@@ -7,8 +7,8 @@ ContainerName=agentux-command-object-store
 EnvironmentFile=/var/lib/agentux/command/command.env
 Environment=MINIO_ROOT_USER_FILE=/run/secrets/minio-root-user
 Environment=MINIO_ROOT_PASSWORD_FILE=/run/secrets/minio-root-password
-Secret=agentux-command-minio-root-user,type=env,target=minio-root-user
-Secret=agentux-command-minio-root-password,type=env,target=minio-root-password
+Secret=agentux-command-minio-root-user,target=minio-root-user
+Secret=agentux-command-minio-root-password,target=minio-root-password
 Volume=agentux-command-object-store.volume:/data
 PublishPort=9000:9000
 PublishPort=9001:9001

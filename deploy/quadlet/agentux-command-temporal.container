@@ -10,9 +10,8 @@ EnvironmentFile=/var/lib/agentux/command/command.env
 Environment=DB=postgres12
 Environment=DB_PORT=5432
 Environment=POSTGRES_USER=agentux
-Environment=POSTGRES_PWD_FILE=/run/secrets/postgres-password
 Environment=POSTGRES_SEEDS=agentux-command-postgres
-Secret=agentux-command-postgres-password,type=env,target=postgres-password
+Secret=agentux-command-postgres-password,type=env,target=POSTGRES_PWD
 PublishPort=7233:7233
 HealthCmd=sh -c 'temporal operator cluster health'
 HealthInterval=15s

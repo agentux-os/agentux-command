@@ -7,8 +7,7 @@ ContainerName=agentux-command-postgres
 EnvironmentFile=/var/lib/agentux/command/command.env
 Environment=POSTGRES_DB=agentux
 Environment=POSTGRES_USER=agentux
-Environment=POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password
-Secret=agentux-command-postgres-password,type=env,target=postgres-password
+Secret=agentux-command-postgres-password,type=env,target=POSTGRES_PASSWORD
 Volume=agentux-command-postgres.volume:/var/lib/postgresql/data
 HealthCmd=pg_isready -U agentux -d agentux
 HealthInterval=10s
