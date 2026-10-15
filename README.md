@@ -17,6 +17,8 @@ AgentUX nodes
 
 Command must not manipulate a node's SQLite database or local Unix socket directly. The future node gateway will expose a versioned, authenticated contract for registration, capabilities, commands and events.
 
+That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/agentux-protocol).
+
 ## Initial stack
 
 - Go HTTP/WebSocket service
