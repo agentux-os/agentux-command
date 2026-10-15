@@ -12,3 +12,11 @@ func TestRegistryTracksHelloAndHeartbeat(t *testing.T) {
 		t.Fatalf("unexpected node state: %#v, found=%v", node, ok)
 	}
 }
+
+func TestRegistryIgnoresHeartbeatFromUnknownNode(t *testing.T) {
+	registry := NewRegistry()
+	registry.Heartbeat("unknown", "ready")
+	if _, ok := registry.Get("unknown"); ok {
+		t.Fatal("unknown heartbeat must not create a node")
+	}
+}
