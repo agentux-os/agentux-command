@@ -80,6 +80,8 @@ func Validate(message Message) error {
 				return fmt.Errorf("run.start requires %s", name)
 			}
 		}
+	default:
+		return fmt.Errorf("unsupported AUXP method %q", message.Method)
 	}
 	return nil
 }
