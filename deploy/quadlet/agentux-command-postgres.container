@@ -1,0 +1,24 @@
+[Unit]
+Description=AgentUX Command PostgreSQL
+
+[Container]
+Image=docker.io/library/postgres:16
+ContainerName=agentux-command-postgres
+EnvironmentFile=/var/lib/agentux/command/command.env
+Environment=POSTGRES_DB=agentux
+Environment=POSTGRES_USER=agentux
+Environment=POSTGRES_PASSWORD_FILE=/run/secrets/postgres-password
+Secret=agentux-command-postgres-password,type=env,target=postgres-password
+Volume=agentux-command-postgres.volume:/var/lib/postgresql/data
+HealthCmd=pg_isready -U agentux -d agentux
+HealthInterval=10s
+HealthTimeout=5s
+HealthRetries=5
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+

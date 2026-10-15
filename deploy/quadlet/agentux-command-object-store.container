@@ -1,0 +1,27 @@
+[Unit]
+Description=AgentUX Command object store
+
+[Container]
+Image=quay.io/minio/minio:latest
+ContainerName=agentux-command-object-store
+EnvironmentFile=/var/lib/agentux/command/command.env
+Environment=MINIO_ROOT_USER_FILE=/run/secrets/minio-root-user
+Environment=MINIO_ROOT_PASSWORD_FILE=/run/secrets/minio-root-password
+Secret=agentux-command-minio-root-user,type=env,target=minio-root-user
+Secret=agentux-command-minio-root-password,type=env,target=minio-root-password
+Volume=agentux-command-object-store.volume:/data
+PublishPort=9000:9000
+PublishPort=9001:9001
+Exec=server /data --console-address :9001
+HealthCmd=curl --fail http://localhost:9000/minio/health/live
+HealthInterval=10s
+HealthTimeout=5s
+HealthRetries=5
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+

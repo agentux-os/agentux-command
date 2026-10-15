@@ -1,0 +1,20 @@
+[Unit]
+Description=AgentUX Command NATS event bus
+
+[Container]
+Image=docker.io/library/nats:2.10
+ContainerName=agentux-command-nats
+Volume=agentux-command-nats.volume:/data
+Exec=-js --store_dir /data
+HealthCmd=nats-server --signal liveness
+HealthInterval=10s
+HealthTimeout=5s
+HealthRetries=5
+
+[Service]
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+

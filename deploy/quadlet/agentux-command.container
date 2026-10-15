@@ -1,0 +1,27 @@
+[Unit]
+Description=AgentUX Command control plane
+Requires=agentux-command-postgres.service agentux-command-nats.service agentux-command-object-store.service
+After=agentux-command-postgres.service agentux-command-nats.service agentux-command-object-store.service
+
+[Container]
+Image=ghcr.io/agentux-os/agentux-command:0.1.0
+ContainerName=agentux-command
+EnvironmentFile=/var/lib/agentux/command/command.env
+Environment=AGENTUX_COMMAND_ADDR=:8080
+Environment=AGENTUX_COMMAND_DATABASE_URL=postgres://agentux@agentux-command-postgres:5432/agentux?sslmode=disable
+Environment=AGENTUX_COMMAND_NATS_URL=nats://agentux-command-nats:4222
+Environment=AGENTUX_COMMAND_OBJECT_STORE_URL=http://agentux-command-object-store:9000
+PublishPort=8080:8080
+HealthCmd=curl --fail http://localhost:8080/healthz
+HealthInterval=10s
+HealthTimeout=5s
+HealthRetries=5
+
+[Service]
+Restart=on-failure
+RestartSec=10s
+TimeoutStartSec=120s
+
+[Install]
+WantedBy=multi-user.target
+

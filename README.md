@@ -44,5 +44,26 @@ That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/age
 
 ## Status
 
-Architecture scaffold. The remote node protocol is intentionally not extracted into a separate repository until the first integration has stabilized.
+The first executable gateway is available in `cmd/agentux-command`. It
+exposes `/healthz`, a read-only `/v1/nodes` view and accepts validated AUXP v1
+messages at `/v1/protocol/messages`. Node state is currently in memory; the
+next increment moves it to PostgreSQL and adds authenticated outbound node
+sessions.
+
+Run it locally:
+
+```sh
+go run ./cmd/agentux-command
+curl http://localhost:8080/healthz
+```
+
+This is an integration slice, not production deployment: authentication,
+WebSocket/TLS transport, durable storage and event replay remain tracked in
+the Command backlog.
+
+The optional server bundle is documented in [`deploy/`](deploy/). It packages
+PostgreSQL, Temporal, NATS, MinIO and Command as rootless Podman Quadlets with
+health checks, persistent volumes and an explicit backup/upgrade policy. It is
+an operational preview until durable storage, authentication and event replay
+are implemented.
 
