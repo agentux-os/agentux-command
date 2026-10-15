@@ -1,0 +1,46 @@
+# AgentUX Command
+
+AgentUX Command is the remote control plane for organizations that run work on AgentUX nodes.
+
+It models organizations, offices, missions, agents, policies and operations. It gives leadership a remote command center while AgentUX Core remains the local execution authority for worktrees, ACP sessions, permissions, gates and pull requests.
+
+## Product boundary
+
+```text
+AgentUX Command
+  organizations · missions · governance · scheduling · telemetry
+                         │
+                         ▼
+AgentUX nodes
+  agentuxd · ACP · worktrees · approvals · technical execution
+```
+
+Command must not manipulate a node's SQLite database or local Unix socket directly. The future node gateway will expose a versioned, authenticated contract for registration, capabilities, commands and events.
+
+## Initial stack
+
+- Go HTTP/WebSocket service
+- PostgreSQL for remote product state
+- Temporal for durable organization-level workflows
+- NATS for internal event distribution
+- AgentUX node gateway for remote execution
+
+## Planned capabilities
+
+- Organizations, offices, missions and agent rosters
+- Autonomy policies and human approval gates
+- Node registration, health and capability-aware placement
+- Aggregated run events, incidents, cost and telemetry
+- Remote leadership views and intervention controls
+
+## Non-goals
+
+- Replacing `agentux-core`'s local execution engine
+- Owning worktrees or ACP sessions directly
+- Making the 2D Office view the source of truth
+- Requiring AgentUX OS for every remote node
+
+## Status
+
+Architecture scaffold. The remote node protocol is intentionally not extracted into a separate repository until the first integration has stabilized.
+
