@@ -22,3 +22,12 @@ func TestValidateRejectsProviderCredential(t *testing.T) {
 		t.Fatal("expected provider credential to be rejected")
 	}
 }
+
+func TestValidateRejectsUnknownMethod(t *testing.T) {
+	message := Message{JSONRPC: "2.0", Method: "node.secret", Params: Params{
+		ProtocolVersion: "v1", OrganizationID: "org-1", NodeID: "node-1", MessageID: "msg-1", OccurredAt: "2026-10-15T12:00:00Z",
+	}}
+	if err := Validate(message); err == nil {
+		t.Fatal("expected unknown method to be rejected")
+	}
+}
