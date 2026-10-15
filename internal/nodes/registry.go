@@ -28,7 +28,10 @@ func (r *Registry) Hello(node Node) {
 func (r *Registry) Heartbeat(id, status string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	node := r.nodes[id]
+	node, ok := r.nodes[id]
+	if !ok {
+		return
+	}
 	node.Status = status
 	r.nodes[id] = node
 }
