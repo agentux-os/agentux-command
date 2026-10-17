@@ -42,11 +42,11 @@
 - Detailed fields, present only when requested: exact oldest/newest `received_at` and per-organization event count plus oldest/newest receive time. No query may select `payload`.
 - Caller owns and opens the database connection; collector starts a `sql.LevelRepeatableRead` read-only transaction and performs no migration or write.
 
-- [ ] **Step 1: Write failing tests** for JSON shape/omission in summary mode and detailed mode, query/collector behavior on an empty event table, partition aggregates, and per-organization aggregates.
-- [ ] **Step 2: Run the focused Go tests** with PostgreSQL integration enabled; confirm the missing report API fails compilation and that empty-history and opt-in cases are represented.
-- [ ] **Step 3: Implement `CollectGrowthReport(ctx, db, detailed)`** using PostgreSQL catalogs/statistics for physical size and estimated rows; in detailed mode run explicit aggregate queries for receive-time bounds and organization groups. Handle SQL NULLs and empty partitions deterministically.
-- [ ] **Step 4: Verify** with `go test ./internal/office -count=1` and `go test -race ./internal/office -count=1`; PostgreSQL cases must execute in CI against PostgreSQL 16, not silently skip there.
-- [ ] **Step 5: Commit** as `feat: report Office event storage growth`.
+- [x] **Step 1: Write failing tests** for JSON shape/omission in summary mode and detailed mode, query/collector behavior on an empty event table, partition aggregates, and per-organization aggregates.
+- [x] **Step 2: Run the focused Go tests** with PostgreSQL integration enabled; confirm the missing report API fails compilation and that empty-history and opt-in cases are represented.
+- [x] **Step 3: Implement `CollectGrowthReport(ctx, db, detailed)`** using PostgreSQL catalogs/statistics for physical size and estimated rows; in detailed mode run explicit aggregate queries for receive-time bounds and organization groups. Handle SQL NULLs and empty partitions deterministically.
+- [x] **Step 4: Verify** with `go test ./internal/office -count=1` and `go test -race ./internal/office -count=1`; PostgreSQL cases executed in CI against PostgreSQL 16 (run 39028797298).
+- [x] **Step 5: Commit** as `feat: report Office event storage growth` (`3acdf6b`).
 
 ### Task 2: Add the standalone CLI, operator runbook, and CI coverage
 
@@ -62,13 +62,13 @@
 - CLI uses `sql.Open("pgx", ...)` directly and does not call `office.OpenPostgres` (which applies migrations).
 - Runbook names the command, explains estimated versus exact/expensive fields, recommends periodic baseline comparison, states indefinite retention/no automatic deletion, and leaves alert thresholds to deployment-specific operator SLOs.
 
-- [ ] **Step 1: Write failing CLI tests** for missing URL, default summary mode, `--detailed`, JSON output, and report-query failure returning nonzero without a partial success report.
-- [ ] **Step 2: Run the focused tests** and confirm expected missing command behavior.
-- [ ] **Step 3: Implement the CLI** with context cancellation, read-only connection behavior, stable JSON output, and clear error handling; do not print credentials or connection URL.
-- [ ] **Step 4: Add CI coverage** so PostgreSQL 16 integration tests execute (including the diagnostic collector) with `AGENTUX_COMMAND_TEST_DATABASE_URL`; retain the existing full `go test ./... -count=1` and `go vet ./...` checks.
-- [ ] **Step 5: Document operator usage** in `deploy/README.md` and summarize the report and lifecycle guarantee in the root README.
-- [ ] **Step 6: Verify** with `go test ./... -count=1`, `go test -race ./internal/office ./cmd/agentux-command-storage-report -count=1`, `go vet ./...`, and the PostgreSQL-backed CI workflow.
-- [ ] **Step 7: Commit** as `docs: document Office event growth diagnostics`.
+- [x] **Step 1: Write failing CLI tests** for missing URL, default summary mode, `--detailed`, JSON output, and report-query failure returning nonzero without a partial success report.
+- [x] **Step 2: Run the focused tests** and confirm expected missing command behavior.
+- [x] **Step 3: Implement the CLI** with context cancellation, read-only connection behavior, stable JSON output, and clear error handling; do not print credentials or connection URL.
+- [x] **Step 4: Verify CI coverage**: the existing workflow provisions PostgreSQL 16, sets `AGENTUX_COMMAND_TEST_DATABASE_URL`, and runs the full suite plus vet (no workflow edit needed; see execution ledger ruling).
+- [x] **Step 5: Document operator usage** in `deploy/README.md` and summarize the report and lifecycle guarantee in the root README.
+- [x] **Step 6: Verify** with `go test ./... -count=1`, `go test -race ./internal/office ./cmd/agentux-command-storage-report -count=1`, `go vet ./...`, and PostgreSQL-backed CI run 39028797298.
+- [x] **Step 7: Commit** as `docs: document Office event growth diagnostics` (`41ebf3f`; follow-up fix `a6737fd`).
 
 ## Self-review
 

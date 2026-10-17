@@ -2,7 +2,7 @@
 
 ## Status
 
-Design draft for user review. No retention duration or deletion authority has been established.
+Approved for implementation on 2026-10-17. No retention duration or deletion authority has been established.
 
 ## Problem
 
