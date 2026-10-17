@@ -31,3 +31,76 @@ func TestGatewayAcceptsHelloAndListsNode(t *testing.T) {
 		t.Fatalf("expected node in list, got %d: %s", list.Code, list.Body.String())
 	}
 }
+
+func TestOfficeProjectionRequiresCapabilityAndReturnsReplayMetadata(t *testing.T) {
+	handler := NewHandler()
+	request := httptest.NewRequest(http.MethodGet, "/v1/office/projection?organizationId=org-demo", nil)
+	request.Header.Set("Authorization", "Bearer demo-leader")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", response.Code, response.Body.String())
+	}
+	var projection map[string]any
+	if err := json.NewDecoder(response.Body).Decode(&projection); err != nil {
+		t.Fatal(err)
+	}
+	for _, field := range []string{"organizationId", "definitionVersion", "projectedAt", "freshness", "lastEventId", "events"} {
+		if projection[field] == nil {
+			t.Fatalf("projection missing %s: %#v", field, projection)
+		}
+	}
+	unauthorized := httptest.NewRecorder()
+	handler.ServeHTTP(unauthorized, httptest.NewRequest(http.MethodGet, "/v1/office/projection", nil))
+	if unauthorized.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 without token, got %d", unauthorized.Code)
+	}
+	missing := httptest.NewRecorder()
+	missingRequest := httptest.NewRequest(http.MethodGet, "/v1/office/projection?organizationId=org-missing", nil)
+	missingRequest.Header.Set("Authorization", "Bearer demo-leader")
+	handler.ServeHTTP(missing, missingRequest)
+	if missing.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown organization, got %d", missing.Code)
+	}
+	invalid := httptest.NewRecorder()
+	invalidRequest := httptest.NewRequest(http.MethodGet, "/v1/office/projection", nil)
+	invalidRequest.Header.Set("Authorization", "Bearer invalid")
+	handler.ServeHTTP(invalid, invalidRequest)
+	if invalid.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for invalid token, got %d", invalid.Code)
+	}
+}
+
+func TestOfficeApprovalResolutionIsIdempotent(t *testing.T) {
+	handler := NewHandler()
+	body := bytes.NewBufferString(`{"decision":"approved","reason":"release reviewed","idempotencyKey":"idem-01"}`)
+	first := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", body)
+	first.Header.Set("Authorization", "Bearer demo-leader")
+	firstResponse := httptest.NewRecorder()
+	handler.ServeHTTP(firstResponse, first)
+	if firstResponse.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", firstResponse.Code, firstResponse.Body.String())
+	}
+
+	replay := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", bytes.NewBufferString(`{"decision":"approved","reason":"release reviewed","idempotencyKey":"idem-01"}`))
+	replay.Header.Set("Authorization", "Bearer demo-leader")
+	replayResponse := httptest.NewRecorder()
+	handler.ServeHTTP(replayResponse, replay)
+	if replayResponse.Code != http.StatusOK || !bytes.Contains(replayResponse.Body.Bytes(), []byte(`"idempotentReplay":true`)) {
+		t.Fatalf("expected idempotent replay, got %d: %s", replayResponse.Code, replayResponse.Body.String())
+	}
+	decided := httptest.NewRecorder()
+	decidedRequest := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", bytes.NewBufferString(`{"decision":"rejected","reason":"changed","idempotencyKey":"idem-02"}`))
+	decidedRequest.Header.Set("Authorization", "Bearer demo-leader")
+	handler.ServeHTTP(decided, decidedRequest)
+	if decided.Code != http.StatusConflict || !bytes.Contains(decided.Body.Bytes(), []byte(`"already_decided"`)) {
+		t.Fatalf("expected already-decided conflict, got %d: %s", decided.Code, decided.Body.String())
+	}
+	forbidden := httptest.NewRecorder()
+	forbiddenRequest := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", bytes.NewBufferString(`{"decision":"approved","idempotencyKey":"idem-03"}`))
+	forbiddenRequest.Header.Set("Authorization", "Bearer demo-observer")
+	handler.ServeHTTP(forbidden, forbiddenRequest)
+	if forbidden.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for missing capability, got %d", forbidden.Code)
+	}
+}
