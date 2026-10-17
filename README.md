@@ -61,8 +61,6 @@ That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/age
 
 The repository is under active integration development. The current gateway surface is always represented by `main`; versioned remote compatibility belongs to [AgentUX Protocol](https://github.com/agentux-os/agentux-protocol), so this README does not carry release-specific version numbers.
 
-Architecture scaffold. The remote node protocol is intentionally not extracted into a separate repository until the first integration has stabilized.
-
 ## Office projection slice
 
 The current gateway exposes a storage-independent first slice for AgentUX Office:
@@ -78,13 +76,27 @@ authentication and organization sessions are tracked in [#13](https://github.com
 
 Projection responses carry `schemaVersion`, `definitionVersion`, `projectedAt`,
 `source`, `freshness`, `lastEventId` and event replay metadata. Events use
-organization/entity IDs, `eventId`, `nodeId` and a monotonic per-node sequence;
-the in-memory implementation deduplicates events before updating its materialized
-read model. Approval mutations require an idempotency key and replay the original
-decision on retry.
+organization/entity IDs, `eventId`, `nodeId` and a monotonic per-node sequence.
+Both the in-memory and PostgreSQL stores deduplicate events before updating the
+materialized read model. Approval mutations require an idempotency key and replay
+the original decision on retry.
 
-The first implementation is intentionally in memory. Durable append-only event
-storage, replay and restart recovery are tracked in [#12](https://github.com/agentux-os/agentux-command/issues/12). Live updates depend on both durable storage and authenticated sessions ([#14](https://github.com/agentux-os/agentux-command/issues/14)).
+The local demo uses deterministic in-memory data. The deployed server requires
+PostgreSQL and stores the append-only event log, per-node replay cursors,
+materialized projection and organization-scoped approval idempotency records.
+Event insertion, cursor advancement and projection update commit atomically.
+The event table is hash-partitioned by organization and indexed by organization
+and receive time for time-window replay and retention queries.
+Approval decisions are also appended to the event log, so the read model can be
+rebuilt and checked against replay after restart. The Office JSON contract stays
+independent of the storage implementation. Live updates depend on authenticated
+organization sessions ([#13](https://github.com/agentux-os/agentux-command/issues/13)) and remain tracked in [#14](https://github.com/agentux-os/agentux-command/issues/14).
+
+Production startup requires `AGENTUX_COMMAND_DATABASE_URL`, connects to the
+database, applies versioned migrations and only then listens for requests.
+`/healthz` checks database connectivity. The command-server Quadlet receives
+the PostgreSQL password through the Podman secret; the database URL does not
+contain the password.
 
 Run the tests locally:
 

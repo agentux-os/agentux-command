@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -12,17 +13,28 @@ import (
 
 type Handler struct {
 	registry *nodes.Registry
-	office   *office.Store
+	office   office.OfficeRepository
 }
 
 func NewHandler() *Handler {
-	return &Handler{registry: nodes.NewRegistry(), office: office.NewStore()}
+	return NewHandlerWithOfficeRepository(office.NewStore())
+}
+
+func NewHandlerWithOfficeRepository(repository office.OfficeRepository) *Handler {
+	if repository == nil {
+		repository = office.NewStore()
+	}
+	return &Handler{registry: nodes.NewRegistry(), office: repository}
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
+		if err := h.office.Ping(r.Context()); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/nodes":
 		writeJSON(w, http.StatusOK, h.registry.List())
@@ -35,6 +47,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func NewPostgresHandler(ctx context.Context, databaseURL string) (*Handler, func() error, error) {
+	db, err := office.OpenPostgres(ctx, databaseURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	return NewHandlerWithOfficeRepository(office.NewPostgresStore(db)), db.Close, nil
 }
 
 func (h *Handler) projection(w http.ResponseWriter, r *http.Request) {
@@ -50,7 +70,11 @@ func (h *Handler) projection(w http.ResponseWriter, r *http.Request) {
 	if organizationID == "" {
 		organizationID = "org-demo"
 	}
-	projection, ok := h.office.GetProjection(organizationID)
+	projection, ok, err := h.office.GetProjection(r.Context(), organizationID)
+	if err != nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "projection_unavailable"})
+		return
+	}
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "projection_not_found"})
 		return
@@ -73,13 +97,13 @@ func (h *Handler) resolveApproval(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
-	response, err := h.office.ResolveApproval(approvalID, request)
+	response, err := h.office.ResolveApproval(r.Context(), approvalID, request)
 	if err != nil {
 		if conflict, ok := err.(*office.ConflictError); ok {
 			writeJSON(w, http.StatusConflict, map[string]any{"ok": false, "conflict": conflict})
 			return
 		}
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "approval_store_unavailable"})
 		return
 	}
 	writeJSON(w, http.StatusOK, response)
