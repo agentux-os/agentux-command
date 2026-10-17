@@ -22,6 +22,8 @@ var _ OfficeRepository = (*PostgresStore)(nil)
 
 func NewPostgresStore(db *sql.DB) *PostgresStore { return &PostgresStore{db: db} }
 
+func (s *PostgresStore) Ping(ctx context.Context) error { return s.db.PingContext(ctx) }
+
 func (s *PostgresStore) GetProjection(ctx context.Context, organizationID string) (Projection, bool, error) {
 	var encoded []byte
 	err := s.db.QueryRowContext(ctx, `SELECT payload FROM office_projections WHERE organization_id = $1`, organizationID).Scan(&encoded)

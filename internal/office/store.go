@@ -9,6 +9,7 @@ import (
 )
 
 type OfficeRepository interface {
+	Ping(context.Context) error
 	GetProjection(context.Context, string) (Projection, bool, error)
 	ApplyEvent(context.Context, Event) error
 	ResolveApproval(context.Context, string, ResolutionRequest) (ResolutionResponse, error)
@@ -72,6 +73,8 @@ type ConflictError struct {
 }
 
 func (e *ConflictError) Error() string { return e.Message }
+
+func (s *Store) Ping(ctx context.Context) error { return ctx.Err() }
 
 type Store struct {
 	mu          sync.RWMutex

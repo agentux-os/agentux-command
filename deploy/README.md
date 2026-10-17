@@ -11,7 +11,8 @@ The OS profile manager creates `/var/lib/agentux/command`. An operator then:
 
 1. copies `config/command.env.example` to
    `/var/lib/agentux/command/command.env` and replaces every placeholder;
-2. creates the three Podman secrets named in the Quadlet files;
+2. creates the three Podman secrets named in the Quadlet files (the PostgreSQL
+   password secret is shared with the Command service as `PGPASSWORD`);
 3. copies the Quadlet files to `/etc/containers/systemd/`;
 4. pins the Command image by digest in a local drop-in or release update;
 5. runs `systemctl daemon-reload` and enables the units in dependency order.
@@ -30,6 +31,8 @@ Do not commit the resulting env file, secrets or generated Quadlet drop-ins.
 
 - **Health:** each container has a health command; systemd restart policy makes
   a failed dependency visible in `systemctl --failed` and `podman healthcheck`.
+  Command also checks PostgreSQL on `/healthz` and refuses startup if the
+  database is unreachable or migrations fail.
 - **Persistence:** PostgreSQL, NATS JetStream and MinIO use named volumes under
   the Command data boundary. Removing a profile never removes these volumes.
 - **Backup:** before an upgrade, dump PostgreSQL with `pg_dump`, export the
@@ -45,7 +48,9 @@ Do not commit the resulting env file, secrets or generated Quadlet drop-ins.
   persistent storage. Production sizing depends on event retention and node
   count; this bundle is not a high-availability deployment.
 
-The initial Command HTTP service does not yet implement database migrations,
-authentication or durable event replay. Until those are shipped, this bundle
-is an operationally explicit preview and must not be advertised as production
-ready.
+Command applies embedded, versioned PostgreSQL migrations at startup. Event
+append, per-node cursor advancement and projection updates share a transaction;
+approval decisions and their organization-scoped idempotency records are
+durable. Keep a verified database backup before upgrading the service image.
+Authentication/session integration and live event streaming are still
+development work; this bundle is not a complete production deployment.

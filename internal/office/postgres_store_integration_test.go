@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"sync"
 	"testing"
@@ -187,12 +188,14 @@ func TestPostgresStoreCanMigrateAndOpenConfiguredDatabase(t *testing.T) {
 		t.Skip("AGENTUX_COMMAND_TEST_DATABASE_URL is not set")
 	}
 	schema := createTestSchema(t, databaseURL)
-	config, err := pgx.ParseConfig(databaseURL)
+	parsedURL, err := url.Parse(databaseURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	config.RuntimeParams["search_path"] = schema
-	dbURL := config.ConnString()
+	query := parsedURL.Query()
+	query.Set("search_path", schema)
+	parsedURL.RawQuery = query.Encode()
+	dbURL := parsedURL.String()
 	db, err := OpenPostgres(context.Background(), dbURL)
 	if err != nil {
 		t.Fatal(err)

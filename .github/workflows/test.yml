@@ -1,0 +1,37 @@
+name: Command tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: agentux_test
+          POSTGRES_USER: agentux
+          POSTGRES_PASSWORD: agentux-test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentux -d agentux_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      AGENTUX_COMMAND_TEST_DATABASE_URL: postgres://agentux:agentux-test@localhost:5432/agentux_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - run: go test ./... -count=1
+      - run: go vet ./...

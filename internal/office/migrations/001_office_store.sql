@@ -1,5 +1,5 @@
 CREATE TABLE IF NOT EXISTS office_events (
-    ingest_id bigserial UNIQUE NOT NULL,
+    ingest_id bigserial NOT NULL,
     organization_id text NOT NULL,
     event_id text NOT NULL,
     node_id text NOT NULL DEFAULT '',
@@ -8,7 +8,16 @@ CREATE TABLE IF NOT EXISTS office_events (
     received_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (organization_id, event_id),
     UNIQUE (organization_id, node_id, sequence)
-);
+) PARTITION BY HASH (organization_id);
+
+CREATE TABLE IF NOT EXISTS office_events_p0 PARTITION OF office_events FOR VALUES WITH (MODULUS 8, REMAINDER 0);
+CREATE TABLE IF NOT EXISTS office_events_p1 PARTITION OF office_events FOR VALUES WITH (MODULUS 8, REMAINDER 1);
+CREATE TABLE IF NOT EXISTS office_events_p2 PARTITION OF office_events FOR VALUES WITH (MODULUS 8, REMAINDER 2);
+CREATE TABLE IF NOT EXISTS office_events_p3 PARTITION OF office_events FOR VALUES WITH (MODULUS 8, REMAINDER 3);
+CREATE TABLE IF NOT EXISTS office_events_p4 PARTITION OF office_events FOR VALUES WITH (MODULUS 8, REMAINDER 4);
+CREATE TABLE IF NOT EXISTS office_events_p5 PARTITION OF office_events FOR VALUES WITH (MODULUS 8, REMAINDER 5);
+CREATE TABLE IF NOT EXISTS office_events_p6 PARTITION OF office_events FOR VALUES WITH (MODULUS 8, REMAINDER 6);
+CREATE TABLE IF NOT EXISTS office_events_p7 PARTITION OF office_events FOR VALUES WITH (MODULUS 8, REMAINDER 7);
 
 CREATE INDEX IF NOT EXISTS office_events_org_received_idx
     ON office_events (organization_id, received_at, event_id);

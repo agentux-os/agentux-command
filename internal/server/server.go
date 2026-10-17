@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -30,6 +31,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch {
 	case r.Method == http.MethodGet && r.URL.Path == "/healthz":
+		if err := h.office.Ping(r.Context()); err != nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"status": "unavailable"})
+			return
+		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/nodes":
 		writeJSON(w, http.StatusOK, h.registry.List())
@@ -42,6 +47,14 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func NewPostgresHandler(ctx context.Context, databaseURL string) (*Handler, func() error, error) {
+	db, err := office.OpenPostgres(ctx, databaseURL)
+	if err != nil {
+		return nil, nil, err
+	}
+	return NewHandlerWithOfficeRepository(office.NewPostgresStore(db)), db.Close, nil
 }
 
 func (h *Handler) projection(w http.ResponseWriter, r *http.Request) {

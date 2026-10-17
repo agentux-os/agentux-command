@@ -117,6 +117,9 @@ func (failingOfficeRepository) GetProjection(context.Context, string) (office.Pr
 func (failingOfficeRepository) ApplyEvent(context.Context, office.Event) error {
 	return errors.New("database unavailable")
 }
+func (failingOfficeRepository) Ping(context.Context) error {
+	return errors.New("database unavailable")
+}
 func (failingOfficeRepository) ResolveApproval(context.Context, string, office.ResolutionRequest) (office.ResolutionResponse, error) {
 	return office.ResolutionResponse{}, errors.New("database unavailable")
 }
@@ -129,5 +132,21 @@ func TestOfficeProjectionReportsStorageFailureAsUnavailable(t *testing.T) {
 	handler.ServeHTTP(response, request)
 	if response.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503 on storage failure, got %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestHealthCheckReportsDatabaseFailure(t *testing.T) {
+	handler := NewHandlerWithOfficeRepository(failingOfficeRepository{})
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/healthz", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when database is unavailable, got %d", response.Code)
+	}
+}
+
+func TestProductionHandlerRequiresDatabaseURL(t *testing.T) {
+	handler, closeStore, err := NewPostgresHandler(context.Background(), "")
+	if err == nil || handler != nil || closeStore != nil {
+		t.Fatalf("expected production handler construction to fail without database URL, handler=%v close=%v err=%v", handler, closeStore != nil, err)
 	}
 }
