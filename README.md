@@ -1,5 +1,11 @@
 # AgentUX Command
 
+<p>
+  <a href="https://github.com/agentux-os/agentux-command/commits/main"><img alt="Last commit" src="https://img.shields.io/github/last-commit/agentux-os/agentux-command?label=updated&labelColor=0b0d10&color=4f7d0b"></a>
+  <a href="https://github.com/agentux-os/agentux-command"><img alt="Top language" src="https://img.shields.io/github/languages/top/agentux-os/agentux-command?label=language&labelColor=0b0d10&color=4f7d0b"></a>
+  <a href="https://github.com/agentux-os/agentux-protocol"><img alt="Protocol" src="https://img.shields.io/badge/protocol-AUXP%20v1-4f7d0b?labelColor=0b0d10"></a>
+</p>
+
 AgentUX Command is the remote control plane for organizations that run work on AgentUX nodes.
 
 It models organizations, offices, missions, agents, policies and operations. It gives leadership a remote command center while AgentUX Core remains the local execution authority for worktrees, ACP sessions, permissions, gates and pull requests.
@@ -44,26 +50,7 @@ That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/age
 
 ## Status
 
-The first executable gateway is available in `cmd/agentux-command`. It
-exposes `/healthz`, a read-only `/v1/nodes` view and accepts validated AUXP v1
-messages at `/v1/protocol/messages`. Node state is currently in memory; the
-next increment moves it to PostgreSQL and adds authenticated outbound node
-sessions.
+The repository is under active integration development. The current gateway surface is always represented by `main`; versioned remote compatibility belongs to [AgentUX Protocol](https://github.com/agentux-os/agentux-protocol), so this README does not carry release-specific version numbers.
 
-Run it locally:
-
-```sh
-go run ./cmd/agentux-command
-curl http://localhost:8080/healthz
-```
-
-This is an integration slice, not production deployment: authentication,
-WebSocket/TLS transport, durable storage and event replay remain tracked in
-the Command backlog.
-
-The optional server bundle is documented in [`deploy/`](deploy/). It packages
-PostgreSQL, Temporal, NATS, MinIO and Command as rootless Podman Quadlets with
-health checks, persistent volumes and an explicit backup/upgrade policy. It is
-an operational preview until durable storage, authentication and event replay
-are implemented.
+Architecture scaffold. The remote node protocol is intentionally not extracted into a separate repository until the first integration has stabilized.
 
