@@ -206,3 +206,48 @@ func TestPostgresStoreCanMigrateAndOpenConfiguredDatabase(t *testing.T) {
 	}
 	_ = db.Close()
 }
+
+func TestPostgresGrowthReportIncludesPartitionSummaryAndOptionalOrganizationAggregates(t *testing.T) {
+	store, _ := newPostgresTestStore(t)
+	ctx := context.Background()
+	for i, orgID := range []string{"org-growth-a", "org-growth-b"} {
+		if err := store.ApplyEvent(ctx, Event{EventID: "growth-" + orgID, EventType: "run.started", OrganizationID: orgID, NodeID: "node-01", Sequence: int64(i + 1)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	summary, err := CollectGrowthReport(ctx, store.db, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Database == "" || summary.CollectedAt.IsZero() || summary.TotalEventBytes <= 0 || len(summary.Partitions) != 8 {
+		t.Fatalf("summary missing database, time, size, or partition data: %#v", summary)
+	}
+	if summary.Detailed != nil {
+		t.Fatalf("summary mode must not include organization details: %#v", summary.Detailed)
+	}
+
+	detailed, err := CollectGrowthReport(ctx, store.db, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if detailed.Detailed == nil || len(detailed.Detailed.Organizations) != 2 {
+		t.Fatalf("detailed report should contain both organization aggregates: %#v", detailed.Detailed)
+	}
+	for _, organization := range detailed.Detailed.Organizations {
+		if organization.EventCount != 1 || organization.OldestReceivedAt == nil || organization.NewestReceivedAt == nil {
+			t.Fatalf("organization aggregate has wrong count or time bounds: %#v", organization)
+		}
+	}
+}
+
+func TestPostgresGrowthReportHandlesEmptyEventHistory(t *testing.T) {
+	store, _ := newPostgresTestStore(t)
+	report, err := CollectGrowthReport(context.Background(), store.db, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.Detailed == nil || report.Detailed.OldestReceivedAt != nil || report.Detailed.NewestReceivedAt != nil || len(report.Detailed.Organizations) != 0 {
+		t.Fatalf("empty event history should produce null bounds and no organizations: %#v", report.Detailed)
+	}
+}

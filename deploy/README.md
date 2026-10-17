@@ -48,6 +48,35 @@ Do not commit the resulting env file, secrets or generated Quadlet drop-ins.
   persistent storage. Production sizing depends on event retention and node
   count; this bundle is not a high-availability deployment.
 
+### Office event growth report
+
+The event log is retained indefinitely; no automatic pruning or archival is
+enabled. Collect a read-only baseline from a trusted Linux build host using the
+same architecture as the Command container:
+
+```sh
+go build -o /tmp/agentux-command-storage-report ./cmd/agentux-command-storage-report
+podman cp /tmp/agentux-command-storage-report agentux-command:/tmp/agentux-command-storage-report
+podman exec agentux-command /tmp/agentux-command-storage-report > office-event-growth.json
+podman exec agentux-command /tmp/agentux-command-storage-report --detailed > office-event-growth-detailed.json
+podman exec agentux-command rm -f /tmp/agentux-command-storage-report
+rm -f /tmp/agentux-command-storage-report
+```
+
+The summary reports database/schema, collection time, physical event-table and
+partition sizes, and PostgreSQL's estimated row counts. `--detailed` additionally
+scans event metadata to report exact receive-time bounds and counts by
+organization; it never emits event payloads, but the output contains tenant
+identifiers and should be handled as operationally sensitive data. Detailed
+aggregation can take longer on a large log.
+
+Capture reports periodically and compare total growth and partition skew. These
+measurements are observations, not a retention recommendation. Set alerts in the
+deployment's chosen monitoring system using its capacity and recovery objectives;
+this project does not prescribe a universal threshold. Do not delete or detach
+event partitions: replay and audit depend on the retained log. Define and review
+an audit/replay policy before any future archival or pruning workflow.
+
 Command applies embedded, versioned PostgreSQL migrations at startup. Event
 append, per-node cursor advancement and projection updates share a transaction;
 approval decisions and their organization-scoped idempotency records are
