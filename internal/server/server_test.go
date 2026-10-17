@@ -2,10 +2,14 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
+
+	"github.com/agentux-os/agentux-command/internal/office"
 )
 
 func TestGatewayAcceptsHelloAndListsNode(t *testing.T) {
@@ -73,7 +77,7 @@ func TestOfficeProjectionRequiresCapabilityAndReturnsReplayMetadata(t *testing.T
 
 func TestOfficeApprovalResolutionIsIdempotent(t *testing.T) {
 	handler := NewHandler()
-	body := bytes.NewBufferString(`{"decision":"approved","reason":"release reviewed","idempotencyKey":"idem-01"}`)
+	body := bytes.NewBufferString(`{"organizationId":"org-demo","decision":"approved","reason":"release reviewed","idempotencyKey":"idem-01"}`)
 	first := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", body)
 	first.Header.Set("Authorization", "Bearer demo-leader")
 	firstResponse := httptest.NewRecorder()
@@ -82,7 +86,7 @@ func TestOfficeApprovalResolutionIsIdempotent(t *testing.T) {
 		t.Fatalf("expected 200, got %d: %s", firstResponse.Code, firstResponse.Body.String())
 	}
 
-	replay := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", bytes.NewBufferString(`{"decision":"approved","reason":"release reviewed","idempotencyKey":"idem-01"}`))
+	replay := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", bytes.NewBufferString(`{"organizationId":"org-demo","decision":"approved","reason":"release reviewed","idempotencyKey":"idem-01"}`))
 	replay.Header.Set("Authorization", "Bearer demo-leader")
 	replayResponse := httptest.NewRecorder()
 	handler.ServeHTTP(replayResponse, replay)
@@ -90,17 +94,40 @@ func TestOfficeApprovalResolutionIsIdempotent(t *testing.T) {
 		t.Fatalf("expected idempotent replay, got %d: %s", replayResponse.Code, replayResponse.Body.String())
 	}
 	decided := httptest.NewRecorder()
-	decidedRequest := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", bytes.NewBufferString(`{"decision":"rejected","reason":"changed","idempotencyKey":"idem-02"}`))
+	decidedRequest := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", bytes.NewBufferString(`{"organizationId":"org-demo","decision":"rejected","reason":"changed","idempotencyKey":"idem-02"}`))
 	decidedRequest.Header.Set("Authorization", "Bearer demo-leader")
 	handler.ServeHTTP(decided, decidedRequest)
 	if decided.Code != http.StatusConflict || !bytes.Contains(decided.Body.Bytes(), []byte(`"already_decided"`)) {
 		t.Fatalf("expected already-decided conflict, got %d: %s", decided.Code, decided.Body.String())
 	}
 	forbidden := httptest.NewRecorder()
-	forbiddenRequest := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", bytes.NewBufferString(`{"decision":"approved","idempotencyKey":"idem-03"}`))
+	forbiddenRequest := httptest.NewRequest(http.MethodPost, "/v1/approvals/approval-01/resolve", bytes.NewBufferString(`{"organizationId":"org-demo","decision":"approved","idempotencyKey":"idem-03"}`))
 	forbiddenRequest.Header.Set("Authorization", "Bearer demo-observer")
 	handler.ServeHTTP(forbidden, forbiddenRequest)
 	if forbidden.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for missing capability, got %d", forbidden.Code)
+	}
+}
+
+type failingOfficeRepository struct{}
+
+func (failingOfficeRepository) GetProjection(context.Context, string) (office.Projection, bool, error) {
+	return office.Projection{}, false, errors.New("database unavailable")
+}
+func (failingOfficeRepository) ApplyEvent(context.Context, office.Event) error {
+	return errors.New("database unavailable")
+}
+func (failingOfficeRepository) ResolveApproval(context.Context, string, office.ResolutionRequest) (office.ResolutionResponse, error) {
+	return office.ResolutionResponse{}, errors.New("database unavailable")
+}
+
+func TestOfficeProjectionReportsStorageFailureAsUnavailable(t *testing.T) {
+	handler := NewHandlerWithOfficeRepository(failingOfficeRepository{})
+	request := httptest.NewRequest(http.MethodGet, "/v1/office/projection?organizationId=org-demo", nil)
+	request.Header.Set("Authorization", "Bearer demo-leader")
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 on storage failure, got %d: %s", response.Code, response.Body.String())
 	}
 }

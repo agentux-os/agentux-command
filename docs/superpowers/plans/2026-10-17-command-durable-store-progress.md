@@ -10,3 +10,5 @@ Shared interfaces:
 Global ruling: retain in-memory `NewHandler()` for unit/demo use while production startup uses PostgreSQL. This preserves the contract and local demo behavior while enforcing persistence in the deployed service; cost if wrong: local and production startup differ, so the endpoint contract and integration tests must cover both adapters.
 
 Task 1: complete (commit 51402ab, tests: `go test ./...` → all packages pass; PostgreSQL runtime integration is deferred to Tasks 2 and 4).
+
+Task 2: complete (pending commit in this change; tests: `go test ./... -count=1` and `go test -race ./internal/office ./internal/server -count=1` pass. Five live PostgreSQL integration cases compile but skip locally because `AGENTUX_COMMAND_TEST_DATABASE_URL` is unavailable; Task 4 adds a PostgreSQL-backed CI service to execute them.)

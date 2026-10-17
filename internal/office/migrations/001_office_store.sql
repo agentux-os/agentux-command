@@ -1,4 +1,5 @@
 CREATE TABLE IF NOT EXISTS office_events (
+    ingest_id bigserial UNIQUE NOT NULL,
     organization_id text NOT NULL,
     event_id text NOT NULL,
     node_id text NOT NULL DEFAULT '',
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS office_projections (
     source text NOT NULL,
     freshness text NOT NULL,
     last_event_id text NOT NULL,
+    last_node_id text NOT NULL DEFAULT '',
     last_sequence bigint NOT NULL DEFAULT 0,
     payload jsonb NOT NULL
 );
@@ -37,6 +39,7 @@ CREATE TABLE IF NOT EXISTS office_approval_state (
     organization_id text NOT NULL,
     approval_id text NOT NULL,
     status text NOT NULL,
+    payload jsonb NOT NULL DEFAULT '{}'::jsonb,
     decision jsonb,
     updated_at timestamptz NOT NULL DEFAULT now(),
     PRIMARY KEY (organization_id, approval_id)
