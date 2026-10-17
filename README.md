@@ -63,3 +63,32 @@ The repository is under active integration development. The current gateway surf
 
 Architecture scaffold. The remote node protocol is intentionally not extracted into a separate repository until the first integration has stabilized.
 
+## Office projection slice
+
+The current gateway exposes a storage-independent first slice for AgentUX Office:
+
+```text
+GET  /v1/office/projection?organizationId=org-demo
+POST /v1/approvals/{approvalId}/resolve
+```
+
+The demo server accepts `Bearer demo-leader` (`organization.read` and
+`approval.decide`) and `Bearer demo-observer` (`organization.read`). Production
+authentication and organization sessions are tracked in [#13](https://github.com/agentux-os/agentux-command/issues/13).
+
+Projection responses carry `schemaVersion`, `definitionVersion`, `projectedAt`,
+`source`, `freshness`, `lastEventId` and event replay metadata. Events use
+organization/entity IDs, `eventId`, `nodeId` and a monotonic per-node sequence;
+the in-memory implementation deduplicates events before updating its materialized
+read model. Approval mutations require an idempotency key and replay the original
+decision on retry.
+
+The first implementation is intentionally in memory. Durable append-only event
+storage, replay and restart recovery are tracked in [#12](https://github.com/agentux-os/agentux-command/issues/12). Live updates depend on both durable storage and authenticated sessions ([#14](https://github.com/agentux-os/agentux-command/issues/14)).
+
+Run the tests locally:
+
+```sh
+go test ./...
+```
+
