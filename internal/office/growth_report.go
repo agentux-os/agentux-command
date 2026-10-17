@@ -49,18 +49,17 @@ func CollectGrowthReport(ctx context.Context, db *sql.DB, detailed bool) (Growth
 	defer tx.Rollback()
 
 	var report GrowthReport
-	if err := tx.QueryRowContext(ctx, `SELECT current_database(), current_schema(), clock_timestamp(), pg_total_relation_size('office_events'::regclass)`).Scan(
-		&report.Database, &report.Schema, &report.CollectedAt, &report.TotalEventBytes,
+	if err := tx.QueryRowContext(ctx, `SELECT current_database(), current_schema(), clock_timestamp()`).Scan(
+		&report.Database, &report.Schema, &report.CollectedAt,
 	); err != nil {
 		return GrowthReport{}, fmt.Errorf("read event storage summary: %w", err)
 	}
 	rows, err := tx.QueryContext(ctx, `
 		SELECT child.relname, pg_total_relation_size(child.oid), COALESCE(stats.n_live_tup, 0)::bigint
-		FROM pg_inherits AS inheritance
-		JOIN pg_class AS parent ON parent.oid = inheritance.inhparent
-		JOIN pg_class AS child ON child.oid = inheritance.inhrelid
+		FROM pg_partition_tree('office_events'::regclass) AS partition_tree
+		JOIN pg_class AS child ON child.oid = partition_tree.relid
 		LEFT JOIN pg_stat_user_tables AS stats ON stats.relid = child.oid
-		WHERE parent.oid = 'office_events'::regclass
+		WHERE partition_tree.isleaf
 		ORDER BY child.relname`)
 	if err != nil {
 		return GrowthReport{}, fmt.Errorf("read event partition statistics: %w", err)
@@ -72,6 +71,7 @@ func CollectGrowthReport(ctx context.Context, db *sql.DB, detailed bool) (Growth
 			_ = rows.Close()
 			return GrowthReport{}, fmt.Errorf("scan event partition statistics: %w", err)
 		}
+		report.TotalEventBytes += partition.Bytes
 		report.EstimatedEventRows += partition.EstimatedRows
 		report.Partitions = append(report.Partitions, partition)
 	}
