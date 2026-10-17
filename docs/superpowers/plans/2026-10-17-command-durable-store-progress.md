@@ -11,4 +11,6 @@ Global ruling: retain in-memory `NewHandler()` for unit/demo use while productio
 
 Task 1: complete (commit 51402ab, tests: `go test ./...` → all packages pass; PostgreSQL runtime integration is deferred to Tasks 2 and 4).
 
-Task 2: complete (pending commit in this change; tests: `go test ./... -count=1` and `go test -race ./internal/office ./internal/server -count=1` pass. Five live PostgreSQL integration cases compile but skip locally because `AGENTUX_COMMAND_TEST_DATABASE_URL` is unavailable; Task 4 adds a PostgreSQL-backed CI service to execute them.)
+Task 2: complete (commit 50bb2fd, tests: `go test ./... -count=1` and `go test -race ./internal/office ./internal/server -count=1` pass. Five live PostgreSQL integration cases compile but skip locally because `AGENTUX_COMMAND_TEST_DATABASE_URL` is unavailable; Task 4 adds a PostgreSQL-backed CI service to execute them.)
+
+Task 3: complete (Command repository contract, Apps adapter, and AUXP response/request schema now carry organizationId; tests: Command `go test ./... -count=1`, Apps `npm test` → 4/4, Protocol `node scripts/validate-fixtures.mjs` → 3 valid and 2 invalid fixtures pass. Commits: command changes already in 50bb2fd; Apps 4c9ec02; Protocol 1b91eaa.)
