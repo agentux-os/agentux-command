@@ -1,6 +1,7 @@
 package office
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -35,5 +36,15 @@ func TestGrowthReportJSONOmitsDetailedDataUnlessRequested(t *testing.T) {
 	}
 	if !strings.Contains(string(encoded), `"organizationId":"org-a"`) {
 		t.Fatalf("detailed report must include tenant aggregates when requested: %s", encoded)
+	}
+}
+
+func TestCollectGrowthReportRejectsNilDatabase(t *testing.T) {
+	report, err := CollectGrowthReport(context.Background(), nil, false)
+	if err == nil {
+		t.Fatal("expected a nil database to return an error")
+	}
+	if report.Database != "" || report.Partitions != nil {
+		t.Fatalf("failed report should not contain partial data: %#v", report)
 	}
 }

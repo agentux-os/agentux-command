@@ -39,6 +39,9 @@ type OrganizationGrowth struct {
 // CollectGrowthReport reports PostgreSQL event storage without changing it.
 // Detailed mode performs a full aggregate over the append-only event table.
 func CollectGrowthReport(ctx context.Context, db *sql.DB, detailed bool) (GrowthReport, error) {
+	if db == nil {
+		return GrowthReport{}, fmt.Errorf("database is required")
+	}
 	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelRepeatableRead, ReadOnly: true})
 	if err != nil {
 		return GrowthReport{}, fmt.Errorf("begin read-only growth report transaction: %w", err)
