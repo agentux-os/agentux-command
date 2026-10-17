@@ -8,3 +8,5 @@ Shared interfaces:
 - Task 3 adds `organizationId` to the approval request, shared with Apps and AUXP.
 
 Global ruling: retain in-memory `NewHandler()` for unit/demo use while production startup uses PostgreSQL. This preserves the contract and local demo behavior while enforcing persistence in the deployed service; cost if wrong: local and production startup differ, so the endpoint contract and integration tests must cover both adapters.
+
+Task 1: complete (commit 51402ab, tests: `go test ./...` → all packages pass; PostgreSQL runtime integration is deferred to Tasks 2 and 4).
