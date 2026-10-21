@@ -408,3 +408,25 @@ func merge(a, b map[string]any) map[string]any {
 	}
 	return out
 }
+
+func TestTokensComeWithProvisionFiles(t *testing.T) {
+	handler := NewHandler().WithPublicURL("https://command.acme.org/")
+	response, issued := call(t, handler, http.MethodPost, "/v1/enrollment-tokens", "demo-leader", map[string]any{
+		"organizationId": "acme", "count": 2,
+		"provision": map[string]any{"profile": "node", "user": "dev", "policy": map[string]any{"commands": map[string]any{"run.start": "allow"}}},
+	})
+	if response.Code != http.StatusCreated {
+		t.Fatalf("issue: %d %v", response.Code, issued)
+	}
+	tokens := issued["tokens"].([]any)
+	file := tokens[1].(map[string]any)["provision"].(map[string]any)
+	join := file["command"].(map[string]any)
+	if file["profile"] != "node" || file["user"] != "dev" || join["url"] != "https://command.acme.org" || join["enrollmentToken"] != tokens[1].(map[string]any)["token"] {
+		t.Fatalf("unexpected provision file: %v", file)
+	}
+	if response, _ := call(t, handler, http.MethodPost, "/v1/enrollment-tokens", "demo-leader", map[string]any{
+		"organizationId": "acme", "provision": map[string]any{"profile": "executive", "user": "dev"},
+	}); response.Code != http.StatusBadRequest {
+		t.Fatalf("an Executive runs no node to provision, got %d", response.Code)
+	}
+}

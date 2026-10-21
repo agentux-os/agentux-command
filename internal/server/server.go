@@ -30,6 +30,39 @@ type Handler struct {
 	instance string
 	// Accept protocol messages from nodes nobody enrolled (the demo only).
 	openNodes bool
+	// The address nodes reach this server at, for provision files.
+	publicURL string
+}
+
+// WithPublicURL is the address nodes use (AGENTUX_COMMAND_PUBLIC_URL); without
+// it, provision files use the address the operator's request came to.
+func (h *Handler) WithPublicURL(url string) *Handler {
+	h.publicURL = strings.TrimRight(strings.TrimSpace(url), "/")
+	return h
+}
+
+func (h *Handler) baseURL(r *http.Request) string {
+	if h.publicURL != "" {
+		return h.publicURL
+	}
+	scheme := "https"
+	if r.TLS == nil && r.Header.Get("X-Forwarded-Proto") != "https" {
+		scheme = "http"
+	}
+	host := r.Header.Get("X-Forwarded-Host")
+	if host == "" {
+		host = r.Host
+	}
+	return scheme + "://" + host
+}
+
+// provisionTemplate is what an operator wants in each machine's provision
+// file (agentux-core docs/provision.md).
+type provisionTemplate struct {
+	Profile     string         `json:"profile"`
+	User        string         `json:"user"`
+	Policy      map[string]any `json:"policy,omitempty"`
+	Preferences map[string]any `json:"preferences,omitempty"`
 }
 
 // WithEnrollStore keeps enrolled nodes in store (PostgreSQL in production).
@@ -451,10 +484,24 @@ func (h *Handler) issueTokens(w http.ResponseWriter, r *http.Request) {
 		Count           int    `json:"count"`
 		TTLMinutes      int    `json:"ttlMinutes"`
 		RequireApproval bool   `json:"requireApproval"`
+		// With it, each token comes with a ready provision file.
+		Provision *provisionTemplate `json:"provision"`
 	}
-	if json.NewDecoder(io.LimitReader(r.Body, 16<<10)).Decode(&request) != nil {
+	if json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&request) != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
+	}
+	if p := request.Provision; p != nil {
+		switch p.Profile {
+		case "node", "workstation", "complete", "custom":
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provision.profile must be a profile that runs a node: node, workstation, complete or custom"})
+			return
+		}
+		if strings.TrimSpace(p.User) == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provision.user is required: the account whose agents run on the machine"})
+			return
+		}
 	}
 	tokens, err := h.enroll.IssueTokens(r.Context(), enroll.TokenRequest{
 		OrganizationID: request.OrganizationID, NodeName: request.NodeName, Count: request.Count,
@@ -464,7 +511,28 @@ func (h *Handler) issueTokens(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"instanceId": h.instance, "tokens": tokens})
+	if request.Provision == nil {
+		writeJSON(w, http.StatusCreated, map[string]any{"instanceId": h.instance, "tokens": tokens})
+		return
+	}
+	base := h.baseURL(r)
+	out := make([]map[string]any, len(tokens))
+	for i, token := range tokens {
+		join := map[string]any{"url": base, "enrollmentToken": token.Token}
+		file := map[string]any{"version": 1, "profile": request.Provision.Profile, "user": request.Provision.User, "command": join}
+		if token.NodeName != "" {
+			join["nodeName"] = token.NodeName
+			file["hostname"] = token.NodeName
+		}
+		if request.Provision.Policy != nil {
+			file["policy"] = request.Provision.Policy
+		}
+		if request.Provision.Preferences != nil {
+			file["preferences"] = request.Provision.Preferences
+		}
+		out[i] = map[string]any{"token": token.Token, "expiresAt": token.ExpiresAt, "nodeName": token.NodeName, "provision": file}
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"instanceId": h.instance, "tokens": out})
 }
 
 // listEnrollments shows every enrolled node and its state.
