@@ -25,6 +25,12 @@ func run() error {
 		return err
 	}
 	defer closeStore()
+	// Each node authenticates with its own token: node-1=token,node-2=token.
+	if tokens := server.ParseNodeTokens(os.Getenv("AGENTUX_COMMAND_NODE_TOKENS")); len(tokens) > 0 {
+		handler.WithNodeTokens(tokens)
+	} else {
+		log.Printf("AGENTUX_COMMAND_NODE_TOKENS is not set: protocol messages are not authenticated")
+	}
 
 	serviceContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

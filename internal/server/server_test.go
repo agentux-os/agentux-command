@@ -150,3 +150,60 @@ func TestProductionHandlerRequiresDatabaseURL(t *testing.T) {
 		t.Fatalf("expected production handler construction to fail without database URL, handler=%v close=%v err=%v", handler, closeStore != nil, err)
 	}
 }
+
+func post(t *testing.T, handler http.Handler, token string, message map[string]any) *httptest.ResponseRecorder {
+	t.Helper()
+	body, _ := json.Marshal(message)
+	request := httptest.NewRequest(http.MethodPost, "/v1/protocol/messages", bytes.NewReader(body))
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	return response
+}
+
+func nodeParams(extra map[string]any) map[string]any {
+	params := map[string]any{"protocolVersion": "v1", "organizationId": "org-1", "nodeId": "node-1", "messageId": "m", "occurredAt": "2026-10-21T12:00:00Z"}
+	for k, v := range extra {
+		params[k] = v
+	}
+	return params
+}
+
+func TestNodeEventsShowInTheNodeList(t *testing.T) {
+	handler := NewHandler().WithNodeTokens(ParseNodeTokens("node-1=s3cret, node-2=other"))
+	hello := map[string]any{"jsonrpc": "2.0", "id": "h", "method": "node.hello", "params": nodeParams(map[string]any{
+		"capabilities": []string{"harness.status"}, "agentuxVersion": "0.4.8", "supportedProtocolVersions": []string{"v1"},
+	})}
+	if response := post(t, handler, "wrong", hello); response.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for a wrong token, got %d", response.Code)
+	}
+	if response := post(t, handler, "s3cret", hello); response.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", response.Code, response.Body.String())
+	}
+	status := map[string]any{"jsonrpc": "2.0", "method": "harness.status", "params": nodeParams(map[string]any{
+		"eventId": "node-1-1", "sequence": 1, "harnesses": []map[string]any{{"id": "codex", "installed": true, "signedIn": true}},
+	})}
+	if response := post(t, handler, "s3cret", status); response.Code != http.StatusAccepted {
+		t.Fatalf("expected 202, got %d: %s", response.Code, response.Body.String())
+	}
+	limits := map[string]any{"jsonrpc": "2.0", "method": "harness.limits_changed", "params": nodeParams(map[string]any{
+		"eventId": "node-1-2", "sequence": 2, "limits": []map[string]any{{"harness": "codex", "kind": "weekly"}},
+	})}
+	post(t, handler, "s3cret", limits)
+
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/v1/nodes", nil))
+	var nodesList []map[string]any
+	if err := json.Unmarshal(list.Body.Bytes(), &nodesList); err != nil || len(nodesList) != 1 {
+		t.Fatalf("unexpected node list: %s", list.Body.String())
+	}
+	node := nodesList[0]
+	if node["agentuxVersion"] != "0.4.8" || node["lastSequence"].(float64) != 2 {
+		t.Fatalf("unexpected node: %v", node)
+	}
+	if !bytes.Contains(list.Body.Bytes(), []byte(`"kind":"weekly"`)) || !bytes.Contains(list.Body.Bytes(), []byte(`"signedIn":true`)) {
+		t.Fatalf("expected harnesses and limits in the list: %s", list.Body.String())
+	}
+}

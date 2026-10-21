@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
+	"io"
 	"net/http"
 	"strings"
 
@@ -14,6 +16,28 @@ import (
 type Handler struct {
 	registry *nodes.Registry
 	office   office.OfficeRepository
+	// Node id to its bearer token. Empty: protocol messages are not
+	// authenticated (development only).
+	nodeTokens map[string]string
+}
+
+// WithNodeTokens requires each node's protocol messages to carry its token
+// (`Authorization: Bearer <token>`).
+func (h *Handler) WithNodeTokens(tokens map[string]string) *Handler {
+	h.nodeTokens = tokens
+	return h
+}
+
+// ParseNodeTokens reads `node-1=token1,node-2=token2`.
+func ParseNodeTokens(text string) map[string]string {
+	tokens := make(map[string]string)
+	for _, entry := range strings.Split(text, ",") {
+		node, token, ok := strings.Cut(strings.TrimSpace(entry), "=")
+		if ok && node != "" && token != "" {
+			tokens[strings.TrimSpace(node)] = strings.TrimSpace(token)
+		}
+	}
+	return tokens
 }
 
 func NewHandler() *Handler {
@@ -125,9 +149,16 @@ func authorized(r *http.Request) bool {
 }
 
 func (h *Handler) message(w http.ResponseWriter, r *http.Request) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 4<<20))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cannot read the message"})
+		return
+	}
 	var message protocol.Message
-	decoder := json.NewDecoder(r.Body)
-	if err := decoder.Decode(&message); err != nil {
+	var raw struct {
+		Params json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(body, &message) != nil || json.Unmarshal(body, &raw) != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
 		return
 	}
@@ -135,11 +166,31 @@ func (h *Handler) message(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
+	if len(h.nodeTokens) > 0 {
+		want, known := h.nodeTokens[message.Params.NodeID]
+		got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !known || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unknown node or token"})
+			return
+		}
+	}
 	switch message.Method {
 	case "node.hello":
-		h.registry.Hello(nodes.Node{ID: message.Params.NodeID, OrganizationID: message.Params.OrganizationID, Capabilities: message.Params.Capabilities})
+		h.registry.Hello(nodes.Node{
+			ID: message.Params.NodeID, OrganizationID: message.Params.OrganizationID, Capabilities: message.Params.Capabilities,
+			AgentUXVersion: message.Params.AgentUXVersion, LastSeenAt: message.Params.OccurredAt,
+		})
 	case "node.heartbeat":
-		h.registry.Heartbeat(message.Params.NodeID, message.Params.Status)
+		h.registry.HeartbeatWith(message.Params.NodeID, message.Params.Status, message.Params.Capacity, message.Params.OccurredAt)
+	default:
+		if protocol.EventMethods[message.Method] {
+			h.registry.Apply(nodes.Event{
+				NodeID: message.Params.NodeID, OrganizationID: message.Params.OrganizationID, Method: message.Method,
+				Sequence: message.Params.Sequence, OccurredAt: message.Params.OccurredAt, RunID: message.Params.RunID,
+				RequestID: message.Params.RequestID, State: message.Params.State,
+				Harnesses: message.Params.Harnesses, Limits: message.Params.Limits, Params: raw.Params,
+			})
+		}
 	}
 	writeJSON(w, http.StatusAccepted, map[string]any{"jsonrpc": "2.0", "id": message.ID, "result": map[string]string{"accepted": "true"}})
 }

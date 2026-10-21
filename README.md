@@ -61,6 +61,12 @@ That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/age
 
 The repository is under active integration development. The current gateway surface is always represented by `main`; versioned remote compatibility belongs to [AgentUX Protocol](https://github.com/agentux-os/agentux-protocol), so this README does not carry release-specific version numbers.
 
+## Node telemetry
+
+AgentUX nodes report themselves with the AgentUX node gateway (`aux node enroll`, then `aux node gateway`, in agentux-core). They POST AUXP messages to `/v1/protocol/messages`: `node.hello`, `node.heartbeat`, and events (`harness.status`, `harness.limits_changed`, `approval.requested`, `run.updated`, `run.completed`, `run.failed`, ...). `GET /v1/nodes` lists each node with its version, last heartbeat and capacity, its agent CLIs (installed, signed in, version, spend, plan usage), its usage limits, its latest run states and its pending approvals.
+
+Events are applied once per node sequence (duplicates are ignored), and a node Command does not know yet (after a restart) is registered by its first event. The node registry is in memory for now. With `AGENTUX_COMMAND_NODE_TOKENS=node-1=token,...` each node must send its own `Authorization: Bearer` token; without it, protocol messages are not authenticated (development only). Enrollment with issued tokens is tracked in [#3](https://github.com/agentux-os/agentux-command/issues/3) and [#7](https://github.com/agentux-os/agentux-command/issues/7).
+
 ## Office projection slice
 
 The current gateway exposes a storage-independent first slice for AgentUX Office:
