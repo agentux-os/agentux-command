@@ -34,7 +34,7 @@ func TestGatewayAcceptsHelloAndListsNode(t *testing.T) {
 	}
 
 	list := httptest.NewRecorder()
-	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/v1/nodes", nil))
+	handler.ServeHTTP(list, observer(httptest.NewRequest(http.MethodGet, "/v1/nodes", nil)))
 	if list.Code != http.StatusOK || !bytes.Contains(list.Body.Bytes(), []byte(`"nodeId":"node-1"`)) {
 		t.Fatalf("expected node in list, got %d: %s", list.Code, list.Body.String())
 	}
@@ -198,7 +198,7 @@ func TestNodeEventsShowInTheNodeList(t *testing.T) {
 	post(t, handler, "s3cret", limits)
 
 	list := httptest.NewRecorder()
-	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/v1/nodes", nil))
+	handler.ServeHTTP(list, observer(httptest.NewRequest(http.MethodGet, "/v1/nodes", nil)))
 	var nodesList []map[string]any
 	if err := json.Unmarshal(list.Body.Bytes(), &nodesList); err != nil || len(nodesList) != 1 {
 		t.Fatalf("unexpected node list: %s", list.Body.String())
@@ -283,7 +283,7 @@ func TestOperatorsSendCommandsToConnectedNodes(t *testing.T) {
 	}
 
 	list := httptest.NewRecorder()
-	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/v1/nodes", nil))
+	handler.ServeHTTP(list, observer(httptest.NewRequest(http.MethodGet, "/v1/nodes", nil)))
 	if !strings.Contains(list.Body.String(), `"connected":true`) {
 		t.Fatalf("expected the node connected: %s", list.Body.String())
 	}
@@ -390,7 +390,7 @@ func TestNodesWaitingForApprovalOnlySayHello(t *testing.T) {
 	if response, _ := call(t, handler, http.MethodPost, "/v1/protocol/messages", secret, hello); response.Code != http.StatusAccepted {
 		t.Fatalf("hello is accepted while waiting, got %d", response.Code)
 	}
-	_, listed := call(t, handler, http.MethodGet, "/v1/nodes", "", nil)
+	_, listed := call(t, handler, http.MethodGet, "/v1/nodes", "demo-observer", nil)
 	_ = listed
 	call(t, handler, http.MethodPost, "/v1/nodes/gpu-1/approve", "demo-leader", nil)
 	if response, _ := call(t, handler, http.MethodPost, "/v1/protocol/messages", secret, event); response.Code != http.StatusAccepted {
@@ -428,5 +428,23 @@ func TestTokensComeWithProvisionFiles(t *testing.T) {
 		"organizationId": "acme", "provision": map[string]any{"profile": "executive", "user": "dev"},
 	}); response.Code != http.StatusBadRequest {
 		t.Fatalf("an Executive runs no node to provision, got %d", response.Code)
+	}
+}
+
+// observer sends a request as an operator who may read the organization.
+func observer(request *http.Request) *http.Request {
+	request.Header.Set("Authorization", "Bearer demo-observer")
+	return request
+}
+
+func TestNodeListNeedsAnOperator(t *testing.T) {
+	handler := NewHandler()
+	for _, token := range []string{"", "not-a-token"} {
+		if response, _ := call(t, handler, http.MethodGet, "/v1/nodes", token, nil); response.Code != http.StatusForbidden {
+			t.Fatalf("listing nodes with %q must be refused, got %d", token, response.Code)
+		}
+	}
+	if response, _ := call(t, handler, http.MethodGet, "/v1/nodes", "demo-observer", nil); response.Code != http.StatusOK {
+		t.Fatalf("an observer lists nodes, got %d", response.Code)
 	}
 }

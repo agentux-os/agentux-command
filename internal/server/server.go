@@ -146,6 +146,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/nodes":
+		// Node telemetry names repositories, agents and spend: operators only.
+		if !hasCapability(r, "organization.read") {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "organization.read capability required"})
+			return
+		}
 		list := h.registry.List()
 		for i := range list {
 			list[i].Connected = h.hub.Connected(list[i].ID)
