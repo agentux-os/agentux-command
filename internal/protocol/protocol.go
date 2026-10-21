@@ -55,6 +55,7 @@ var EventMethods = map[string]bool{
 	"harness.status":         true,
 	"harness.limits_changed": true,
 	"command.denied":         true,
+	"command.completed":      true,
 }
 
 func Validate(message Message) error {

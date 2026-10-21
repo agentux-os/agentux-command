@@ -25,6 +25,8 @@ type Node struct {
 	Runs             map[string]json.RawMessage `json:"runs,omitempty"`
 	PendingApprovals map[string]json.RawMessage `json:"pendingApprovals,omitempty"`
 	LastSequence     int64                      `json:"lastSequence"`
+	// Whether the node has its command connection open (set by the server).
+	Connected bool `json:"connected"`
 }
 
 // Event is one node event as the registry applies it.
