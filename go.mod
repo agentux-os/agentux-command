@@ -2,7 +2,10 @@ module github.com/agentux-os/agentux-command
 
 go 1.25
 
-require github.com/jackc/pgx/v5 v5.7.6
+require (
+	github.com/coder/websocket v1.8.14
+	github.com/jackc/pgx/v5 v5.7.6
+)
 
 require (
 	github.com/jackc/pgpassfile v1.0.0 // indirect

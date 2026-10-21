@@ -7,7 +7,11 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
 
 	"github.com/agentux-os/agentux-command/internal/office"
 )
@@ -205,5 +209,82 @@ func TestNodeEventsShowInTheNodeList(t *testing.T) {
 	}
 	if !bytes.Contains(list.Body.Bytes(), []byte(`"kind":"weekly"`)) || !bytes.Contains(list.Body.Bytes(), []byte(`"signedIn":true`)) {
 		t.Fatalf("expected harnesses and limits in the list: %s", list.Body.String())
+	}
+}
+
+func TestOperatorsSendCommandsToConnectedNodes(t *testing.T) {
+	handler := NewHandler().WithNodeTokens(ParseNodeTokens("node-1=s3cret"))
+	server := httptest.NewServer(handler)
+	defer server.Close()
+	hello := map[string]any{"jsonrpc": "2.0", "id": "h", "method": "node.hello", "params": nodeParams(map[string]any{
+		"capabilities": []string{"harness.list"}, "agentuxVersion": "0.4.9", "supportedProtocolVersions": []string{"v1"},
+	})}
+	post(t, handler, "s3cret", hello)
+
+	command := func(token string, body string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "/v1/nodes/node-1/commands", strings.NewReader(body))
+		request.Header.Set("Authorization", "Bearer "+token)
+		response := httptest.NewRecorder()
+		handler.ServeHTTP(response, request)
+		return response
+	}
+	if response := command("demo-observer", `{"method":"harness.list","params":{}}`); response.Code != http.StatusForbidden {
+		t.Fatalf("observers must not send commands, got %d", response.Code)
+	}
+	if response := command("demo-leader", `{"method":"harness.list","params":{}}`); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 before the node connects, got %d", response.Code)
+	}
+	if response := command("demo-leader", `{"method":"shell.exec","params":{}}`); response.Code != http.StatusBadRequest {
+		t.Fatalf("unknown methods must be refused, got %d", response.Code)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	url := "ws" + strings.TrimPrefix(server.URL, "http") + "/v1/protocol/connect?nodeId=node-1"
+	if _, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: http.Header{"Authorization": {"Bearer wrong"}}}); err == nil {
+		t.Fatal("a wrong node token must not connect")
+	}
+	ws, _, err := websocket.Dial(ctx, url, &websocket.DialOptions{HTTPHeader: http.Header{"Authorization": {"Bearer s3cret"}}})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer ws.CloseNow()
+	go func() {
+		for {
+			_, data, err := ws.Read(context.Background())
+			if err != nil {
+				return
+			}
+			var request struct {
+				ID     string         `json:"id"`
+				Method string         `json:"method"`
+				Params map[string]any `json:"params"`
+			}
+			_ = json.Unmarshal(data, &request)
+			answer := map[string]any{"jsonrpc": "2.0", "id": request.ID, "result": map[string]any{"method": request.Method, "nodeId": request.Params["nodeId"]}}
+			if request.Method == "preferences.set" {
+				answer = map[string]any{"jsonrpc": "2.0", "id": request.ID, "error": map[string]any{"code": -32010, "message": "awaiting_local_confirmation"}}
+			}
+			out, _ := json.Marshal(answer)
+			_ = ws.Write(context.Background(), websocket.MessageText, out)
+		}
+	}()
+	for !handler.hub.Connected("node-1") {
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	response := command("demo-leader", `{"method":"harness.list","commandId":"cmd-1","params":{}}`)
+	if response.Code != http.StatusOK || !strings.Contains(response.Body.String(), `"nodeId":"node-1"`) {
+		t.Fatalf("expected the node's answer, got %d: %s", response.Code, response.Body.String())
+	}
+	response = command("demo-leader", `{"method":"preferences.set","params":{"preferences":{}}}`)
+	if response.Code != http.StatusConflict || !strings.Contains(response.Body.String(), "awaiting_local_confirmation") {
+		t.Fatalf("expected a held command, got %d: %s", response.Code, response.Body.String())
+	}
+
+	list := httptest.NewRecorder()
+	handler.ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/v1/nodes", nil))
+	if !strings.Contains(list.Body.String(), `"connected":true`) {
+		t.Fatalf("expected the node connected: %s", list.Body.String())
 	}
 }
