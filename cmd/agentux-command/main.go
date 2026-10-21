@@ -33,6 +33,9 @@ func run() error {
 		log.Printf("AGENTUX_COMMAND_INSECURE_OPEN_NODES=1: nodes that never enrolled may report")
 		handler.WithOpenNodes(true)
 	}
+	if url := os.Getenv("AGENTUX_COMMAND_PUBLIC_URL"); url != "" {
+		handler.WithPublicURL(url)
+	}
 	log.Printf("agentux-command instance %s", handler.InstanceID())
 
 	serviceContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)

@@ -77,6 +77,8 @@ Every Command server has an **instance id** (`GET /v1/instance`), created once a
 
 So two Command servers in one institution never take each other's nodes: tokens and credentials only work on the server that issued them, and nodes refuse commands from any other instance. Nodes are never discovered or joined automatically. The command connection answers with `X-AgentUX-Command-Instance`, `node.hello` with the `instanceId`, and every command carries `commandInstanceId`.
 
+**Fleets of VMs.** Add `"provision": { "profile": "node", "user": "dev", "policy"?, "preferences"? }` to the token request, and each token comes with a ready provision file (`version`, `profile`, `user`, `command.url`, `command.enrollmentToken`, ...) for `aux provision` (agentux-core `docs/provision.md`): give each VM its file through QEMU fw_cfg, an `AGENTUX` disk or the kernel command line, and it comes up enrolled. The URL in it is `AGENTUX_COMMAND_PUBLIC_URL`, or the address the request came to.
+
 Static tokens (`AGENTUX_COMMAND_NODE_TOKENS`) still work. Nodes that are neither enrolled nor listed are refused, except on the in-memory demo server or with `AGENTUX_COMMAND_INSECURE_OPEN_NODES=1`.
 
 ## Node commands
