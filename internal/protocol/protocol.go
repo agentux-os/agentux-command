@@ -1,6 +1,7 @@
 package protocol
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
@@ -30,6 +31,30 @@ type Params struct {
 	Capacity                  any      `json:"capacity,omitempty"`
 	LastAcknowledgedSequence  int64    `json:"lastAcknowledgedSequence,omitempty"`
 	ProviderToken             string   `json:"providerToken,omitempty"`
+	// Event payloads Command keeps as the node sent them.
+	Harnesses json.RawMessage `json:"harnesses,omitempty"`
+	Limits    json.RawMessage `json:"limits,omitempty"`
+	RequestID string          `json:"requestId,omitempty"`
+	State     string          `json:"state,omitempty"`
+}
+
+// EventMethods are the node → command notifications that carry an event
+// identity (eventId, sequence).
+var EventMethods = map[string]bool{
+	"node.status_changed":    true,
+	"run.accepted":           true,
+	"run.started":            true,
+	"run.updated":            true,
+	"session.event":          true,
+	"approval.requested":     true,
+	"gate.completed":         true,
+	"run.completed":          true,
+	"run.failed":             true,
+	"artifact.available":     true,
+	"node.alert":             true,
+	"harness.status":         true,
+	"harness.limits_changed": true,
+	"command.denied":         true,
 }
 
 func Validate(message Message) error {
@@ -81,7 +106,22 @@ func Validate(message Message) error {
 			}
 		}
 	default:
-		return fmt.Errorf("unsupported AUXP method %q", message.Method)
+		if !EventMethods[message.Method] {
+			return fmt.Errorf("unsupported AUXP method %q", message.Method)
+		}
+		if message.Params.EventID == "" || message.Params.Sequence < 1 {
+			return fmt.Errorf("%s requires eventId and a positive sequence", message.Method)
+		}
+		switch message.Method {
+		case "harness.status":
+			if len(message.Params.Harnesses) == 0 {
+				return fmt.Errorf("harness.status requires harnesses")
+			}
+		case "harness.limits_changed":
+			if len(message.Params.Limits) == 0 {
+				return fmt.Errorf("harness.limits_changed requires limits")
+			}
+		}
 	}
 	return nil
 }
