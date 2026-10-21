@@ -28,9 +28,12 @@ func run() error {
 	// Each node authenticates with its own token: node-1=token,node-2=token.
 	if tokens := server.ParseNodeTokens(os.Getenv("AGENTUX_COMMAND_NODE_TOKENS")); len(tokens) > 0 {
 		handler.WithNodeTokens(tokens)
-	} else {
-		log.Printf("AGENTUX_COMMAND_NODE_TOKENS is not set: protocol messages are not authenticated")
 	}
+	if os.Getenv("AGENTUX_COMMAND_INSECURE_OPEN_NODES") == "1" {
+		log.Printf("AGENTUX_COMMAND_INSECURE_OPEN_NODES=1: nodes that never enrolled may report")
+		handler.WithOpenNodes(true)
+	}
+	log.Printf("agentux-command instance %s", handler.InstanceID())
 
 	serviceContext, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
