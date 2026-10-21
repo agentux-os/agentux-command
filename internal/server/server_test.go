@@ -288,3 +288,123 @@ func TestOperatorsSendCommandsToConnectedNodes(t *testing.T) {
 		t.Fatalf("expected the node connected: %s", list.Body.String())
 	}
 }
+
+func call(t *testing.T, handler http.Handler, method, path, token string, body any) (*httptest.ResponseRecorder, map[string]any) {
+	t.Helper()
+	data, _ := json.Marshal(body)
+	request := httptest.NewRequest(method, path, bytes.NewReader(data))
+	if token != "" {
+		request.Header.Set("Authorization", "Bearer "+token)
+	}
+	response := httptest.NewRecorder()
+	handler.ServeHTTP(response, request)
+	var out map[string]any
+	_ = json.Unmarshal(response.Body.Bytes(), &out)
+	return response, out
+}
+
+func TestNodesEnrollWithOneCommandOnly(t *testing.T) {
+	ours := NewHandler().WithOpenNodes(false)
+	theirs := NewHandler().WithOpenNodes(false)
+	if ours.InstanceID() == theirs.InstanceID() {
+		t.Fatal("each Command server has its own instance id")
+	}
+	_, instance := call(t, ours, http.MethodGet, "/v1/instance", "", nil)
+	if instance["instanceId"] != ours.InstanceID() {
+		t.Fatalf("unexpected instance: %v", instance)
+	}
+
+	if response, _ := call(t, ours, http.MethodPost, "/v1/enrollment-tokens", "demo-observer", map[string]any{"organizationId": "acme"}); response.Code != http.StatusForbidden {
+		t.Fatalf("observers must not issue tokens, got %d", response.Code)
+	}
+	_, issued := call(t, ours, http.MethodPost, "/v1/enrollment-tokens", "demo-leader", map[string]any{"organizationId": "acme", "count": 2})
+	tokens := issued["tokens"].([]any)
+	token := tokens[0].(map[string]any)["token"].(string)
+	_, foreign := call(t, theirs, http.MethodPost, "/v1/enrollment-tokens", "demo-leader", map[string]any{"organizationId": "acme"})
+	foreignToken := foreign["tokens"].([]any)[0].(map[string]any)["token"].(string)
+
+	// Another Command's token cannot capture this node, nor ours theirs.
+	if response, _ := call(t, ours, http.MethodPost, "/v1/enroll", "", map[string]any{"token": foreignToken, "hostname": "box"}); response.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for another instance's token, got %d", response.Code)
+	}
+	response, enrolled := call(t, ours, http.MethodPost, "/v1/enroll", "", map[string]any{"token": token, "hostname": "box"})
+	if response.Code != http.StatusOK || enrolled["instanceId"] != ours.InstanceID() || enrolled["organizationId"] != "acme" {
+		t.Fatalf("enroll: %d %v", response.Code, enrolled)
+	}
+	nodeID, secret := enrolled["nodeId"].(string), enrolled["nodeSecret"].(string)
+	if response, _ := call(t, ours, http.MethodPost, "/v1/enroll", "", map[string]any{"token": token}); response.Code != http.StatusUnauthorized {
+		t.Fatalf("a token is used once, got %d", response.Code)
+	}
+
+	params := func(org string, extra map[string]any) map[string]any {
+		p := map[string]any{"protocolVersion": "v1", "organizationId": org, "nodeId": nodeID, "messageId": "m", "occurredAt": "2026-10-21T12:00:00Z"}
+		for k, v := range extra {
+			p[k] = v
+		}
+		return p
+	}
+	hello := map[string]any{"jsonrpc": "2.0", "id": "h", "method": "node.hello", "params": params("acme", map[string]any{
+		"capabilities": []string{"harness.list"}, "agentuxVersion": "0.4.9", "supportedProtocolVersions": []string{"v1"},
+	})}
+	response, accepted := call(t, ours, http.MethodPost, "/v1/protocol/messages", secret, hello)
+	if response.Code != http.StatusAccepted || accepted["result"].(map[string]any)["instanceId"] != ours.InstanceID() {
+		t.Fatalf("hello: %d %v", response.Code, accepted)
+	}
+	// The credential is bound to its organization and to this server.
+	wrongOrg := map[string]any{"jsonrpc": "2.0", "id": "h", "method": "node.hello", "params": params("other-org", map[string]any{
+		"capabilities": []string{"harness.list"}, "agentuxVersion": "0.4.9", "supportedProtocolVersions": []string{"v1"},
+	})}
+	if response, _ := call(t, ours, http.MethodPost, "/v1/protocol/messages", secret, wrongOrg); response.Code != http.StatusUnauthorized {
+		t.Fatalf("another organization must be refused, got %d", response.Code)
+	}
+	if response, _ := call(t, theirs, http.MethodPost, "/v1/protocol/messages", secret, hello); response.Code != http.StatusUnauthorized {
+		t.Fatalf("another Command must refuse the node, got %d", response.Code)
+	}
+
+	// Revoked: refused.
+	if response, _ := call(t, ours, http.MethodPost, "/v1/nodes/"+nodeID+"/revoke", "demo-leader", nil); response.Code != http.StatusOK {
+		t.Fatalf("revoke: %d", response.Code)
+	}
+	if response, _ := call(t, ours, http.MethodPost, "/v1/protocol/messages", secret, hello); response.Code != http.StatusUnauthorized {
+		t.Fatalf("a revoked node must be refused, got %d", response.Code)
+	}
+}
+
+func TestNodesWaitingForApprovalOnlySayHello(t *testing.T) {
+	handler := NewHandler().WithOpenNodes(false)
+	_, issued := call(t, handler, http.MethodPost, "/v1/enrollment-tokens", "demo-leader", map[string]any{"organizationId": "acme", "nodeName": "gpu-1", "requireApproval": true})
+	token := issued["tokens"].([]any)[0].(map[string]any)["token"].(string)
+	_, enrolled := call(t, handler, http.MethodPost, "/v1/enroll", "", map[string]any{"token": token})
+	if enrolled["nodeId"] != "gpu-1" || enrolled["approved"] != false {
+		t.Fatalf("unexpected enrollment: %v", enrolled)
+	}
+	secret := enrolled["nodeSecret"].(string)
+	base := map[string]any{"protocolVersion": "v1", "organizationId": "acme", "nodeId": "gpu-1", "messageId": "m", "occurredAt": "2026-10-21T12:00:00Z"}
+	event := map[string]any{"jsonrpc": "2.0", "method": "harness.limits_changed", "params": merge(base, map[string]any{"eventId": "e1", "sequence": 1, "limits": []any{}})}
+	if response, _ := call(t, handler, http.MethodPost, "/v1/protocol/messages", secret, event); response.Code != http.StatusForbidden {
+		t.Fatalf("a node waiting for approval must not send events, got %d", response.Code)
+	}
+	hello := map[string]any{"jsonrpc": "2.0", "id": "h", "method": "node.hello", "params": merge(base, map[string]any{
+		"capabilities": []string{"harness.list"}, "agentuxVersion": "0.4.9", "supportedProtocolVersions": []string{"v1"},
+	})}
+	if response, _ := call(t, handler, http.MethodPost, "/v1/protocol/messages", secret, hello); response.Code != http.StatusAccepted {
+		t.Fatalf("hello is accepted while waiting, got %d", response.Code)
+	}
+	_, listed := call(t, handler, http.MethodGet, "/v1/nodes", "", nil)
+	_ = listed
+	call(t, handler, http.MethodPost, "/v1/nodes/gpu-1/approve", "demo-leader", nil)
+	if response, _ := call(t, handler, http.MethodPost, "/v1/protocol/messages", secret, event); response.Code != http.StatusAccepted {
+		t.Fatalf("an approved node sends events, got %d", response.Code)
+	}
+}
+
+func merge(a, b map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range a {
+		out[k] = v
+	}
+	for k, v := range b {
+		out[k] = v
+	}
+	return out
+}

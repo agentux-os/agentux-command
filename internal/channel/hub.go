@@ -128,6 +128,16 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, nodeID string) {
 	}
 }
 
+// Disconnect closes a node's command connection (a revoked node).
+func (h *Hub) Disconnect(nodeID string) {
+	h.mu.Lock()
+	c, ok := h.conns[nodeID]
+	h.mu.Unlock()
+	if ok {
+		c.ws.Close(websocket.StatusPolicyViolation, "revoked")
+	}
+}
+
 // Send writes a command to a node and waits for its answer, at most until
 // ctx ends. params must carry the commandId, which is also the request id.
 func (h *Hub) Send(ctx context.Context, nodeID, method string, params map[string]any) (Response, error) {

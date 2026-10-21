@@ -67,9 +67,21 @@ AgentUX nodes report themselves with the AgentUX node gateway (`aux node enroll`
 
 Events are applied once per node sequence (duplicates are ignored), and a node Command does not know yet (after a restart) is registered by its first event. The node registry is in memory for now. With `AGENTUX_COMMAND_NODE_TOKENS=node-1=token,...` each node must send its own `Authorization: Bearer` token; without it, protocol messages are not authenticated (development only). Enrollment with issued tokens is tracked in [#3](https://github.com/agentux-os/agentux-command/issues/3) and [#7](https://github.com/agentux-os/agentux-command/issues/7).
 
+## Node enrollment
+
+Every Command server has an **instance id** (`GET /v1/instance`), created once and kept in its database. Nodes join one server, and only that one:
+
+1. An operator with `node.enroll` issues tokens: `POST /v1/enrollment-tokens` with `{ "organizationId", "count"?, "nodeName"?, "ttlMinutes"?, "requireApproval"? }`. A token (`auxe1_<instanceId>_<secret>`) names this server, is single use and expires (24 hours by default, 30 days at most). A token for a `nodeName` is for that node only. Tokens are shown once; only their hashes are stored.
+2. On the node, `aux node enroll <url>` reads the token and calls `POST /v1/enroll` (`{ token, nodeName?, hostname? }`). It gets the node's own credential (`auxn1_<secret>`), its node id (unique on this server: a suffix is added when a host name is taken, never someone else's id), its organization and the instance id, which the node pins.
+3. Nodes authenticate with that credential, which is bound to their node id and organization. A token of another Command server is refused (409), as is a message for another organization. With `requireApproval`, a node may only say hello until an operator approves it (`POST /v1/nodes/<id>/approve`); `POST /v1/nodes/<id>/revoke` cuts a node off and closes its connection. `GET /v1/enrollments` lists every enrolled node.
+
+So two Command servers in one institution never take each other's nodes: tokens and credentials only work on the server that issued them, and nodes refuse commands from any other instance. Nodes are never discovered or joined automatically. The command connection answers with `X-AgentUX-Command-Instance`, `node.hello` with the `instanceId`, and every command carries `commandInstanceId`.
+
+Static tokens (`AGENTUX_COMMAND_NODE_TOKENS`) still work. Nodes that are neither enrolled nor listed are refused, except on the in-memory demo server or with `AGENTUX_COMMAND_INSECURE_OPEN_NODES=1`.
+
 ## Node commands
 
-Nodes keep a command connection open: the gateway dials `GET /v1/protocol/connect?nodeId=<id>` (WebSocket, with its bearer token when `AGENTUX_COMMAND_NODE_TOKENS` is set). Operators send a node a command with `POST /v1/nodes/<nodeId>/commands` and `{ "method", "params", "commandId"? }`, with the `node.command` capability (`Bearer demo-leader` in the demo). Methods: `run.start`, `run.cancel`, `run.pause`, `run.resume`, `run.snapshot`, `request.resolve`, `bus.post`, `harness.list`, `harness.test`, `limits.clear`, `preferences.set`. Command fills in the envelope and a `commandId` when none is given, and answers with the node's `result` (200), its error (409 when the node holds the command for local confirmation or its policy denies it, 502 otherwise), 503 when the node is not connected, or 504 when it does not answer within 150 seconds. A command sent again with the same `commandId` gets the first answer. `GET /v1/nodes` says which nodes are `connected`.
+Nodes keep a command connection open: the gateway dials `GET /v1/protocol/connect?nodeId=<id>` (WebSocket, with its enrollment credential (or a static token)). Operators send a node a command with `POST /v1/nodes/<nodeId>/commands` and `{ "method", "params", "commandId"? }`, with the `node.command` capability (`Bearer demo-leader` in the demo). Methods: `run.start`, `run.cancel`, `run.pause`, `run.resume`, `run.snapshot`, `request.resolve`, `bus.post`, `harness.list`, `harness.test`, `limits.clear`, `preferences.set`. Command fills in the envelope and a `commandId` when none is given, and answers with the node's `result` (200), its error (409 when the node holds the command for local confirmation or its policy denies it, 502 otherwise), 503 when the node is not connected, or 504 when it does not answer within 150 seconds. A command sent again with the same `commandId` gets the first answer. `GET /v1/nodes` says which nodes are `connected`.
 
 ## Office projection slice
 

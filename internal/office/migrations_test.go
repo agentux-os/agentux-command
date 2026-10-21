@@ -9,7 +9,7 @@ import (
 
 func TestMigrationVersionsAreOrderedAndStartAtOne(t *testing.T) {
 	versions := MigrationVersions()
-	want := []int{1}
+	want := []int{1, 2}
 	if !reflect.DeepEqual(versions, want) {
 		t.Fatalf("expected ordered migration versions %v, got %v", want, versions)
 	}
