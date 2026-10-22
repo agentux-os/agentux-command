@@ -446,6 +446,49 @@ async fn definitions_live_in_the_database() {
         store.get("other", 1).await,
         Err(definitions::Error::NotFound)
     ));
+    // Version 2: a stale edit is refused; reviews by others count.
+    let bob = Actor::of("oidc:bob");
+    let mut reviewed = store.get("acme", 2).await.unwrap().document;
+    reviewed["organization"]["publication_policy"] = json!("review-required");
+    let draft = store
+        .replace_at("acme", 2, reviewed.clone(), &ana, now, Some(1))
+        .await
+        .unwrap();
+    assert_eq!(draft.revision, 2);
+    assert!(matches!(
+        store
+            .replace_at("acme", 2, reviewed, &bob, now, Some(1))
+            .await,
+        Err(definitions::Error::Stale { current: 2 })
+    ));
+    assert!(matches!(
+        store.publish("acme", 2, &ana, now).await,
+        Err(definitions::Error::ReviewRequired)
+    ));
+    let review = |reviewer: &Actor| definitions::Review {
+        reviewer: reviewer.clone(),
+        decision: "approved".into(),
+        comment: String::new(),
+        revision: 0,
+        reviewed_at: now,
+    };
+    assert!(matches!(
+        store.review("acme", 2, review(&ana), None).await,
+        Err(definitions::Error::OwnReview)
+    ));
+    let approved = store
+        .review("acme", 2, review(&bob), Some(2))
+        .await
+        .unwrap();
+    assert!(approved.approved());
+    let published = store
+        .publish_at("acme", 2, &ana, now, Some(2))
+        .await
+        .unwrap();
+    assert_eq!(
+        (published.status.as_str(), published.reviews.len()),
+        ("published", 1)
+    );
 }
 
 #[tokio::test]

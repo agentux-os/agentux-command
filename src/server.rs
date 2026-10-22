@@ -292,6 +292,10 @@ impl Handler {
                 "/v1/organizations/{org}/definitions/{version}/publish",
                 post(publish_definition),
             )
+            .route(
+                "/v1/organizations/{org}/definitions/{version}/reviews",
+                post(review_definition),
+            )
             .route("/v1/organizations/{org}/audit", get(organization_audit))
             .route("/v1/organizations/{org}/audit/export", get(export_audit))
             .route("/v1/organizations/{org}/events", get(organization_events))
@@ -1495,11 +1499,40 @@ fn definition_error(e: definitions::Error) -> Response {
             StatusCode::UNPROCESSABLE_ENTITY,
             json!({"error": "the definition does not validate", "problems": problems}),
         ),
+        definitions::Error::Stale { current } => reply(
+            StatusCode::CONFLICT,
+            json!({"error": "stale_draft", "message": e.to_string(), "currentRevision": current}),
+        ),
+        definitions::Error::ReviewRequired => reply(
+            StatusCode::CONFLICT,
+            json!({"error": "review_required", "message": e.to_string()}),
+        ),
+        definitions::Error::OwnReview => error(StatusCode::FORBIDDEN, &e.to_string()),
         definitions::Error::Storage(_) => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "definition store unavailable",
         ),
     }
+}
+
+/// The revision an `If-Match` header names (`"3"`, `3` or `W/"3"`).
+fn if_match(headers: &HeaderMap) -> Option<i64> {
+    let value = headers.get(header::IF_MATCH)?.to_str().ok()?.trim();
+    value
+        .trim_start_matches("W/")
+        .trim_matches('"')
+        .parse()
+        .ok()
+}
+
+/// A definition, with its revision as the `ETag` editors send back in
+/// `If-Match`.
+fn definition_reply(status: StatusCode, definition: &definitions::Definition) -> Response {
+    let mut response = reply(status, serde_json::to_value(definition).unwrap_or_default());
+    if let Ok(tag) = HeaderValue::from_str(&format!("\"{}\"", definition.revision)) {
+        response.headers_mut().insert(header::ETAG, tag);
+    }
+    response
 }
 
 /// The operator, when it holds `capability` in `org`; else the answer.
@@ -1544,18 +1577,24 @@ async fn get_definition(
         return *denied;
     }
     match s.definitions.get(&org, version).await {
-        Ok(definition) => reply(
-            StatusCode::OK,
-            serde_json::to_value(definition).unwrap_or_default(),
-        ),
+        Ok(definition) => definition_reply(StatusCode::OK, &definition),
         Err(e) => definition_error(e),
     }
 }
 
 /// A new draft, validated (the problems come back; it is kept either way).
+#[derive(Deserialize)]
+struct DraftQuery {
+    /// Start from this version's document (a rollback, or the next change
+    /// to the published one) instead of the body.
+    #[serde(default)]
+    from: Option<i64>,
+}
+
 async fn draft_definition(
     State(s): AppState,
     Path(org): Path<String>,
+    Query(query): Query<DraftQuery>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
@@ -1563,8 +1602,15 @@ async fn draft_definition(
         Ok(p) => p,
         Err(denied) => return *denied,
     };
-    let Some(document) = parse::<Value>(&body, 1 << 20) else {
-        return error(StatusCode::BAD_REQUEST, "invalid JSON");
+    let document = match query.from {
+        Some(version) => match s.definitions.get(&org, version).await {
+            Ok(definition) => definition.document,
+            Err(e) => return definition_error(e),
+        },
+        None => match parse::<Value>(&body, 1 << 20) {
+            Some(document) => document,
+            None => return error(StatusCode::BAD_REQUEST, "invalid JSON"),
+        },
     };
     match s
         .definitions
@@ -1579,10 +1625,7 @@ async fn draft_definition(
                 json!({"definitionVersion": definition.definition_version, "problems": definition.problems.len()}),
             )
             .await;
-            reply(
-                StatusCode::CREATED,
-                serde_json::to_value(definition).unwrap_or_default(),
-            )
+            definition_reply(StatusCode::CREATED, &definition)
         }
         Err(e) => definition_error(e),
     }
@@ -1604,12 +1647,13 @@ async fn replace_definition(
     };
     match s
         .definitions
-        .replace(
+        .replace_at(
             &org,
             version,
             document,
             &Actor::of(&operator.subject),
             Utc::now(),
+            if_match(&headers),
         )
         .await
     {
@@ -1621,10 +1665,7 @@ async fn replace_definition(
                 json!({"definitionVersion": definition.definition_version, "problems": definition.problems.len()}),
             )
             .await;
-            reply(
-                StatusCode::OK,
-                serde_json::to_value(definition).unwrap_or_default(),
-            )
+            definition_reply(StatusCode::OK, &definition)
         }
         Err(e) => definition_error(e),
     }
@@ -1642,7 +1683,13 @@ async fn publish_definition(
     };
     let published = match s
         .definitions
-        .publish(&org, version, &Actor::of(&operator.subject), Utc::now())
+        .publish_at(
+            &org,
+            version,
+            &Actor::of(&operator.subject),
+            Utc::now(),
+            if_match(&headers),
+        )
         .await
     {
         Ok(definition) => definition,
@@ -2132,4 +2179,60 @@ async fn export_audit(
         out,
     )
         .into_response()
+}
+
+#[derive(Deserialize)]
+struct ReviewRequest {
+    #[serde(default)]
+    decision: String,
+    #[serde(default)]
+    comment: String,
+}
+
+/// Reviews a draft's current revision (`approval.decide`): `approved` or
+/// `changes_requested`. Nobody reviews their own changes; `If-Match` makes
+/// sure the reviewer saw the revision they decide on.
+async fn review_definition(
+    State(s): AppState,
+    Path((org, version)): Path<(String, i64)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let operator = match operator_in(&s, &headers, &org, auth::APPROVAL_DECIDE).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let Some(request) = parse::<ReviewRequest>(&body, 64 << 10) else {
+        return error(StatusCode::BAD_REQUEST, "invalid JSON");
+    };
+    let review = definitions::Review {
+        reviewer: Actor::of(&operator.subject),
+        decision: request.decision,
+        comment: request.comment,
+        revision: 0,
+        reviewed_at: Utc::now(),
+    };
+    match s
+        .definitions
+        .review(&org, version, review, if_match(&headers))
+        .await
+    {
+        Ok(definition) => {
+            let last = definition.reviews.last();
+            s.audit(
+                &org,
+                "organization.definition.reviewed",
+                &operator,
+                json!({
+                    "definitionVersion": definition.definition_version,
+                    "revision": definition.revision,
+                    "decision": last.map(|r| r.decision.as_str()),
+                    "comment": last.map(|r| r.comment.as_str()),
+                }),
+            )
+            .await;
+            definition_reply(StatusCode::OK, &definition)
+        }
+        Err(e) => definition_error(e),
+    }
 }
