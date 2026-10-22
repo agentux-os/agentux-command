@@ -301,3 +301,84 @@ async fn sessions_live_in_the_database() {
     sessions.end(&secret).await.unwrap();
     assert!(sessions.resolve(&secret, now).await.is_none(), "ended");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn nodes_are_known_after_a_restart() {
+    use agentux_command::auth::{ORGANIZATION_READ, TokenRequest};
+    use agentux_command::server::{Handler, parse_node_tokens};
+    use axum::http::StatusCode;
+    let Some((_, pool, _, schema)) = store().await else {
+        return;
+    };
+    let url = url_with_schema(&schema);
+    let handler = Handler::postgres(&url)
+        .await
+        .unwrap()
+        .with_node_tokens(parse_node_tokens("node-1=s3cret"));
+    let reader = handler
+        .service_tokens()
+        .issue(
+            TokenRequest {
+                name: "reader".into(),
+                organization_id: "org-1".into(),
+                capabilities: vec![ORGANIZATION_READ.into()],
+                ..TokenRequest::default()
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap()
+        .secret;
+    let app = handler.router();
+    let mut hello = common::hello("org-1", "node-1");
+    hello["params"]["occurredAt"] = json!(chrono::Utc::now().to_rfc3339());
+    let (status, _) =
+        common::call(&app, "POST", "/v1/protocol/messages", "s3cret", Some(hello)).await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let harnesses = json!({"jsonrpc": "2.0", "method": "harness.status", "params": common::params("org-1", "node-1", json!({
+        "eventId": "node-1-1", "sequence": 1, "harnesses": [{"id": "codex", "installed": true}],
+    }))});
+    let mut harnesses = harnesses;
+    harnesses["params"]["occurredAt"] = json!(chrono::Utc::now().to_rfc3339());
+    let (status, _) = common::call(
+        &app,
+        "POST",
+        "/v1/protocol/messages",
+        "s3cret",
+        Some(harnesses),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    // The writer stores behind the request; wait for it.
+    let client = pool.get().await.unwrap();
+    for _ in 0..200 {
+        let stored = client
+            .query_opt(
+                "SELECT payload FROM node_state WHERE node_id = 'node-1'",
+                &[],
+            )
+            .await
+            .unwrap();
+        if stored.is_some_and(|row| row.get::<_, serde_json::Value>(0)["lastSequence"] == 1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    let restarted = Handler::postgres(&url).await.unwrap().router();
+    let (status, list) = common::call(&restarted, "GET", "/v1/nodes", &reader, None).await;
+    assert_eq!(status, StatusCode::OK);
+    let node = &list[0];
+    assert_eq!(node["nodeId"], "node-1");
+    assert_eq!(
+        node["harnesses"][0]["id"], "codex",
+        "what it reported survives"
+    );
+    assert_eq!(
+        node["lastSequence"], 1,
+        "so its next event is not taken for a duplicate"
+    );
+    assert_eq!(node["connected"], false);
+    assert_eq!(node["presence"], "online");
+}

@@ -1,16 +1,25 @@
-//! What Command knows of each node, from its messages. In memory: a restarted
-//! Command learns its nodes again from their next hello and events.
+//! What Command knows of each node, from its messages. Kept in memory for
+//! every request, and, on a production server, written to PostgreSQL behind
+//! each change ([`persist`]) and read back at startup, so a restarted Command
+//! still knows its nodes, their agents, runs and approvals.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Mutex, MutexGuard};
 
-use serde::Serialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::mpsc;
+
+/// A node heard from within this many seconds is online...
+const ONLINE_FOR: i64 = 90;
+/// ...within this many, degraded (heartbeats come every 30 seconds).
+const DEGRADED_FOR: i64 = 300;
 
 /// What Command knows of one AgentUX node: what it said in node.hello and
 /// heartbeats, and the latest of its agent, limit, run and approval events.
-#[derive(Debug, Clone, Default, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
 pub struct Node {
     #[serde(rename = "nodeId")]
     pub id: String,
@@ -37,6 +46,24 @@ pub struct Node {
     pub last_sequence: i64,
     /// Whether the node has its command connection open (set by the server).
     pub connected: bool,
+    /// `online`, `degraded` or `offline`, from how long ago it was last
+    /// heard from (set when listed).
+    #[serde(skip_deserializing)]
+    pub presence: String,
+}
+
+impl Node {
+    /// Online, degraded or offline at `now`, from when it was last heard.
+    pub fn presence_at(&self, now: DateTime<Utc>) -> &'static str {
+        let Ok(seen) = DateTime::parse_from_rfc3339(&self.last_seen_at) else {
+            return "offline";
+        };
+        match (now - seen.with_timezone(&Utc)).num_seconds() {
+            age if age <= ONLINE_FOR => "online",
+            age if age <= DEGRADED_FOR => "degraded",
+            _ => "offline",
+        }
+    }
 }
 
 /// One node event as the registry applies it.
@@ -62,6 +89,8 @@ const MAX_RUNS: usize = 200;
 #[derive(Default)]
 pub struct Registry {
     nodes: Mutex<HashMap<String, Node>>,
+    /// Where changed nodes go to be stored, when they are.
+    store: Mutex<Option<mpsc::UnboundedSender<Node>>>,
 }
 
 impl Registry {
@@ -71,6 +100,31 @@ impl Registry {
 
     fn lock(&self) -> MutexGuard<'_, HashMap<String, Node>> {
         self.nodes.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Sends every change from now on to `store` ([`persist::writer`]).
+    pub fn store_to(&self, store: mpsc::UnboundedSender<Node>) {
+        *self.store.lock().unwrap_or_else(|e| e.into_inner()) = Some(store);
+    }
+
+    /// Takes nodes stored before a restart, as they were.
+    pub fn load(&self, stored: Vec<Node>) {
+        let mut nodes = self.lock();
+        for mut node in stored {
+            node.connected = false;
+            nodes.insert(node.id.clone(), node);
+        }
+    }
+
+    fn stored(&self, node: &Node) {
+        if let Some(store) = self
+            .store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            let _ = store.send(node.clone());
+        }
     }
 
     pub fn hello(&self, mut node: Node) {
@@ -84,6 +138,7 @@ impl Registry {
             node.last_sequence = known.last_sequence;
         }
         node.status = "online".into();
+        self.stored(&node);
         nodes.insert(node.id.clone(), node);
     }
 
@@ -104,6 +159,7 @@ impl Registry {
         if !at.is_empty() {
             node.last_seen_at = at.into();
         }
+        self.stored(node);
     }
 
     /// Records a node event. Events are at least once: one whose sequence is
@@ -150,6 +206,7 @@ impl Registry {
             }
             _ => {}
         }
+        self.stored(node);
         true
     }
 
@@ -157,11 +214,76 @@ impl Registry {
         self.lock().get(id).cloned()
     }
 
-    /// Every node, by id.
+    /// Every node, by id, with its presence now.
     pub fn list(&self) -> Vec<Node> {
+        let now = Utc::now();
         let mut list: Vec<Node> = self.lock().values().cloned().collect();
+        for node in &mut list {
+            node.presence = node.presence_at(now).to_string();
+        }
         list.sort_by(|a, b| a.id.cmp(&b.id));
         list
+    }
+}
+
+/// The registry in PostgreSQL (migration 005_node_state).
+pub mod persist {
+    use std::collections::HashMap;
+
+    use tokio::sync::mpsc;
+    use tokio_postgres::types::Json;
+
+    use super::Node;
+
+    /// Every stored node.
+    pub async fn load(pool: &deadpool_postgres::Pool) -> Result<Vec<Node>, String> {
+        let client = pool.get().await.map_err(|e| e.to_string())?;
+        let rows = client
+            .query("SELECT payload FROM node_state ORDER BY node_id", &[])
+            .await
+            .map_err(|e| format!("read node state: {e}"))?;
+        Ok(rows
+            .iter()
+            .map(|row| row.get::<_, Json<Node>>(0).0)
+            .collect())
+    }
+
+    /// Starts the task that stores changed nodes; send it each change. A
+    /// burst of changes is written once per node, the latest.
+    pub fn writer(pool: deadpool_postgres::Pool) -> mpsc::UnboundedSender<Node> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Node>();
+        tokio::spawn(async move {
+            while let Some(first) = rx.recv().await {
+                let mut latest = HashMap::from([(first.id.clone(), first)]);
+                while let Ok(more) = rx.try_recv() {
+                    latest.insert(more.id.clone(), more);
+                }
+                if let Err(e) = write(&pool, latest.into_values()).await {
+                    eprintln!("agentux-command: cannot store node state: {e}");
+                }
+            }
+        });
+        tx
+    }
+
+    async fn write(
+        pool: &deadpool_postgres::Pool,
+        nodes: impl Iterator<Item = Node>,
+    ) -> Result<(), String> {
+        let client = pool.get().await.map_err(|e| e.to_string())?;
+        for mut node in nodes {
+            node.connected = false;
+            node.presence = String::new();
+            client
+                .execute(
+                    "INSERT INTO node_state (node_id, organization_id, payload, updated_at) VALUES ($1, $2, $3, now())
+                     ON CONFLICT (node_id) DO UPDATE SET organization_id = EXCLUDED.organization_id, payload = EXCLUDED.payload, updated_at = now()",
+                    &[&node.id, &node.organization_id, &Json(&node)],
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
     }
 }
 
@@ -193,6 +315,48 @@ fn trim_runs(runs: &mut BTreeMap<String, Value>) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn presence_follows_the_last_time_a_node_was_heard() {
+        let now = Utc::now();
+        let seen = |secs: i64| Node {
+            last_seen_at: (now - chrono::Duration::seconds(secs)).to_rfc3339(),
+            ..Node::default()
+        };
+        assert_eq!(seen(10).presence_at(now), "online");
+        assert_eq!(seen(200).presence_at(now), "degraded");
+        assert_eq!(seen(3600).presence_at(now), "offline");
+        assert_eq!(
+            Node::default().presence_at(now),
+            "offline",
+            "never heard from"
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_go_to_the_store_and_load_back() {
+        let registry = Registry::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        registry.store_to(tx);
+        registry.hello(Node {
+            id: "node-1".into(),
+            organization_id: "org-1".into(),
+            ..Node::default()
+        });
+        registry.heartbeat("node-1", "ready");
+        assert_eq!(rx.recv().await.unwrap().status, "online");
+        let latest = rx.recv().await.unwrap();
+        assert_eq!(latest.status, "ready");
+
+        let restarted = Registry::new();
+        restarted.load(vec![Node {
+            connected: true,
+            ..latest
+        }]);
+        let node = restarted.get("node-1").unwrap();
+        assert_eq!(node.status, "ready");
+        assert!(!node.connected, "no connection survives a restart");
+    }
 
     #[test]
     fn tracks_hello_and_heartbeat() {
