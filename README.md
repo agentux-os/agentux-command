@@ -141,6 +141,12 @@ cargo clippy --all-targets -- -D warnings
 The image the Quadlet runs, `ghcr.io/agentux-os/agentux-command`, is built
 from `Containerfile` for amd64 and arm64 by `.github/workflows/image.yml`:
 `:main` and `:sha-<12>` from `main`, `:X.Y.Z` and `:latest` from a `vX.Y.Z`
-tag that matches `Cargo.toml`. Locally: `podman build -t agentux-command -f Containerfile .`
+tag that matches `Cargo.toml`. Locally: `podman build -t agentux-command -f Containerfile .`
+
+**Releases.** A pull request bumps `version` in `Cargo.toml`, `Cargo.lock` and
+the image the Quadlet pins (`deploy/quadlet/agentux-command.container`); CI
+checks they agree. Pushing the matching `vX.Y.Z` tag publishes the image
+`:X.Y.Z` and the GitHub release with both binaries for x86_64 and aarch64, the
+deploy bundle and the migrations (`.github/workflows/release.yml`).
 
 

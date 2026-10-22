@@ -38,3 +38,8 @@ jobs:
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
       - run: node scripts/validate-bundle.mjs
+      - name: The Quadlet pins this version
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          grep -qx "Image=ghcr.io/agentux-os/agentux-command:$version" deploy/quadlet/agentux-command.container \
+            || { echo "::error::deploy/quadlet/agentux-command.container must pin agentux-command:$version"; exit 1; }
