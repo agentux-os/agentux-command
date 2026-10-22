@@ -89,8 +89,10 @@ Nodes keep a command connection open: the gateway dials `GET /v1/protocol/connec
 ## Operator access
 
 Every operator request resolves to a principal holding capabilities **per
-organization**: `organization.read`, `node.command`, `node.enroll`,
-`approval.decide` and `auth.admin`. A route acts on a record (a node, an
+organization**: `organization.read`, `organization.edit`,
+`organization.publish`, `node.command`, `node.enroll`, `approval.decide` and
+`auth.admin` (ADR 0015's vocabulary and how it maps:
+[ADR 0015, Acceptance](https://github.com/agentux-os/agentux/blob/main/docs/adr/0015-organization-command-office-contract.md#acceptance)). A route acts on a record (a node, an
 enrollment, an approval) only with the capability in **that record's
 organization**; another organization's nodes and enrollments are not listed,
 and are answered as unknown. No credential, or one Command does not accept,
@@ -147,6 +149,32 @@ AGENTUX_COMMAND_OIDC_SCOPES="openid profile email groups"  # default
 The demo tokens (`demo-leader`: every capability but `auth.admin` in every
 organization; `demo-observer`: `organization.read`) work on the in-memory demo
 server, and on a real one only with `AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1`.
+
+## Organization definitions
+
+An organization's areas, roles, missions, workflows, gates, agents and nodes
+are one versioned document, the
+[organization definition v1 contract](https://github.com/agentux-os/agentux/blob/main/docs/contracts/organization-definition-v1.md)
+(ADR 0015), kept field for field; fields this version does not know are kept.
+
+```text
+GET  /v1/organizations/<org>/definitions                    organization.read  (versions, newest first)
+POST /v1/organizations/<org>/definitions                    organization.edit  (a new draft)
+GET  /v1/organizations/<org>/definitions/<version>          organization.read
+PUT  /v1/organizations/<org>/definitions/<version>          organization.edit  (a draft only; 409 once published)
+POST /v1/organizations/<org>/definitions/<version>/publish  organization.publish
+GET  /v1/organizations/<org>/audit                          organization.read  (drafted, replaced, published; actor and time)
+```
+
+A draft is validated every time it is saved and keeps its problems (missing
+or duplicate ids, references to areas, roles, missions, gates or steps that do
+not exist, a step going outside its workflow, unknown permissions, a
+`human-required` gate no human role can pass, a `schema_version` other than
+1.x). Only a draft without problems is published (422 otherwise); a published
+version never changes again, and the next change is a new draft with the next
+number. Publishing records `organization.definition.published` in the Office
+event log, and the Office projection takes the organization, its areas,
+missions and agents, and the definition version from it.
 
 ## Office projection slice
 

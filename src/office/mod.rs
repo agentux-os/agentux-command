@@ -493,6 +493,29 @@ pub(crate) fn apply_projection_event(
         approval.insert("status".into(), Value::String("pending".into()));
         projection.approvals.push(approval);
     }
+    if event.event_type == "organization.definition.published"
+        && let Some(Value::Object(data)) = &event.data
+    {
+        if let Some(version) = data.get("definition_version").and_then(Value::as_i64) {
+            projection.definition_version = format!("definition-{version}");
+        }
+        if let Some(Value::Object(organization)) = data.get("organization") {
+            projection.organization = organization.clone();
+        }
+        let objects = |key: &str| -> Option<Vec<Object>> {
+            data.get(key)
+                .and_then(|v| serde_json::from_value(v.clone()).ok())
+        };
+        if let Some(areas) = objects("areas") {
+            projection.areas = areas;
+        }
+        if let Some(missions) = objects("missions") {
+            projection.missions = missions;
+        }
+        if let Some(agents) = objects("agents") {
+            projection.agents = agents;
+        }
+    }
     if event.event_type == "approval.resolved" {
         let Value::Object(resolution) = data() else {
             return Err(Error::Invalid(

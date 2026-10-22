@@ -7,6 +7,7 @@
 
 pub mod auth;
 pub mod channel;
+pub mod definitions;
 pub mod enroll;
 pub mod nodes;
 pub mod office;
