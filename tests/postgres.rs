@@ -382,3 +382,51 @@ async fn nodes_are_known_after_a_restart() {
     assert_eq!(node["connected"], false);
     assert_eq!(node["presence"], "online");
 }
+
+#[tokio::test]
+async fn definitions_live_in_the_database() {
+    use agentux_command::definitions::{self, Actor, Store};
+    let Some((_, pool, ..)) = store().await else {
+        return;
+    };
+    let store = definitions::Postgres::new(pool);
+    let ana = Actor::of("oidc:ana");
+    let now = chrono::Utc::now();
+    let mut doc = json!({"schema_version": "1.0", "organization": {"id": "acme", "name": "Acme"}, "areas": [], "roles": [], "missions": [], "workflows": [], "gates": [], "agents": [], "nodes": []});
+    let first = store.draft("acme", json!({}), &ana, now).await.unwrap();
+    assert_eq!(first.definition_version, 1);
+    assert!(matches!(
+        store.publish("acme", 1, &ana, now).await,
+        Err(definitions::Error::Invalid(_))
+    ));
+    store
+        .replace("acme", 1, doc.clone(), &ana, now)
+        .await
+        .unwrap();
+    let published = store.publish("acme", 1, &ana, now).await.unwrap();
+    assert_eq!(published.published_by, Some(ana.clone()));
+    doc["organization"]["name"] = json!("Changed");
+    assert!(matches!(
+        store.replace("acme", 1, doc.clone(), &ana, now).await,
+        Err(definitions::Error::Published)
+    ));
+    assert_eq!(
+        store.get("acme", 1).await.unwrap().document["organization"]["name"],
+        "Acme",
+        "published stays as published"
+    );
+    assert_eq!(
+        store
+            .draft("acme", doc, &ana, now)
+            .await
+            .unwrap()
+            .definition_version,
+        2
+    );
+    assert_eq!(store.list("acme").await.unwrap().len(), 2);
+    assert_eq!(store.audit("acme", 10).await.unwrap().len(), 4);
+    assert!(matches!(
+        store.get("other", 1).await,
+        Err(definitions::Error::NotFound)
+    ));
+}

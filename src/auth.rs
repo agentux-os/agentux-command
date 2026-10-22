@@ -32,6 +32,10 @@ pub const NODE_COMMAND: &str = "node.command";
 pub const NODE_ENROLL: &str = "node.enroll";
 /// Issues and revokes the organization's service tokens.
 pub const AUTH_ADMIN: &str = "auth.admin";
+/// Drafts and edits the organization's definition (ADR 0015).
+pub const ORGANIZATION_EDIT: &str = "organization.edit";
+/// Publishes a definition draft (ADR 0015).
+pub const ORGANIZATION_PUBLISH: &str = "organization.publish";
 
 /// Every capability, in a stable order.
 pub const CAPABILITIES: &[&str] = &[
@@ -40,6 +44,8 @@ pub const CAPABILITIES: &[&str] = &[
     NODE_COMMAND,
     NODE_ENROLL,
     AUTH_ADMIN,
+    ORGANIZATION_EDIT,
+    ORGANIZATION_PUBLISH,
 ];
 
 /// Grants in every organization (the demo tokens only).
@@ -139,6 +145,8 @@ impl Authenticator for DemoTokens {
                     APPROVAL_DECIDE,
                     NODE_COMMAND,
                     NODE_ENROLL,
+                    ORGANIZATION_EDIT,
+                    ORGANIZATION_PUBLISH,
                 ],
             )),
             "demo-observer" => {

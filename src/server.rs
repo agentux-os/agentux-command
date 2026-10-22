@@ -20,6 +20,7 @@ use subtle::ConstantTimeEq;
 
 use crate::auth::{self, DemoTokens, Principal, ServiceTokens, Sessions};
 use crate::channel::{Hub, SendError};
+use crate::definitions::{self, Actor};
 use crate::oidc::{self, Oidc};
 use auxp::enrollment;
 use auxp::provision::{CommandJoin, Provision};
@@ -56,6 +57,8 @@ struct Inner {
     sessions: Arc<dyn Sessions>,
     /// Sign-in with an OIDC provider, when configured.
     oidc: Option<Arc<Oidc>>,
+    /// Organization definitions and their audit log.
+    definitions: Arc<dyn definitions::Store>,
 }
 
 /// A Command server, configured with the `with_*` methods, served by
@@ -105,6 +108,7 @@ impl Handler {
                 demo_tokens: true,
                 sessions: Arc::new(auth::MemorySessions::default()),
                 oidc: None,
+                definitions: Arc::new(definitions::Memory::default()),
             },
         }
     }
@@ -119,6 +123,7 @@ impl Handler {
         let handler = Self::with_office(Arc::new(office::PostgresStore::new(pool.clone())))
             .with_service_tokens(Arc::new(auth::PostgresTokens::new(pool.clone())))
             .with_sessions(Arc::new(auth::PostgresSessions::new(pool.clone())))
+            .with_definitions(Arc::new(definitions::Postgres::new(pool.clone())))
             .with_stored_nodes(pool.clone())
             .await?
             .with_enroll_store(Arc::new(enroll::Postgres::new(pool)))
@@ -133,6 +138,12 @@ impl Handler {
         self.inner.registry.load(nodes::persist::load(&pool).await?);
         self.inner.registry.store_to(nodes::persist::writer(pool));
         Ok(self)
+    }
+
+    /// Keeps organization definitions and their audit log in `store`.
+    pub fn with_definitions(mut self, store: Arc<dyn definitions::Store>) -> Self {
+        self.inner.definitions = store;
+        self
     }
 
     /// Keeps signed-in operators' sessions in `store`.
@@ -225,6 +236,19 @@ impl Handler {
                 "/v1/service-tokens/{token}/revoke",
                 post(revoke_service_token),
             )
+            .route(
+                "/v1/organizations/{org}/definitions",
+                get(list_definitions).post(draft_definition),
+            )
+            .route(
+                "/v1/organizations/{org}/definitions/{version}",
+                get(get_definition).put(replace_definition),
+            )
+            .route(
+                "/v1/organizations/{org}/definitions/{version}/publish",
+                post(publish_definition),
+            )
+            .route("/v1/organizations/{org}/audit", get(organization_audit))
             .route("/v1/auth/login", get(login))
             .route("/v1/auth/callback", get(callback))
             .route("/v1/auth/logout", post(logout))
@@ -1214,4 +1238,203 @@ fn redirect(location: &str, cookie: Option<String>) -> Response {
         response.headers_mut().insert(header::SET_COOKIE, value);
     }
     response
+}
+
+/// The 4xx/5xx answer for a definition store error.
+fn definition_error(e: definitions::Error) -> Response {
+    match e {
+        definitions::Error::NotFound => error(StatusCode::NOT_FOUND, &e.to_string()),
+        definitions::Error::Published => error(StatusCode::CONFLICT, &e.to_string()),
+        definitions::Error::Invalid(problems) => reply(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            json!({"error": "the definition does not validate", "problems": problems}),
+        ),
+        definitions::Error::Storage(_) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "definition store unavailable",
+        ),
+    }
+}
+
+/// The operator, when it holds `capability` in `org`; else the answer.
+async fn operator_in(
+    s: &Inner,
+    headers: &HeaderMap,
+    org: &str,
+    capability: &str,
+) -> Result<Principal, Box<Response>> {
+    let operator = s.operator(headers).await?;
+    if !operator.can(org, capability) {
+        return Err(Box::new(forbidden(capability, org)));
+    }
+    Ok(operator)
+}
+
+/// Every version of an organization's definition (without documents).
+async fn list_definitions(
+    State(s): AppState,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = operator_in(&s, &headers, &org, auth::ORGANIZATION_READ).await {
+        return *denied;
+    }
+    match s.definitions.list(&org).await {
+        Ok(versions) => reply(
+            StatusCode::OK,
+            json!({"organizationId": org, "definitions": versions}),
+        ),
+        Err(e) => definition_error(e),
+    }
+}
+
+/// One version, with its document and validation result.
+async fn get_definition(
+    State(s): AppState,
+    Path((org, version)): Path<(String, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = operator_in(&s, &headers, &org, auth::ORGANIZATION_READ).await {
+        return *denied;
+    }
+    match s.definitions.get(&org, version).await {
+        Ok(definition) => reply(
+            StatusCode::OK,
+            serde_json::to_value(definition).unwrap_or_default(),
+        ),
+        Err(e) => definition_error(e),
+    }
+}
+
+/// A new draft, validated (the problems come back; it is kept either way).
+async fn draft_definition(
+    State(s): AppState,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let operator = match operator_in(&s, &headers, &org, auth::ORGANIZATION_EDIT).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let Some(document) = parse::<Value>(&body, 1 << 20) else {
+        return error(StatusCode::BAD_REQUEST, "invalid JSON");
+    };
+    match s
+        .definitions
+        .draft(&org, document, &Actor::of(&operator.subject), Utc::now())
+        .await
+    {
+        Ok(definition) => reply(
+            StatusCode::CREATED,
+            serde_json::to_value(definition).unwrap_or_default(),
+        ),
+        Err(e) => definition_error(e),
+    }
+}
+
+/// Replaces a draft; a published version answers 409.
+async fn replace_definition(
+    State(s): AppState,
+    Path((org, version)): Path<(String, i64)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let operator = match operator_in(&s, &headers, &org, auth::ORGANIZATION_EDIT).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let Some(document) = parse::<Value>(&body, 1 << 20) else {
+        return error(StatusCode::BAD_REQUEST, "invalid JSON");
+    };
+    match s
+        .definitions
+        .replace(
+            &org,
+            version,
+            document,
+            &Actor::of(&operator.subject),
+            Utc::now(),
+        )
+        .await
+    {
+        Ok(definition) => reply(
+            StatusCode::OK,
+            serde_json::to_value(definition).unwrap_or_default(),
+        ),
+        Err(e) => definition_error(e),
+    }
+}
+
+/// Publishes a draft that validates, and tells the Office projection.
+async fn publish_definition(
+    State(s): AppState,
+    Path((org, version)): Path<(String, i64)>,
+    headers: HeaderMap,
+) -> Response {
+    let operator = match operator_in(&s, &headers, &org, auth::ORGANIZATION_PUBLISH).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let published = match s
+        .definitions
+        .publish(&org, version, &Actor::of(&operator.subject), Utc::now())
+        .await
+    {
+        Ok(definition) => definition,
+        Err(e) => return definition_error(e),
+    };
+    let document = &published.document;
+    let event = office::Event {
+        event_id: format!("definition-{org}-{version}"),
+        event_type: "organization.definition.published".into(),
+        organization_id: org.clone(),
+        node_id: "command.definitions".into(),
+        sequence: version,
+        occurred_at: crate::now_rfc3339(),
+        data: Some(json!({
+            "definition_version": version,
+            "organization": document.get("organization"),
+            "areas": document.get("areas"),
+            "missions": document.get("missions"),
+            "agents": document.get("agents"),
+            "actor": published.published_by,
+        })),
+        ..office::Event::default()
+    };
+    if let Err(e) = s.office.apply_event(event).await {
+        eprintln!(
+            "agentux-command: definition {org} v{version} published, but the Office projection did not take it: {e}"
+        );
+    }
+    reply(
+        StatusCode::OK,
+        serde_json::to_value(published).unwrap_or_default(),
+    )
+}
+
+#[derive(Deserialize)]
+struct AuditQuery {
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// The organization's audit log, newest first.
+async fn organization_audit(
+    State(s): AppState,
+    Path(org): Path<String>,
+    Query(query): Query<AuditQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = operator_in(&s, &headers, &org, auth::ORGANIZATION_READ).await {
+        return *denied;
+    }
+    let limit = query.limit.unwrap_or(100).clamp(1, 1000);
+    match s.definitions.audit(&org, limit).await {
+        Ok(entries) => reply(
+            StatusCode::OK,
+            json!({"organizationId": org, "entries": entries}),
+        ),
+        Err(e) => definition_error(e),
+    }
 }
