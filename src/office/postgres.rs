@@ -197,6 +197,9 @@ pub async fn append_event(
         .map_err(storage("read office event cursor"))?
         .map(|row| row.get(0))
         .unwrap_or(0);
+    if event.sequence == 0 {
+        event.sequence = last + 1;
+    }
     if event.sequence <= last {
         return Err(Error::conflict(
             "stale_version",

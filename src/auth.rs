@@ -36,6 +36,8 @@ pub const AUTH_ADMIN: &str = "auth.admin";
 pub const ORGANIZATION_EDIT: &str = "organization.edit";
 /// Publishes a definition draft (ADR 0015).
 pub const ORGANIZATION_PUBLISH: &str = "organization.publish";
+/// Exports the organization's audit trail.
+pub const AUDIT_READ: &str = "audit.read";
 
 /// Every capability, in a stable order.
 pub const CAPABILITIES: &[&str] = &[
@@ -46,6 +48,7 @@ pub const CAPABILITIES: &[&str] = &[
     AUTH_ADMIN,
     ORGANIZATION_EDIT,
     ORGANIZATION_PUBLISH,
+    AUDIT_READ,
 ];
 
 /// Grants in every organization (the demo tokens only).
@@ -147,6 +150,7 @@ impl Authenticator for DemoTokens {
                     NODE_ENROLL,
                     ORGANIZATION_EDIT,
                     ORGANIZATION_PUBLISH,
+                    AUDIT_READ,
                 ],
             )),
             "demo-observer" => {
