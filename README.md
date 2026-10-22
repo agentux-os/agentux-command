@@ -90,8 +90,8 @@ Nodes keep a command connection open: the gateway dials `GET /v1/protocol/connec
 
 Every operator request resolves to a principal holding capabilities **per
 organization**: `organization.read`, `organization.edit`,
-`organization.publish`, `node.command`, `node.enroll`, `approval.decide` and
-`auth.admin` (ADR 0015's vocabulary and how it maps:
+`organization.publish`, `node.command`, `node.enroll`, `approval.decide`,
+`audit.read` and `auth.admin` (ADR 0015's vocabulary and how it maps:
 [ADR 0015, Acceptance](https://github.com/agentux-os/agentux/blob/main/docs/adr/0015-organization-command-office-contract.md#acceptance)). A route acts on a record (a node, an
 enrollment, an approval) only with the capability in **that record's
 organization**; another organization's nodes and enrollments are not listed,
@@ -253,6 +253,49 @@ organization's next event waits while an earlier one fails), retried with a
 backoff from 5 s to 10 min that survives restarts. Delivered events leave the
 outbox after a day; one the sink has not taken in 7 days is dropped from it,
 and stays in the log for replay.
+
+## Audit
+
+The organization's event log is its audit trail. Besides what nodes report
+and what runs do, it records, with the operator as `actor`:
+
+| Event | When |
+|---|---|
+| `organization.definition.drafted`, `.replaced`, `.published` | a definition changes |
+| `approval.resolved` | someone decides an approval (the decision, the reason) |
+| `mission.run.*` | a run starts, is paused, resumed or cancelled (and every step it takes) |
+| `node.command.sent` | an operator sends a node a command: the method, the command id and the outcome; never its params |
+| `node.enrollment_tokens.issued`, `node.approved`, `node.revoked` | nodes join or leave |
+| `auth.service_token.issued`, `.revoked` | service tokens change (never their secrets) |
+| `audit.exported` | someone exports the trail |
+
+```text
+GET /v1/organizations/<org>/audit/export?since=<time>&until=<time>   audit.read   (application/x-ndjson)
+```
+
+exports it, oldest first. Each line is `{"cursor", "event", "prev", "hash"}`,
+where `hash` is the hex sha256 of `prev`, a newline, and the line's compact
+JSON without `hash`. `prev` is the line before's `hash`, empty for the first.
+The last line is `{"organizationId", "count", "digest", "since", "until",
+"exportedAt"}`, where `digest` is the last hash. Keep the digest apart from the
+file: a line changed, dropped or reordered no longer chains to it. Free text
+in events (`prompt`, `detail`, `message`, `body`, `answer`, `reason`) is
+exported as `[redacted]`. One export carries at most 100,000 events
+(`"truncated": true` beyond that), so export by time range.
+
+To check a file in Python:
+
+```python
+import hashlib, json
+lines = [json.loads(l) for l in open("audit.ndjson")]
+prev = ""
+for record in lines[:-1]:
+    h = record.pop("hash")
+    assert record["prev"] == prev
+    assert h == hashlib.sha256((prev + "\n" + json.dumps(record, separators=(",", ":"), ensure_ascii=False)).encode()).hexdigest()
+    prev = h
+assert lines[-1]["digest"] == prev
+```
 
 ## Office projection
 

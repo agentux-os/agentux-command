@@ -453,6 +453,9 @@ impl OfficeRepository for Store {
         }
         let stream = (event.organization_id.clone(), event.node_id.clone());
         let last = state.sequences.get(&stream).copied().unwrap_or(0);
+        if event.sequence == 0 {
+            event.sequence = last + 1;
+        }
         if event.sequence <= last {
             return Err(Error::Invalid(format!(
                 "event sequence {} is not after {last} for {}/{}",
@@ -567,7 +570,10 @@ impl OfficeRepository for Store {
 }
 
 pub(crate) fn validate_event(event: &Event) -> Result<(), Error> {
-    if event.event_id.is_empty() || event.organization_id.is_empty() || event.sequence < 1 {
+    // Command's own streams (`command.*`) may leave the sequence to the log.
+    let numbered =
+        event.sequence >= 1 || (event.sequence == 0 && event.node_id.starts_with("command."));
+    if event.event_id.is_empty() || event.organization_id.is_empty() || !numbered {
         return Err(Error::Invalid(
             "event requires eventId, organizationId and positive sequence".into(),
         ));

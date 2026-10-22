@@ -291,6 +291,7 @@ impl Handler {
                 post(publish_definition),
             )
             .route("/v1/organizations/{org}/audit", get(organization_audit))
+            .route("/v1/organizations/{org}/audit/export", get(export_audit))
             .route("/v1/organizations/{org}/events", get(organization_events))
             .route(
                 "/v1/organizations/{org}/runs",
@@ -568,6 +569,28 @@ impl Inner {
         }
     }
 
+    /// Records what an operator did in the organization's event log, which
+    /// is its audit trail: what, who, and what it touched (never secrets or
+    /// prompts).
+    async fn audit(&self, org: &str, event_type: &str, operator: &Principal, data: Value) {
+        let event_id = format!("audit-{}", random_hex(12));
+        let event = office::Event {
+            event_id: event_id.clone(),
+            event_type: event_type.into(),
+            organization_id: org.into(),
+            node_id: "command.audit".into(),
+            occurred_at: crate::now_rfc3339(),
+            correlation_id: event_id,
+            actor: serde_json::to_value(Actor::of(&operator.subject)).ok(),
+            data: Some(data),
+            ..office::Event::default()
+        };
+        match self.office.apply_event(event).await {
+            Ok(()) => self.changed.notify_waiters(),
+            Err(e) => eprintln!("agentux-command: audit {event_type} in {org}: {e}"),
+        }
+    }
+
     /// The mission engine over this server's stores.
     fn engine(&self) -> missions::Engine {
         missions::Engine::new(
@@ -793,6 +816,7 @@ async fn command(
     } else {
         request.command_id
     };
+    let org = node.organization_id.clone();
     for (key, value) in [
         ("protocolVersion", "v1".to_string()),
         ("organizationId", node.organization_id),
@@ -810,6 +834,20 @@ async fn command(
     let answer = tokio::time::timeout(
         COMMAND_TIMEOUT,
         s.hub.send(&node_id, &request.method, params),
+    )
+    .await;
+    let outcome = match &answer {
+        Err(_) => "timeout",
+        Ok(Err(SendError::NotConnected)) => "unreachable",
+        Ok(Err(_)) => "disconnected",
+        Ok(Ok(a)) if a.error.is_some() => "refused",
+        Ok(Ok(_)) => "ok",
+    };
+    s.audit(
+        &org,
+        "node.command.sent",
+        &operator,
+        json!({"nodeId": node_id, "method": request.method, "commandId": command_id, "outcome": outcome}),
     )
     .await;
     match answer {
@@ -955,6 +993,7 @@ async fn issue_tokens(State(s): AppState, headers: HeaderMap, body: Bytes) -> Re
         return forbidden(auth::NODE_ENROLL, &request.organization_id);
     }
     let base = s.base_url(&headers);
+    let (org, require_approval) = (request.organization_id.clone(), request.require_approval);
     if let Some(template) = &request.provision {
         if template.user.trim().is_empty() {
             return error(
@@ -987,6 +1026,14 @@ async fn issue_tokens(State(s): AppState, headers: HeaderMap, body: Bytes) -> Re
         Ok(tokens) => tokens,
         Err(e) => return error(StatusCode::BAD_REQUEST, &e.to_string()),
     };
+    let names: Vec<&str> = tokens.iter().map(|t| t.node_name.as_str()).collect();
+    s.audit(
+        &org,
+        "node.enrollment_tokens.issued",
+        &operator,
+        json!({"count": tokens.len(), "nodeNames": names, "requireApproval": require_approval}),
+    )
+    .await;
     let Some(template) = request.provision else {
         return reply(
             StatusCode::CREATED,
@@ -1059,13 +1106,13 @@ async fn decide_node(
     if !operator.can_somewhere(auth::NODE_ENROLL) {
         return error(StatusCode::FORBIDDEN, "node.enroll capability required");
     }
-    match s.node_organization(&node_id).await {
-        Some(org) if operator.can(&org, auth::NODE_ENROLL) => {}
+    let org = match s.node_organization(&node_id).await {
+        Some(org) if operator.can(&org, auth::NODE_ENROLL) => org,
         Some(org) if operator.can(&org, auth::ORGANIZATION_READ) => {
             return forbidden(auth::NODE_ENROLL, &org);
         }
         _ => return error(StatusCode::NOT_FOUND, "unknown node"),
-    }
+    };
     let result = if action == "approve" {
         s.enroll.approve(&node_id, Utc::now()).await
     } else {
@@ -1075,6 +1122,15 @@ async fn decide_node(
         }
         result
     };
+    if result.is_ok() {
+        let event_type = if action == "approve" {
+            "node.approved"
+        } else {
+            "node.revoked"
+        };
+        s.audit(&org, event_type, &operator, json!({"nodeId": node_id}))
+            .await;
+    }
     match result {
         Ok(()) => reply(
             StatusCode::OK,
@@ -1231,11 +1287,21 @@ async fn issue_service_token(State(s): AppState, headers: HeaderMap, body: Bytes
         return forbidden(auth::AUTH_ADMIN, &request.organization_id);
     }
     request.created_by = operator.subject.clone();
+    let org = request.organization_id.clone();
     match s.service_tokens.issue(request, Utc::now()).await {
-        Ok(issued) => reply(
-            StatusCode::CREATED,
-            serde_json::to_value(issued).unwrap_or_default(),
-        ),
+        Ok(issued) => {
+            s.audit(
+                &org,
+                "auth.service_token.issued",
+                &operator,
+                json!({"tokenId": issued.token.id, "name": issued.token.name, "capabilities": issued.token.capabilities}),
+            )
+            .await;
+            reply(
+                StatusCode::CREATED,
+                serde_json::to_value(issued).unwrap_or_default(),
+            )
+        }
         Err(auth::Error::Invalid(e)) => error(StatusCode::BAD_REQUEST, &e),
         Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "token store unavailable"),
     }
@@ -1278,7 +1344,16 @@ async fn revoke_service_token(
         Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "token store unavailable"),
     };
     match s.service_tokens.revoke(&token.id, Utc::now()).await {
-        Ok(()) => reply(StatusCode::OK, json!({"id": token.id, "status": "revoked"})),
+        Ok(()) => {
+            s.audit(
+                &token.organization_id,
+                "auth.service_token.revoked",
+                &operator,
+                json!({"tokenId": token.id, "name": token.name}),
+            )
+            .await;
+            reply(StatusCode::OK, json!({"id": token.id, "status": "revoked"}))
+        }
         Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "token store unavailable"),
     }
 }
@@ -1486,10 +1561,19 @@ async fn draft_definition(
         .draft(&org, document, &Actor::of(&operator.subject), Utc::now())
         .await
     {
-        Ok(definition) => reply(
-            StatusCode::CREATED,
-            serde_json::to_value(definition).unwrap_or_default(),
-        ),
+        Ok(definition) => {
+            s.audit(
+                &org,
+                "organization.definition.drafted",
+                &operator,
+                json!({"definitionVersion": definition.definition_version, "problems": definition.problems.len()}),
+            )
+            .await;
+            reply(
+                StatusCode::CREATED,
+                serde_json::to_value(definition).unwrap_or_default(),
+            )
+        }
         Err(e) => definition_error(e),
     }
 }
@@ -1519,10 +1603,19 @@ async fn replace_definition(
         )
         .await
     {
-        Ok(definition) => reply(
-            StatusCode::OK,
-            serde_json::to_value(definition).unwrap_or_default(),
-        ),
+        Ok(definition) => {
+            s.audit(
+                &org,
+                "organization.definition.replaced",
+                &operator,
+                json!({"definitionVersion": definition.definition_version, "problems": definition.problems.len()}),
+            )
+            .await;
+            reply(
+                StatusCode::OK,
+                serde_json::to_value(definition).unwrap_or_default(),
+            )
+        }
         Err(e) => definition_error(e),
     }
 }
@@ -1908,4 +2001,125 @@ async fn control_run(
         Err(missions::Error::Invalid(m)) => error(StatusCode::CONFLICT, &m),
         Err(e) => mission_error(e),
     }
+}
+
+/// Fields of an event's data the audit export leaves out: what people and
+/// agents wrote, which an audit needs to know happened, not to read.
+const REDACTED: &[&str] = &["prompt", "detail", "message", "body", "answer", "reason"];
+
+/// `event` as the audit export shows it.
+fn redacted(mut event: office::Event) -> office::Event {
+    if let Some(Value::Object(data)) = &mut event.data {
+        for key in REDACTED {
+            if let Some(value) = data.get_mut(*key)
+                && !value.is_null()
+            {
+                *value = Value::String("[redacted]".into());
+            }
+        }
+    }
+    event
+}
+
+/// sha256 of `prev` and the compact JSON of `record`, in hex.
+pub fn chain_hash(prev: &str, record: &Value) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(prev.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(record.to_string().as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+#[derive(Deserialize)]
+struct ExportQuery {
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
+}
+
+/// The most events one export carries.
+const EXPORT_LIMIT: usize = 100_000;
+
+/// The organization's audit trail as NDJSON, tamper-evident: each line is
+/// `{"cursor", "event", "prev", "hash"}` with `hash` = sha256(`prev` + "\n" +
+/// the line's compact JSON without `hash`), `prev` the previous line's hash
+/// (empty for the first); the last line is `{"organizationId", "count",
+/// "digest", ...}`, `digest` the last hash. Prompts and other free text are
+/// redacted. Needs `audit.read`; the export itself is audited.
+async fn export_audit(
+    State(s): AppState,
+    Path(org): Path<String>,
+    Query(query): Query<ExportQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let operator = match operator_in(&s, &headers, &org, auth::AUDIT_READ).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let time = |value: &Option<String>| match value.as_deref() {
+        None | Some("") => Ok(None),
+        Some(text) => chrono::DateTime::parse_from_rfc3339(text)
+            .map(|t| Some(t.with_timezone(&Utc)))
+            .map_err(|_| ()),
+    };
+    let (Ok(since), Ok(until)) = (time(&query.since), time(&query.until)) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "since and until are RFC 3339 times",
+        );
+    };
+    let mut out = String::new();
+    let (mut prev, mut count, mut after) = (String::new(), 0usize, 0i64);
+    loop {
+        let replay = office::Replay {
+            after,
+            since,
+            until,
+            limit: 1000,
+        };
+        let batch = match s.office.events(&org, &replay).await {
+            Ok(batch) => batch,
+            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "event log unavailable"),
+        };
+        if batch.is_empty() || count >= EXPORT_LIMIT {
+            break;
+        }
+        for logged in batch {
+            after = logged.cursor;
+            let mut record =
+                json!({"cursor": logged.cursor, "event": redacted(logged.event), "prev": prev});
+            let hash = chain_hash(&prev, &record);
+            record["hash"] = Value::String(hash.clone());
+            out.push_str(&record.to_string());
+            out.push('\n');
+            prev = hash;
+            count += 1;
+        }
+    }
+    let summary = json!({
+        "organizationId": org,
+        "count": count,
+        "digest": prev,
+        "truncated": count >= EXPORT_LIMIT,
+        "since": query.since,
+        "until": query.until,
+        "exportedAt": crate::now_rfc3339(),
+    });
+    out.push_str(&summary.to_string());
+    out.push('\n');
+    s.audit(
+        &org,
+        "audit.exported",
+        &operator,
+        json!({"count": count, "digest": prev, "since": query.since, "until": query.until}),
+    )
+    .await;
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/x-ndjson")],
+        out,
+    )
+        .into_response()
 }
