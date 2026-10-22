@@ -36,7 +36,7 @@ That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/age
 
 ## Initial stack
 
-- Go HTTP/WebSocket service
+- Rust HTTP/WebSocket service (axum, tokio-postgres)
 - PostgreSQL for remote product state
 - Temporal for durable organization-level workflows
 - NATS for internal event distribution
@@ -127,9 +127,19 @@ database, applies versioned migrations and only then listens for requests.
 the PostgreSQL password through the Podman secret; the database URL does not
 contain the password.
 
-Run the tests locally:
+Build and run the tests locally (Rust stable; the PostgreSQL tests run when
+`AGENTUX_COMMAND_TEST_DATABASE_URL` points at a test database, and are
+skipped otherwise):
 
 ```sh
-go test ./...
+cargo build --release      # target/release/agentux-command, agentux-command-storage-report
+cargo test
+cargo clippy --all-targets -- -D warnings
 ```
+
+The image the Quadlet runs, `ghcr.io/agentux-os/agentux-command`, is built
+from `Containerfile` for amd64 and arm64 by `.github/workflows/image.yml`:
+`:main` and `:sha-<12>` from `main`, `:X.Y.Z` and `:latest` from a `vX.Y.Z`
+tag that matches `Cargo.toml`. Locally: `podman build -t agentux-command -f Containerfile .`
+
 

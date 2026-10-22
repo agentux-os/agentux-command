@@ -1,0 +1,8 @@
+target
+.git
+.github
+.worktrees
+docs
+deploy
+scripts
+tests
