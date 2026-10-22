@@ -107,10 +107,16 @@ fn is_zero(n: &i64) -> bool {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ResolutionRequest {
+    #[serde(deserialize_with = "crate::nullable")]
     pub organization_id: String,
+    #[serde(deserialize_with = "crate::nullable")]
     pub decision: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(
+        skip_serializing_if = "String::is_empty",
+        deserialize_with = "crate::nullable"
+    )]
     pub reason: String,
+    #[serde(deserialize_with = "crate::nullable")]
     pub idempotency_key: String,
 }
 

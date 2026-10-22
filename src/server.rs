@@ -18,26 +18,14 @@ use serde_json::{Map, Value, json};
 use subtle::ConstantTimeEq;
 
 use crate::channel::{Hub, SendError};
-use crate::enroll::{self, SECRET_PREFIX, TokenRequest};
+use auxp::enrollment;
+use auxp::provision::{CommandJoin, Provision};
+
+use crate::enroll::{self, TokenRequest};
 use crate::nodes::{self, Registry};
 use crate::office::{self, OfficeRepository, ResolutionRequest};
-use crate::protocol::{self, Message};
+use crate::protocol;
 use crate::random_hex;
-
-/// The commands operators may send to a node (AUXP command → node).
-const NODE_COMMANDS: &[&str] = &[
-    "run.start",
-    "run.cancel",
-    "run.pause",
-    "run.resume",
-    "run.snapshot",
-    "request.resolve",
-    "bus.post",
-    "harness.list",
-    "harness.test",
-    "limits.clear",
-    "preferences.set",
-];
 
 /// How long an operator's command waits for the node's answer.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(150);
@@ -246,7 +234,7 @@ impl Inner {
         organization_id: &str,
     ) -> Access {
         let got = bearer(headers);
-        if got.starts_with(SECRET_PREFIX) {
+        if enrollment::is_credential(got) {
             return match self.enroll.authenticate(node_id, got).await {
                 Ok(c) if !organization_id.is_empty() && c.organization_id != organization_id => {
                     Access::None
@@ -272,12 +260,9 @@ impl Inner {
 
     /// Records a valid node message in the registry.
     fn apply(&self, body: &[u8]) {
-        let Ok(message) = serde_json::from_slice::<Message>(body) else {
+        let Ok(message) = protocol::read(body) else {
             return;
         };
-        if protocol::validate(&message).is_err() {
-            return;
-        }
         let raw = serde_json::from_slice::<Value>(body)
             .ok()
             .and_then(|v| v.get("params").cloned());
@@ -374,12 +359,13 @@ async fn list_nodes(State(s): AppState, headers: HeaderMap) -> Response {
 }
 
 async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Response {
-    let Some(message) = parse::<Message>(&body, MESSAGE_LIMIT) else {
-        return error(StatusCode::BAD_REQUEST, "invalid JSON");
-    };
-    if let Err(e) = protocol::validate(&message) {
-        return error(StatusCode::BAD_REQUEST, &e);
+    if body.len() > MESSAGE_LIMIT {
+        return error(StatusCode::BAD_REQUEST, "the message is too large");
     }
+    let message = match protocol::read(&body) {
+        Ok(message) => message,
+        Err(e) => return error(StatusCode::BAD_REQUEST, &e),
+    };
     let p = &message.params;
     match s
         .node_access(&headers, &p.node_id, &p.organization_id)
@@ -456,18 +442,16 @@ async fn connect(
         });
     // Nodes check they reached the Command server they enrolled with.
     if let Ok(value) = HeaderValue::from_str(&s.instance) {
-        response
-            .headers_mut()
-            .insert("x-agentux-command-instance", value);
+        response.headers_mut().insert(auxp::INSTANCE_HEADER, value);
     }
     response
 }
 
 #[derive(Deserialize)]
 struct CommandRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::nullable")]
     method: String,
-    #[serde(rename = "commandId", default)]
+    #[serde(rename = "commandId", default, deserialize_with = "crate::nullable")]
     command_id: String,
     #[serde(default)]
     params: Option<Map<String, Value>>,
@@ -489,8 +473,8 @@ async fn command(
     let Some(node) = s.registry.get(&node_id) else {
         return error(StatusCode::NOT_FOUND, "unknown node");
     };
-    let request = parse::<CommandRequest>(&body, 1 << 20)
-        .filter(|r| NODE_COMMANDS.contains(&r.method.as_str()));
+    let request =
+        parse::<CommandRequest>(&body, 1 << 20).filter(|r| auxp::methods::is_command(&r.method));
     let Some(request) = request else {
         return error(
             StatusCode::BAD_REQUEST,
@@ -544,7 +528,7 @@ async fn command(
         Ok(Ok(answer)) => match answer.error {
             Some(e) => {
                 // Held for confirmation at the node, or denied by its policy.
-                let status = if e.code == -32010 || e.code == -32011 {
+                let status = if auxp::codes::is_policy(e.code) {
                     StatusCode::CONFLICT
                 } else {
                     StatusCode::BAD_GATEWAY
@@ -562,8 +546,12 @@ async fn command(
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 struct RedeemRequest {
+    #[serde(deserialize_with = "crate::nullable")]
     token: String,
+    /// `null` from a gateway enrolling without a name.
+    #[serde(deserialize_with = "crate::nullable")]
     node_name: String,
+    #[serde(deserialize_with = "crate::nullable")]
     hostname: String,
 }
 
@@ -605,27 +593,52 @@ async fn redeem(State(s): AppState, body: Bytes) -> Response {
     }
 }
 
-/// What an operator wants in each machine's provision file (agentux-core
-/// docs/provision.md).
+/// What an operator wants in each machine's provision file.
 #[derive(Deserialize)]
 struct ProvisionTemplate {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::nullable")]
     profile: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::nullable")]
     user: String,
     #[serde(default)]
-    policy: Option<Map<String, Value>>,
+    policy: Option<Value>,
     #[serde(default)]
-    preferences: Option<Map<String, Value>>,
+    preferences: Option<Value>,
+}
+
+impl ProvisionTemplate {
+    /// The provision file for one token: auxp's type, the one `aux provision`
+    /// reads.
+    fn file(&self, url: &str, token: &str, node_name: &str) -> Provision {
+        let node_name = (!node_name.is_empty()).then(|| node_name.to_string());
+        Provision {
+            version: auxp::provision::VERSION,
+            profile: self.profile.clone(),
+            hostname: node_name.clone(),
+            user: Some(self.user.clone()),
+            command: Some(CommandJoin {
+                url: url.to_string(),
+                enrollment_token: token.to_string(),
+                node_name,
+            }),
+            policy: self.policy.clone(),
+            preferences: self.preferences.clone(),
+        }
+    }
 }
 
 #[derive(Deserialize, Default)]
 #[serde(rename_all = "camelCase", default)]
 struct TokensRequest {
+    #[serde(deserialize_with = "crate::nullable")]
     organization_id: String,
+    #[serde(deserialize_with = "crate::nullable")]
     node_name: String,
+    #[serde(deserialize_with = "crate::nullable")]
     count: i64,
+    #[serde(deserialize_with = "crate::nullable")]
     ttl_minutes: i64,
+    #[serde(deserialize_with = "crate::nullable")]
     require_approval: bool,
     /// With it, each token comes with a ready provision file.
     provision: Option<ProvisionTemplate>,
@@ -639,21 +652,19 @@ async fn issue_tokens(State(s): AppState, headers: HeaderMap, body: Bytes) -> Re
     let Some(request) = parse::<TokensRequest>(&body, 64 << 10) else {
         return error(StatusCode::BAD_REQUEST, "invalid JSON");
     };
-    if let Some(p) = &request.provision {
-        if !matches!(
-            p.profile.as_str(),
-            "node" | "workstation" | "complete" | "custom"
-        ) {
-            return error(
-                StatusCode::BAD_REQUEST,
-                "provision.profile must be a profile that runs a node: node, workstation, complete or custom",
-            );
-        }
-        if p.user.trim().is_empty() {
+    let base = s.base_url(&headers);
+    if let Some(template) = &request.provision {
+        if template.user.trim().is_empty() {
             return error(
                 StatusCode::BAD_REQUEST,
                 "provision.user is required: the account whose agents run on the machine",
             );
+        }
+        // Checked before any token exists, with a token of the right shape.
+        let sample = enrollment::token(&s.instance, &"0".repeat(enrollment::SECRET_HEX_LEN));
+        let node_name = request.node_name.trim().to_lowercase();
+        if let Err(e) = template.file(&base, &sample, &node_name).validate() {
+            return error(StatusCode::BAD_REQUEST, &format!("provision: {e}"));
         }
     }
     let tokens = s
@@ -680,23 +691,10 @@ async fn issue_tokens(State(s): AppState, headers: HeaderMap, body: Bytes) -> Re
             json!({"instanceId": s.instance, "tokens": tokens}),
         );
     };
-    let base = s.base_url(&headers);
     let out: Vec<Value> = tokens
         .iter()
         .map(|token| {
-            let mut join = json!({"url": base, "enrollmentToken": token.token});
-            let mut file = json!({"version": 1, "profile": template.profile, "user": template.user});
-            if !token.node_name.is_empty() {
-                join["nodeName"] = json!(token.node_name);
-                file["hostname"] = json!(token.node_name);
-            }
-            file["command"] = join;
-            if let Some(policy) = &template.policy {
-                file["policy"] = Value::Object(policy.clone());
-            }
-            if let Some(preferences) = &template.preferences {
-                file["preferences"] = Value::Object(preferences.clone());
-            }
+            let file = template.file(&base, &token.token, &token.node_name);
             json!({"token": token.token, "expiresAt": token.expires_at, "nodeName": token.node_name, "provision": file})
         })
         .collect();

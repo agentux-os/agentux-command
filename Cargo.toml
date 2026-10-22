@@ -1,12 +1,15 @@
 [package]
 name = "agentux-command"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "AgentUX Command: the remote control plane for AgentUX nodes"
 repository = "https://github.com/agentux-os/agentux-command"
 publish = false
 
 [dependencies]
+# AUXP, shared with agentux-core's node gateway and tested against the
+# protocol's schemas.
+auxp = { git = "https://github.com/agentux-os/agentux-protocol", rev = "9c219eebb88b1bd74a275f8a17ba287031723d3c" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
@@ -24,6 +27,12 @@ tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_j
 url = "2"
 
 [dev-dependencies]
+# The real node side for tests/end_to_end.rs: agentux-core's gateway in
+# front of an agentuxd with scripted agents.
+agentux-gateway = { git = "https://github.com/agentux-os/agentux-core", rev = "da4a80ca27f89e56b166a29a40900191285fa74e" }
+agentux-store = { git = "https://github.com/agentux-os/agentux-core", rev = "da4a80ca27f89e56b166a29a40900191285fa74e" }
+agentuxd = { git = "https://github.com/agentux-os/agentux-core", rev = "da4a80ca27f89e56b166a29a40900191285fa74e" }
+tempfile = "3"
 http-body-util = "0.1"
 tokio-tungstenite = "0.27"
 tower = { version = "0.5", features = ["util"] }

@@ -4,7 +4,7 @@ Requires=agentux-command-postgres.service agentux-command-nats.service agentux-c
 After=agentux-command-postgres.service agentux-command-nats.service agentux-command-object-store.service
 
 [Container]
-Image=ghcr.io/agentux-os/agentux-command:0.1.0
+Image=ghcr.io/agentux-os/agentux-command:0.1.1
 ContainerName=agentux-command
 EnvironmentFile=/var/lib/agentux/command/command.env
 Environment=AGENTUX_COMMAND_ADDR=:8080

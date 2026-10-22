@@ -591,3 +591,30 @@ async fn the_node_list_needs_an_operator() {
     let (status, _) = call(&app, "GET", "/nowhere", "", None).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn fields_sent_as_null_read_as_unset() {
+    // The node gateway sends "nodeName": null when the node has no name.
+    let app = Handler::new().router();
+    let (_, issued) = call(
+        &app,
+        "POST",
+        "/v1/enrollment-tokens",
+        "demo-leader",
+        Some(json!({"organizationId": "acme", "nodeName": null, "count": null})),
+    )
+    .await;
+    let token = issued["tokens"][0]["token"].as_str().unwrap();
+    let (status, enrolled) = call(
+        &app,
+        "POST",
+        "/v1/enroll",
+        "",
+        Some(json!({"token": token, "nodeName": null, "hostname": "box"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{enrolled}");
+    assert_eq!(enrolled["nodeId"], "node-box");
+    let (status, _) = call(&app, "POST", "/v1/approvals/approval-01/resolve", "demo-leader", Some(json!({"organizationId": "org-demo", "decision": "approved", "reason": null, "idempotencyKey": "k"}))).await;
+    assert_eq!(status, StatusCode::OK);
+}
