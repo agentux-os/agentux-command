@@ -18,7 +18,7 @@ pub use growth::{
     DetailedGrowth, GrowthReport, OrganizationGrowth, PartitionGrowth, collect_growth_report,
 };
 pub use migrations::{migrate, migration_versions};
-pub use postgres::{PostgresStore, open_postgres, pool, with_env_password};
+pub use postgres::{PostgresStore, append_event, open_postgres, pool, with_env_password};
 
 /// Events kept in a projection; older ones stay in the log only.
 const PROJECTION_EVENT_LIMIT: usize = 100;
@@ -28,6 +28,8 @@ pub trait OfficeRepository: Send + Sync {
     async fn ping(&self) -> Result<(), Error>;
     async fn get_projection(&self, organization_id: &str) -> Result<Option<Projection>, Error>;
     async fn apply_event(&self, event: Event) -> Result<(), Error>;
+    /// Part of an organization's event log, oldest first.
+    async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error>;
     async fn resolve_approval(
         &self,
         approval_id: &str,
@@ -58,8 +60,65 @@ pub struct Event {
     pub correlation_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub causation_id: String,
+    /// Who caused it (ADR 0015): `{"kind": "user" | "service" | "operator" |
+    /// "node", "id": …}`. A node's events without one are the node's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub actor: Option<Value>,
+    /// The organization definition the event happened under, when known
+    /// (`definition-<n>`).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub definition_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+/// An event as the log keeps it: its place in the organization's log, for
+/// replay from a cursor.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Logged {
+    pub cursor: i64,
+    pub event: Event,
+}
+
+/// Which part of an organization's log to replay: after a cursor, within a
+/// time range (when the event was taken), at most `limit` events.
+#[derive(Debug, Clone, Default)]
+pub struct Replay {
+    pub after: i64,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    pub limit: i64,
+}
+
+impl Replay {
+    fn takes(&self, cursor: i64, event: &Event) -> bool {
+        let at = chrono::DateTime::parse_from_rfc3339(&event.received_at).ok();
+        cursor > self.after
+            && self.since.is_none_or(|s| at.is_some_and(|at| at >= s))
+            && self.until.is_none_or(|u| at.is_some_and(|at| at < u))
+    }
+}
+
+/// An event without a definition version happened under the one the
+/// organization's projection has, when it has one.
+pub(crate) fn stamp_definition(event: &mut Event, projection: &Projection) {
+    if event.definition_version.is_empty()
+        && !projection.definition_version.is_empty()
+        && projection.definition_version != "definition-unknown"
+    {
+        event.definition_version = projection.definition_version.clone();
+    }
+}
+
+/// Stamps what the log needs on an event it takes: when, and who for a
+/// node's own events.
+pub(crate) fn prepare(event: &mut Event) {
+    if event.received_at.is_empty() {
+        event.received_at = now_rfc3339();
+    }
+    if event.actor.is_none() && !event.node_id.is_empty() && !event.node_id.starts_with("command") {
+        event.actor = Some(json!({"kind": "node", "id": event.node_id}));
+    }
 }
 
 pub type Object = Map<String, Value>;
@@ -118,6 +177,9 @@ pub struct ResolutionRequest {
     pub reason: String,
     #[serde(deserialize_with = "crate::nullable")]
     pub idempotency_key: String,
+    /// Who decides: set by the server from the caller, never from the body.
+    #[serde(skip)]
+    pub actor: Option<Value>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -182,6 +244,8 @@ struct MemoryState {
     events: HashSet<(String, String)>,
     /// The last sequence by organization and node.
     sequences: HashMap<(String, String), i64>,
+    /// Every event taken, in order, with its cursor.
+    log: Vec<Logged>,
 }
 
 fn objects(value: Value) -> Vec<Object> {
@@ -254,6 +318,7 @@ impl Store {
                 decisions: HashMap::new(),
                 events: HashSet::from([("org-demo".into(), "evt-107".into())]),
                 sequences: HashMap::from([(("org-demo".into(), "node-01".into()), 7)]),
+                log: Vec::new(),
             }),
         }
     }
@@ -275,9 +340,7 @@ impl OfficeRepository for Store {
 
     async fn apply_event(&self, mut event: Event) -> Result<(), Error> {
         validate_event(&event)?;
-        if event.received_at.is_empty() {
-            event.received_at = now_rfc3339();
-        }
+        prepare(&mut event);
         let mut state = self.lock();
         let event_key = (event.organization_id.clone(), event.event_id.clone());
         if state.events.contains(&event_key) {
@@ -299,6 +362,7 @@ impl OfficeRepository for Store {
                 source: "command-memory".into(),
                 ..empty_projection(&event.organization_id)
             });
+        stamp_definition(&mut event, &projection);
         apply_projection_event(&mut projection, &event)?;
         state.events.insert(event_key);
         state.sequences.insert(stream, event.sequence);
@@ -327,7 +391,22 @@ impl OfficeRepository for Store {
         state
             .projections
             .insert(event.organization_id.clone(), projection);
+        let cursor = state.log.len() as i64 + 1;
+        state.log.push(Logged { cursor, event });
         Ok(())
+    }
+
+    async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error> {
+        Ok(self
+            .lock()
+            .log
+            .iter()
+            .filter(|l| {
+                l.event.organization_id == organization_id && replay.takes(l.cursor, &l.event)
+            })
+            .take(replay.limit.max(0) as usize)
+            .cloned()
+            .collect())
     }
 
     async fn resolve_approval(
@@ -568,6 +647,7 @@ mod tests {
             decision: "approved".into(),
             reason: "reviewed".into(),
             idempotency_key: "idem-01".into(),
+            ..ResolutionRequest::default()
         };
         let first = store
             .resolve_approval("approval-01", request.clone())

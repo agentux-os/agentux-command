@@ -537,6 +537,39 @@ impl Store for Memory {
     }
 }
 
+/// The Office event a publication records: the organization, its areas,
+/// missions and agents, the new definition version and who published it.
+pub fn published_event(definition: &Definition) -> crate::office::Event {
+    let org = &definition.organization_id;
+    let version = definition.definition_version;
+    let document = &definition.document;
+    crate::office::Event {
+        event_id: format!("definition-{org}-{version}"),
+        event_type: "organization.definition.published".into(),
+        organization_id: org.clone(),
+        node_id: "command.definitions".into(),
+        sequence: version,
+        occurred_at: definition
+            .published_at
+            .map(|at| at.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+            .unwrap_or_else(crate::now_rfc3339),
+        correlation_id: format!("definition-{org}-{version}"),
+        actor: definition
+            .published_by
+            .as_ref()
+            .and_then(|a| serde_json::to_value(a).ok()),
+        definition_version: format!("definition-{version}"),
+        data: Some(serde_json::json!({
+            "definition_version": version,
+            "organization": document.get("organization"),
+            "areas": document.get("areas"),
+            "missions": document.get("missions"),
+            "agents": document.get("agents"),
+        })),
+        ..crate::office::Event::default()
+    }
+}
+
 /// Definitions in Command's database (migration 006_organization_definitions).
 pub struct Postgres {
     pool: deadpool_postgres::Pool,
@@ -689,9 +722,14 @@ impl Store for Postgres {
                 &[&org, &version, &Json(actor), &now],
             )
             .await?;
+        let published = row_definition(&row);
+        // The Office event commits with the publication, or neither does.
+        crate::office::append_event(&tx, published_event(&published))
+            .await
+            .map_err(|e| Error::Storage(e.to_string()))?;
         record(&tx, org, "definition.published", actor, version, now).await?;
         tx.commit().await?;
-        Ok(row_definition(&row))
+        Ok(published)
     }
 
     async fn get(&self, org: &str, version: i64) -> Result<Definition, Error> {

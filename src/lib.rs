@@ -12,6 +12,7 @@ pub mod enroll;
 pub mod nodes;
 pub mod office;
 pub mod oidc;
+pub mod outbox;
 pub mod protocol;
 pub mod report;
 pub mod server;

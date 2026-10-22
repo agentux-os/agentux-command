@@ -176,6 +176,34 @@ number. Publishing records `organization.definition.published` in the Office
 event log, and the Office projection takes the organization, its areas,
 missions and agents, and the definition version from it.
 
+## Events
+
+Every event Command takes (a node's reports, an approval decision, a
+published definition) goes into the organization's event log in the same
+transaction as the state it changes, deduplicated by `eventId`. Events carry
+ADR 0015's envelope: the organization, `correlationId`, `actor` (`{"kind":
+"user" | "service" | "operator" | "node", "id": …}`; a node's own events are
+the node's) and, once the organization has a published definition,
+`definitionVersion`.
+
+```text
+GET /v1/organizations/<org>/events?after=<cursor>&since=<time>&until=<time>&limit=<n>   organization.read
+```
+
+replays the log oldest first: after a cursor, within a time range (RFC 3339,
+`since` inclusive, `until` exclusive), at most `limit` (100, up to 1000).
+Each entry is `{"cursor": n, "event": {...}}`; `next` is the cursor to go on
+from.
+
+With `AGENTUX_COMMAND_EVENTS_URL` set, Command also POSTs each event as JSON
+to that URL (`Idempotency-Key: <eventId>`, and `Authorization: Bearer
+<AGENTUX_COMMAND_EVENTS_TOKEN>` when that is set), from an outbox written in
+the same transaction (ADR 0020): at least once, in order per organization (an
+organization's next event waits while an earlier one fails), retried with a
+backoff from 5 s to 10 min that survives restarts. Delivered events leave the
+outbox after a day; one the sink has not taken in 7 days is dropped from it,
+and stays in the log for replay.
+
 ## Office projection slice
 
 The current gateway exposes a storage-independent first slice for AgentUX Office:

@@ -389,7 +389,7 @@ async fn definitions_live_in_the_database() {
     let Some((_, pool, ..)) = store().await else {
         return;
     };
-    let store = definitions::Postgres::new(pool);
+    let store = definitions::Postgres::new(pool.clone());
     let ana = Actor::of("oidc:ana");
     let now = chrono::Utc::now();
     let mut doc = json!({"schema_version": "1.0", "organization": {"id": "acme", "name": "Acme"}, "areas": [], "roles": [], "missions": [], "workflows": [], "gates": [], "agents": [], "nodes": []});
@@ -425,8 +425,223 @@ async fn definitions_live_in_the_database() {
     );
     assert_eq!(store.list("acme").await.unwrap().len(), 2);
     assert_eq!(store.audit("acme", 10).await.unwrap().len(), 4);
+    // The publication took its Office event in the same transaction.
+    let office = PostgresStore::new(pool.clone());
+    let projection = office.get_projection("acme").await.unwrap().unwrap();
+    assert_eq!(projection.definition_version, "definition-1");
+    assert_eq!(projection.organization["name"], "Acme");
+    let queued: i64 = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT count(*) FROM office_outbox WHERE event_id = 'definition-acme-1'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(queued, 1);
     assert!(matches!(
         store.get("other", 1).await,
         Err(definitions::Error::NotFound)
     ));
+}
+
+#[tokio::test]
+async fn events_are_queued_with_their_state_and_replayed_by_organization() {
+    use office::Replay;
+    let Some((store, pool, ..)) = store().await else {
+        return;
+    };
+    for (id, org, sequence) in [("a1", "org-a", 1), ("b1", "org-b", 1), ("a2", "org-a", 2)] {
+        store.apply_event(event(id, org, sequence)).await.unwrap();
+    }
+    store.apply_event(event("a1", "org-a", 1)).await.unwrap();
+    let client = pool.get().await.unwrap();
+    let queued: Vec<String> = client
+        .query("SELECT event_id FROM office_outbox ORDER BY outbox_id", &[])
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r.get(0))
+        .collect();
+    assert_eq!(queued, ["a1", "b1", "a2"], "once per event, in order");
+
+    let all = |after| Replay {
+        after,
+        limit: 100,
+        ..Replay::default()
+    };
+    let replayed = store.events("org-a", &all(0)).await.unwrap();
+    let ids: Vec<&str> = replayed.iter().map(|l| l.event.event_id.as_str()).collect();
+    assert_eq!(ids, ["a1", "a2"], "only the organization's events");
+    assert_eq!(
+        replayed[0].event.actor,
+        Some(json!({"kind": "node", "id": "node-01"})),
+        "a node's events are the node's"
+    );
+    let rest = store
+        .events("org-a", &all(replayed[0].cursor))
+        .await
+        .unwrap();
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].event.event_id, "a2");
+    let one = Replay { limit: 1, ..all(0) };
+    assert_eq!(store.events("org-a", &one).await.unwrap().len(), 1);
+    let future = Replay {
+        since: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+        ..all(0)
+    };
+    assert!(store.events("org-a", &future).await.unwrap().is_empty());
+    let past = Replay {
+        until: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+        ..all(0)
+    };
+    assert!(store.events("org-a", &past).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_approval_decision_is_queued_with_its_actor() {
+    let Some((store, pool, ..)) = store().await else {
+        return;
+    };
+    store
+        .apply_event(Event {
+            event_type: "approval.requested".into(),
+            data: Some(json!({"id": "approval-1", "runId": "run-7", "correlationId": "corr-7"})),
+            ..event("requested", "org-a", 1)
+        })
+        .await
+        .unwrap();
+    store
+        .resolve_approval(
+            "approval-1",
+            ResolutionRequest {
+                organization_id: "org-a".into(),
+                decision: "approved".into(),
+                idempotency_key: "k".into(),
+                actor: Some(json!({"kind": "user", "id": "oidc:ana"})),
+                ..ResolutionRequest::default()
+            },
+        )
+        .await
+        .unwrap();
+    let row = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT payload FROM office_outbox WHERE payload->>'eventType' = 'approval.resolved'",
+            &[],
+        )
+        .await
+        .unwrap();
+    let tokio_postgres::types::Json(event): tokio_postgres::types::Json<serde_json::Value> =
+        row.get(0);
+    assert_eq!(event["actor"]["id"], "oidc:ana");
+    assert_eq!(event["runId"], "run-7");
+    assert_eq!(event["correlationId"], "corr-7");
+}
+
+/// A sink that records what it takes and refuses the events named in `fail`.
+#[derive(Default)]
+struct Recorder {
+    taken: std::sync::Mutex<Vec<String>>,
+    fail: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl agentux_command::outbox::Sink for Recorder {
+    async fn deliver(&self, event: &serde_json::Value) -> Result<(), String> {
+        let id = event["eventId"].as_str().unwrap_or_default().to_string();
+        if self.fail.lock().unwrap().contains(&id) {
+            return Err(format!("{id} refused"));
+        }
+        self.taken.lock().unwrap().push(id);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn delivery_is_ordered_per_organization_retried_and_survives_a_restart() {
+    use agentux_command::outbox::{Delivery, Pass};
+    use std::sync::Arc;
+    let Some((store, pool, config, _)) = store().await else {
+        return;
+    };
+    for (id, org, sequence) in [
+        ("a1", "org-a", 1),
+        ("a2", "org-a", 2),
+        ("b1", "org-b", 1),
+        ("a3", "org-a", 3),
+    ] {
+        store.apply_event(event(id, org, sequence)).await.unwrap();
+    }
+    let sink = Arc::new(Recorder::default());
+    sink.fail.lock().unwrap().push("a2".into());
+    let delivery = Delivery::new(pool.clone(), Some(sink.clone()));
+    assert_eq!(
+        delivery.run_once().await.unwrap(),
+        Pass {
+            delivered: 2,
+            failed: 1
+        }
+    );
+    assert_eq!(
+        *sink.taken.lock().unwrap(),
+        ["a1", "b1"],
+        "org-a stops at a2; org-b goes on"
+    );
+    let client = pool.get().await.unwrap();
+    let row = client
+        .query_one(
+            "SELECT attempts, last_error, next_attempt_at > now() FROM office_outbox WHERE event_id = 'a2'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, i32>(0), 1);
+    assert_eq!(
+        row.get::<_, Option<String>>(1).as_deref(),
+        Some("a2 refused")
+    );
+    assert!(row.get::<_, bool>(2), "retried later");
+    assert_eq!(
+        delivery.run_once().await.unwrap(),
+        Pass::default(),
+        "a3 waits behind a2"
+    );
+
+    // A restart: a new pool and delivery, and the sink takes a2 now.
+    drop(delivery);
+    let restarted = Delivery::new(office::pool(config), Some(sink.clone()));
+    sink.fail.lock().unwrap().clear();
+    client
+        .execute(
+            "UPDATE office_outbox SET next_attempt_at = now() WHERE event_id = 'a2'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restarted.run_once().await.unwrap(),
+        Pass {
+            delivered: 2,
+            failed: 0
+        }
+    );
+    assert_eq!(*sink.taken.lock().unwrap(), ["a1", "b1", "a2", "a3"]);
+    assert_eq!(
+        restarted.run_once().await.unwrap(),
+        Pass::default(),
+        "each once"
+    );
+
+    // Without a sink nothing is sent.
+    store.apply_event(event("a4", "org-a", 4)).await.unwrap();
+    assert_eq!(
+        Delivery::new(pool.clone(), None).run_once().await.unwrap(),
+        Pass::default()
+    );
 }

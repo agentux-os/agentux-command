@@ -59,6 +59,9 @@ struct Inner {
     oidc: Option<Arc<Oidc>>,
     /// Organization definitions and their audit log.
     definitions: Arc<dyn definitions::Store>,
+    /// The database, when Command keeps its state in one: event delivery
+    /// reads its outbox.
+    database: Option<deadpool_postgres::Pool>,
 }
 
 /// A Command server, configured with the `with_*` methods, served by
@@ -109,6 +112,7 @@ impl Handler {
                 sessions: Arc::new(auth::MemorySessions::default()),
                 oidc: None,
                 definitions: Arc::new(definitions::Memory::default()),
+                database: None,
             },
         }
     }
@@ -120,7 +124,9 @@ impl Handler {
         let pool = office::open_postgres(database_url)
             .await
             .map_err(|e| e.to_string())?;
-        let handler = Self::with_office(Arc::new(office::PostgresStore::new(pool.clone())))
+        let mut handler = Self::with_office(Arc::new(office::PostgresStore::new(pool.clone())));
+        handler.inner.database = Some(pool.clone());
+        let handler = handler
             .with_service_tokens(Arc::new(auth::PostgresTokens::new(pool.clone())))
             .with_sessions(Arc::new(auth::PostgresSessions::new(pool.clone())))
             .with_definitions(Arc::new(definitions::Postgres::new(pool.clone())))
@@ -138,6 +144,16 @@ impl Handler {
         self.inner.registry.load(nodes::persist::load(&pool).await?);
         self.inner.registry.store_to(nodes::persist::writer(pool));
         Ok(self)
+    }
+
+    /// Delivers the events Command takes to `sink`, from the database's
+    /// outbox ([`outbox`](crate::outbox)); without a sink the outbox is only
+    /// kept bounded. Nothing to do without a database.
+    pub fn deliver_events(self, sink: Option<Arc<dyn crate::outbox::Sink>>) -> Self {
+        if let Some(pool) = &self.inner.database {
+            crate::outbox::Delivery::new(pool.clone(), sink).spawn(Duration::from_secs(2));
+        }
+        self
     }
 
     /// Keeps organization definitions and their audit log in `store`.
@@ -249,6 +265,7 @@ impl Handler {
                 post(publish_definition),
             )
             .route("/v1/organizations/{org}/audit", get(organization_audit))
+            .route("/v1/organizations/{org}/events", get(organization_events))
             .route("/v1/auth/login", get(login))
             .route("/v1/auth/callback", get(callback))
             .route("/v1/auth/logout", post(logout))
@@ -1026,9 +1043,10 @@ async fn resolve_approval(
     if !operator.can_somewhere(auth::APPROVAL_DECIDE) {
         return error(StatusCode::FORBIDDEN, "approval.decide capability required");
     }
-    let Some(request) = parse::<ResolutionRequest>(&body, 64 << 10) else {
+    let Some(mut request) = parse::<ResolutionRequest>(&body, 64 << 10) else {
         return error(StatusCode::BAD_REQUEST, "invalid JSON");
     };
+    request.actor = serde_json::to_value(Actor::of(&operator.subject)).ok();
     // The approval is scoped to the request's organization, so deciding
     // needs the capability there.
     if !operator.can(&request.organization_id, auth::APPROVAL_DECIDE) {
@@ -1384,24 +1402,9 @@ async fn publish_definition(
         Ok(definition) => definition,
         Err(e) => return definition_error(e),
     };
-    let document = &published.document;
-    let event = office::Event {
-        event_id: format!("definition-{org}-{version}"),
-        event_type: "organization.definition.published".into(),
-        organization_id: org.clone(),
-        node_id: "command.definitions".into(),
-        sequence: version,
-        occurred_at: crate::now_rfc3339(),
-        data: Some(json!({
-            "definition_version": version,
-            "organization": document.get("organization"),
-            "areas": document.get("areas"),
-            "missions": document.get("missions"),
-            "agents": document.get("agents"),
-            "actor": published.published_by,
-        })),
-        ..office::Event::default()
-    };
+    // The PostgreSQL store took the event with the publication; taking it
+    // again is a no-op there, and the memory store takes it here.
+    let event = definitions::published_event(&published);
     if let Err(e) = s.office.apply_event(event).await {
         eprintln!(
             "agentux-command: definition {org} v{version} published, but the Office projection did not take it: {e}"
@@ -1436,5 +1439,59 @@ async fn organization_audit(
             json!({"organizationId": org, "entries": entries}),
         ),
         Err(e) => definition_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+struct EventsQuery {
+    #[serde(default)]
+    after: Option<i64>,
+    #[serde(default)]
+    since: Option<String>,
+    #[serde(default)]
+    until: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// Replays the organization's event log: after a cursor, within a time range
+/// (`since` inclusive, `until` exclusive, RFC 3339), at most `limit` (100 by
+/// default, 1000 at most). `next` is the cursor to continue from.
+async fn organization_events(
+    State(s): AppState,
+    Path(org): Path<String>,
+    Query(query): Query<EventsQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = operator_in(&s, &headers, &org, auth::ORGANIZATION_READ).await {
+        return *denied;
+    }
+    let time = |value: &Option<String>| match value.as_deref() {
+        None | Some("") => Ok(None),
+        Some(text) => chrono::DateTime::parse_from_rfc3339(text)
+            .map(|t| Some(t.with_timezone(&Utc)))
+            .map_err(|_| ()),
+    };
+    let (Ok(since), Ok(until)) = (time(&query.since), time(&query.until)) else {
+        return error(
+            StatusCode::BAD_REQUEST,
+            "since and until are RFC 3339 times",
+        );
+    };
+    let replay = office::Replay {
+        after: query.after.unwrap_or(0).max(0),
+        since,
+        until,
+        limit: query.limit.unwrap_or(100).clamp(1, 1000),
+    };
+    match s.office.events(&org, &replay).await {
+        Ok(events) => {
+            let next = events.last().map_or(replay.after, |e| e.cursor);
+            reply(
+                StatusCode::OK,
+                json!({"organizationId": org, "events": events, "next": next}),
+            )
+        }
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "event log unavailable"),
     }
 }
