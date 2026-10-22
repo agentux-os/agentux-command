@@ -119,10 +119,20 @@ impl Handler {
         let handler = Self::with_office(Arc::new(office::PostgresStore::new(pool.clone())))
             .with_service_tokens(Arc::new(auth::PostgresTokens::new(pool.clone())))
             .with_sessions(Arc::new(auth::PostgresSessions::new(pool.clone())))
+            .with_stored_nodes(pool.clone())
+            .await?
             .with_enroll_store(Arc::new(enroll::Postgres::new(pool)))
             .await
             .map_err(|e| e.to_string())?;
         Ok(handler.with_open_nodes(false).with_demo_tokens(false))
+    }
+
+    /// Reads the nodes stored before a restart from `pool`, and stores every
+    /// change from now on.
+    pub async fn with_stored_nodes(self, pool: deadpool_postgres::Pool) -> Result<Self, String> {
+        self.inner.registry.load(nodes::persist::load(&pool).await?);
+        self.inner.registry.store_to(nodes::persist::writer(pool));
+        Ok(self)
     }
 
     /// Keeps signed-in operators' sessions in `store`.
