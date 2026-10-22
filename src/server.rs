@@ -26,6 +26,7 @@ use auxp::enrollment;
 use auxp::provision::{CommandJoin, Provision};
 
 use crate::enroll::{self, TokenRequest};
+use crate::missions;
 use crate::nodes::{self, Registry};
 use crate::office::{self, OfficeRepository, ResolutionRequest};
 use crate::protocol;
@@ -64,6 +65,8 @@ struct Inner {
     database: Option<deadpool_postgres::Pool>,
     /// Woken whenever this server takes an event, for live streams.
     changed: tokio::sync::Notify,
+    /// Missions' runs.
+    runs: Arc<dyn missions::Store>,
 }
 
 /// A Command server, configured with the `with_*` methods, served by
@@ -116,6 +119,7 @@ impl Handler {
                 definitions: Arc::new(definitions::Memory::default()),
                 database: None,
                 changed: tokio::sync::Notify::new(),
+                runs: Arc::new(missions::Memory::default()),
             },
         }
     }
@@ -133,6 +137,7 @@ impl Handler {
             .with_service_tokens(Arc::new(auth::PostgresTokens::new(pool.clone())))
             .with_sessions(Arc::new(auth::PostgresSessions::new(pool.clone())))
             .with_definitions(Arc::new(definitions::Postgres::new(pool.clone())))
+            .with_runs(Arc::new(missions::Postgres::new(pool.clone())))
             .with_stored_nodes(pool.clone())
             .await?
             .with_enroll_store(Arc::new(enroll::Postgres::new(pool)))
@@ -156,6 +161,12 @@ impl Handler {
         if let Some(pool) = &self.inner.database {
             crate::outbox::Delivery::new(pool.clone(), sink).spawn(Duration::from_secs(2));
         }
+        self
+    }
+
+    /// Keeps missions' runs in `store`.
+    pub fn with_runs(mut self, store: Arc<dyn missions::Store>) -> Self {
+        self.inner.runs = store;
         self
     }
 
@@ -233,6 +244,18 @@ impl Handler {
 
     pub fn router(self) -> Router {
         let state = Arc::new(self.inner);
+        // Runs that are due move on their own (a retry, a check on a node);
+        // the loop ends with the server.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let weak = Arc::downgrade(&state);
+            runtime.spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                    let Some(s) = weak.upgrade() else { break };
+                    s.engine().tick(&NodesVia(&s)).await;
+                }
+            });
+        }
         Router::new()
             .route("/healthz", get(healthz))
             .route("/v1/instance", get(instance))
@@ -269,6 +292,15 @@ impl Handler {
             )
             .route("/v1/organizations/{org}/audit", get(organization_audit))
             .route("/v1/organizations/{org}/events", get(organization_events))
+            .route(
+                "/v1/organizations/{org}/runs",
+                get(list_runs).post(start_run),
+            )
+            .route("/v1/organizations/{org}/runs/{run}", get(get_run))
+            .route(
+                "/v1/organizations/{org}/runs/{run}/{action}",
+                post(control_run),
+            )
             .route("/v1/organizations/{org}/events/stream", get(stream_events))
             .route("/v1/auth/login", get(login))
             .route("/v1/auth/callback", get(callback))
@@ -510,12 +542,39 @@ impl Inner {
             event.node_id.clone(),
             event.sequence,
         );
+        let (node_run, error) = (
+            event.run_id.clone(),
+            event
+                .data
+                .as_ref()
+                .and_then(|d| d["error"].as_str())
+                .unwrap_or_default()
+                .to_string(),
+        );
         match self.office.apply_event(event).await {
-            Ok(()) => self.changed.notify_waiters(),
+            Ok(()) => {
+                self.changed.notify_waiters();
+                if let Err(e) = self
+                    .engine()
+                    .node_event(&org, &node_run, method, &error, &NodesVia(self))
+                    .await
+                {
+                    eprintln!("agentux-command: missions: {e}");
+                }
+            }
             Err(e) => eprintln!(
                 "agentux-command: the Office did not take {method} {sequence} from {node} in {org}: {e}"
             ),
         }
+    }
+
+    /// The mission engine over this server's stores.
+    fn engine(&self) -> missions::Engine {
+        missions::Engine::new(
+            self.runs.clone(),
+            self.definitions.clone(),
+            self.office.clone(),
+        )
     }
 
     /// Where nodes reach this server.
@@ -1102,14 +1161,38 @@ async fn resolve_approval(
     let Some(mut request) = parse::<ResolutionRequest>(&body, 64 << 10) else {
         return error(StatusCode::BAD_REQUEST, "invalid JSON");
     };
-    request.actor = serde_json::to_value(Actor::of(&operator.subject)).ok();
+    let actor = Actor::of(&operator.subject);
+    request.actor = serde_json::to_value(&actor).ok();
+    // A human-required gate of a mission is decided by a person.
+    let engine = s.engine();
+    let policy = engine
+        .gate_policy(&request.organization_id, &approval_id)
+        .await;
+    if policy.as_deref() == Some("human-required") && actor.kind == "service" {
+        return error(
+            StatusCode::FORBIDDEN,
+            "this gate is human-required: a person decides it, not a service token",
+        );
+    }
+    let (org, decision, decider) = (
+        request.organization_id.clone(),
+        request.decision.clone(),
+        request.actor.clone(),
+    );
     // The approval is scoped to the request's organization, so deciding
     // needs the capability there.
     if !operator.can(&request.organization_id, auth::APPROVAL_DECIDE) {
         return forbidden(auth::APPROVAL_DECIDE, &request.organization_id);
     }
     let resolved = s.office.resolve_approval(&approval_id, request).await;
-    if resolved.is_ok() {
+    if let Ok(response) = &resolved {
+        if !response.idempotent_replay
+            && let Err(e) = engine
+                .decided(&org, &approval_id, &decision, decider, &NodesVia(&s))
+                .await
+        {
+            eprintln!("agentux-command: missions: {e}");
+        }
         s.changed.notify_waiters();
     }
     match resolved {
@@ -1650,4 +1733,179 @@ async fn stream_events(
     axum::response::sse::Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+/// The engine's way to nodes: the command channel, with the AUXP envelope
+/// every command carries.
+struct NodesVia<'a>(&'a Inner);
+
+/// How long the engine waits for a node to answer a command.
+const ENGINE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[async_trait::async_trait]
+impl missions::Nodes for NodesVia<'_> {
+    fn pick(&self, organization_id: &str) -> Option<String> {
+        let mut nodes: Vec<String> = self
+            .0
+            .registry
+            .list()
+            .into_iter()
+            .filter(|n| n.organization_id == organization_id && n.presence == "online")
+            .map(|n| n.id)
+            .filter(|id| self.0.hub.connected(id))
+            .collect();
+        nodes.sort();
+        nodes.into_iter().next()
+    }
+
+    async fn command(
+        &self,
+        node_id: &str,
+        method: &str,
+        mut params: Map<String, Value>,
+    ) -> Result<Value, missions::NodeError> {
+        use missions::NodeError;
+        let s = self.0;
+        let organization = s
+            .registry
+            .get(node_id)
+            .map(|n| n.organization_id)
+            .unwrap_or_default();
+        let command_id = params
+            .get("commandId")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        for (key, value) in [
+            ("protocolVersion", "v1".to_string()),
+            ("organizationId", organization),
+            ("nodeId", node_id.to_string()),
+            ("messageId", command_id),
+            (
+                "occurredAt",
+                Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            ),
+            ("commandInstanceId", s.instance.clone()),
+        ] {
+            params.insert(key.into(), Value::String(value));
+        }
+        match tokio::time::timeout(ENGINE_COMMAND_TIMEOUT, s.hub.send(node_id, method, params))
+            .await
+        {
+            Err(_) => Err(NodeError::Unreachable(format!(
+                "node {node_id} did not answer in time"
+            ))),
+            Ok(Err(e)) => Err(NodeError::Unreachable(format!("node {node_id}: {e}"))),
+            Ok(Ok(answer)) => match answer.error {
+                Some(e) => Err(NodeError::Refused(e.message)),
+                None => Ok(answer.result.unwrap_or(Value::Null)),
+            },
+        }
+    }
+}
+
+/// The 4xx/5xx answer for a mission engine error.
+fn mission_error(e: missions::Error) -> Response {
+    match e {
+        missions::Error::NotFound => error(StatusCode::NOT_FOUND, "run not found"),
+        missions::Error::Invalid(m) => error(StatusCode::UNPROCESSABLE_ENTITY, &m),
+        missions::Error::Conflict => {
+            error(StatusCode::CONFLICT, "the run changed meanwhile; try again")
+        }
+        missions::Error::Storage(_) => {
+            error(StatusCode::SERVICE_UNAVAILABLE, "run store unavailable")
+        }
+    }
+}
+
+/// Starts a mission (`node.command`, which covers `run.start` in ADR 0015's
+/// mapping) under the organization's newest published definition.
+async fn start_run(
+    State(s): AppState,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let operator = match operator_in(&s, &headers, &org, auth::NODE_COMMAND).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let Some(input) = parse::<missions::Input>(&body, 1 << 20) else {
+        return error(StatusCode::BAD_REQUEST, "invalid JSON");
+    };
+    match s
+        .engine()
+        .start(&org, input, &Actor::of(&operator.subject), &NodesVia(&s))
+        .await
+    {
+        Ok(run) => reply(
+            StatusCode::CREATED,
+            serde_json::to_value(run).unwrap_or_default(),
+        ),
+        Err(e) => mission_error(e),
+    }
+}
+
+/// The organization's runs, newest first.
+async fn list_runs(State(s): AppState, Path(org): Path<String>, headers: HeaderMap) -> Response {
+    if let Err(denied) = operator_in(&s, &headers, &org, auth::ORGANIZATION_READ).await {
+        return *denied;
+    }
+    match s.runs.list(&org).await {
+        Ok(runs) => reply(StatusCode::OK, json!({"organizationId": org, "runs": runs})),
+        Err(e) => mission_error(e),
+    }
+}
+
+async fn get_run(
+    State(s): AppState,
+    Path((org, run)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = operator_in(&s, &headers, &org, auth::ORGANIZATION_READ).await {
+        return *denied;
+    }
+    match s.runs.get(&org, &run).await {
+        Ok(run) => reply(
+            StatusCode::OK,
+            serde_json::to_value(run).unwrap_or_default(),
+        ),
+        Err(e) => mission_error(e),
+    }
+}
+
+/// `pause`, `resume` (a failed run retries its step) or `cancel`.
+async fn control_run(
+    State(s): AppState,
+    Path((org, run, action)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let control = match action.as_str() {
+        "pause" => missions::Control::Pause,
+        "resume" => missions::Control::Resume,
+        "cancel" => missions::Control::Cancel,
+        _ => return error(StatusCode::NOT_FOUND, "unknown action"),
+    };
+    let operator = match operator_in(&s, &headers, &org, auth::NODE_COMMAND).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    match s
+        .engine()
+        .control(
+            &org,
+            &run,
+            control,
+            &Actor::of(&operator.subject),
+            &NodesVia(&s),
+        )
+        .await
+    {
+        Ok(run) => reply(
+            StatusCode::OK,
+            serde_json::to_value(run).unwrap_or_default(),
+        ),
+        Err(missions::Error::Invalid(m)) => error(StatusCode::CONFLICT, &m),
+        Err(e) => mission_error(e),
+    }
 }

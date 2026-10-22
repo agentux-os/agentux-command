@@ -729,6 +729,32 @@ pub(crate) fn apply_projection_event(
             upsert(&mut projection.runs, run);
         }
     }
+    if event.event_type.starts_with("mission.run.")
+        && let Some(Value::Object(data)) = &event.data
+    {
+        let mut run = Object::new();
+        for (from, to) in [
+            ("runId", "id"),
+            ("missionId", "missionId"),
+            ("workflowId", "workflowId"),
+            ("status", "status"),
+            ("step", "step"),
+            ("error", "error"),
+        ] {
+            if let Some(value) = data.get(from) {
+                run.insert(to.into(), value.clone());
+            }
+        }
+        run.insert("kind".into(), Value::String("mission".into()));
+        run.insert(
+            "definitionVersion".into(),
+            Value::String(event.definition_version.clone()),
+        );
+        run.insert("updatedAt".into(), Value::String(event.occurred_at.clone()));
+        if run.contains_key("id") {
+            upsert(&mut projection.runs, run);
+        }
+    }
     if event.event_type == "artifact.available" {
         let mut artifact = data().as_object().cloned().unwrap_or_default();
         let id = artifact

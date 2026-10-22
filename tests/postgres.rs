@@ -645,3 +645,53 @@ async fn delivery_is_ordered_per_organization_retried_and_survives_a_restart() {
         Pass::default()
     );
 }
+
+#[tokio::test]
+async fn mission_runs_live_in_the_database_and_refuse_stale_writes() {
+    use agentux_command::missions::{self, Input, Run, Store};
+    let Some((_, pool, config, _)) = store().await else {
+        return;
+    };
+    let runs = missions::Postgres::new(pool);
+    let now = chrono::Utc::now();
+    let mut run = Run {
+        run_id: "run-1".into(),
+        organization_id: "acme".into(),
+        definition_version: 3,
+        mission_id: "ship".into(),
+        workflow_id: "ship-v1".into(),
+        status: missions::RUNNING.into(),
+        step: "implement".into(),
+        input: Input::default(),
+        steps: Default::default(),
+        error: String::new(),
+        run_at: None,
+        created_by: agentux_command::definitions::Actor::of("oidc:ana"),
+        created_at: now,
+        updated_at: now,
+        revision: 1,
+    };
+    runs.insert(&run).await.unwrap();
+    run.revision = 2;
+    run.status = missions::WAITING.into();
+    runs.save(&run).await.unwrap();
+    assert!(
+        matches!(runs.save(&run).await, Err(missions::Error::Conflict)),
+        "a second writer of revision 2 loses"
+    );
+
+    // After a restart: the same run, still driven.
+    let restarted = missions::Postgres::new(office::pool(config));
+    let loaded = restarted.get("acme", "run-1").await.unwrap();
+    assert_eq!((loaded.revision, loaded.status.as_str()), (2, "waiting"));
+    assert_eq!(restarted.active(None).await.unwrap().len(), 1);
+    assert!(matches!(
+        restarted.get("beta", "run-1").await,
+        Err(missions::Error::NotFound)
+    ));
+    run.revision = 3;
+    run.status = missions::COMPLETED.into();
+    restarted.save(&run).await.unwrap();
+    assert!(restarted.active(Some("acme")).await.unwrap().is_empty());
+    assert_eq!(restarted.list("acme").await.unwrap().len(), 1);
+}

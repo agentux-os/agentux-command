@@ -176,6 +176,42 @@ number. Publishing records `organization.definition.published` in the Office
 event log, and the Office projection takes the organization, its areas,
 missions and agents, and the definition version from it.
 
+## Missions
+
+A mission runs as its workflow from the organization's newest published
+definition, and stays pinned to that version
+([ADR 0020](https://github.com/agentux-os/agentux/blob/main/docs/adr/0020-command-workflows-without-temporal.md):
+a state machine in PostgreSQL, no Temporal).
+
+```text
+POST /v1/organizations/<org>/runs                    node.command        {"missionId", "repository", "prompt", "title"?, "nodeId"?}
+GET  /v1/organizations/<org>/runs                    organization.read   (newest first)
+GET  /v1/organizations/<org>/runs/<run>              organization.read
+POST /v1/organizations/<org>/runs/<run>/pause        node.command
+POST /v1/organizations/<org>/runs/<run>/resume       node.command        (a failed run retries its step)
+POST /v1/organizations/<org>/runs/<run>/cancel       node.command
+```
+
+- **agent** steps go to a node of the organization (the run's `nodeId`, or
+  one that is connected and online) as AUXP `run.start`, with command id
+  `<run>:<step>:<attempt>`, so a resend after a crash is the same command.
+  The node's `run.completed` or `run.failed` ends the step. If Command
+  missed those, it asks the node (`run.snapshot`) every minute. A step
+  running longer than 24 h fails.
+- **gate** steps request an approval in the Office (`approval.requested`, id
+  `<run>-<step>-<attempt>`). A `human-required` gate is decided by a person
+  (a signed-in operator) with `approval.decide`; a service token gets 403.
+  Rejected, the run fails; resumed, the gate asks again.
+- **action** steps are recorded as done (Command does not execute them).
+- **No node**: the run `waiting` with the reason, and it tries again every 30 s.
+  **A node refusing** (its policy) or failing the step: the run `failed`,
+  and resume retries the step as a new attempt.
+- Every transition is saved with a revision check (two Command instances
+  cannot both move a run) and goes into the event log as `mission.run.*`,
+  with its actor and `definitionVersion`; the log is the run's audit trail.
+  The Office projection shows each run with `kind: "mission"`. Due runs move
+  on their own every 2 s, including after a restart.
+
 ## Events
 
 Every event Command takes (a node's reports, an approval decision, a

@@ -9,6 +9,7 @@ pub mod auth;
 pub mod channel;
 pub mod definitions;
 pub mod enroll;
+pub mod missions;
 pub mod nodes;
 pub mod office;
 pub mod oidc;
