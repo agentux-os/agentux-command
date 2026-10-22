@@ -55,7 +55,7 @@ dependencies = [
 [[package]]
 name = "agentux-api"
 version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=da4a80ca27f89e56b166a29a40900191285fa74e#da4a80ca27f89e56b166a29a40900191285fa74e"
+source = "git+https://github.com/agentux-os/agentux-core?rev=c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf#c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -66,7 +66,7 @@ dependencies = [
 [[package]]
 name = "agentux-bus"
 version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=da4a80ca27f89e56b166a29a40900191285fa74e#da4a80ca27f89e56b166a29a40900191285fa74e"
+source = "git+https://github.com/agentux-os/agentux-core?rev=c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf#c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf"
 dependencies = [
  "agentux-config",
  "rmcp",
@@ -108,7 +108,7 @@ dependencies = [
 [[package]]
 name = "agentux-config"
 version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=da4a80ca27f89e56b166a29a40900191285fa74e#da4a80ca27f89e56b166a29a40900191285fa74e"
+source = "git+https://github.com/agentux-os/agentux-core?rev=c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf#c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf"
 dependencies = [
  "serde",
  "serde-saphyr",
@@ -118,7 +118,7 @@ dependencies = [
 [[package]]
 name = "agentux-gateway"
 version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=da4a80ca27f89e56b166a29a40900191285fa74e#da4a80ca27f89e56b166a29a40900191285fa74e"
+source = "git+https://github.com/agentux-os/agentux-core?rev=c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf#c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf"
 dependencies = [
  "agentux-api",
  "auxp",
@@ -129,13 +129,13 @@ dependencies = [
  "serde-saphyr",
  "serde_json",
  "tokio",
- "tokio-tungstenite 0.26.2",
+ "tokio-tungstenite 0.30.0",
 ]
 
 [[package]]
 name = "agentux-harness"
 version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=da4a80ca27f89e56b166a29a40900191285fa74e#da4a80ca27f89e56b166a29a40900191285fa74e"
+source = "git+https://github.com/agentux-os/agentux-core?rev=c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf#c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf"
 dependencies = [
  "agent-client-protocol",
  "rustix",
@@ -146,7 +146,7 @@ dependencies = [
 [[package]]
 name = "agentux-store"
 version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=da4a80ca27f89e56b166a29a40900191285fa74e#da4a80ca27f89e56b166a29a40900191285fa74e"
+source = "git+https://github.com/agentux-os/agentux-core?rev=c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf#c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf"
 dependencies = [
  "agentux-api",
  "rusqlite",
@@ -158,12 +158,12 @@ dependencies = [
 [[package]]
 name = "agentux-worktree"
 version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=da4a80ca27f89e56b166a29a40900191285fa74e#da4a80ca27f89e56b166a29a40900191285fa74e"
+source = "git+https://github.com/agentux-os/agentux-core?rev=c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf#c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf"
 
 [[package]]
 name = "agentuxd"
 version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=da4a80ca27f89e56b166a29a40900191285fa74e#da4a80ca27f89e56b166a29a40900191285fa74e"
+source = "git+https://github.com/agentux-os/agentux-core?rev=c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf#c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf"
 dependencies = [
  "agentux-api",
  "agentux-bus",
@@ -382,7 +382,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "auxp"
 version = "0.1.0"
-source = "git+https://github.com/agentux-os/agentux-protocol?rev=9c219eebb88b1bd74a275f8a17ba287031723d3c#9c219eebb88b1bd74a275f8a17ba287031723d3c"
+source = "git+https://github.com/agentux-os/agentux-protocol?rev=aeced51393523ee7cd20c0b163cdb2664c2a038e#aeced51393523ee7cd20c0b163cdb2664c2a038e"
 dependencies = [
  "jiff",
  "serde",
@@ -415,7 +415,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
- "sha1",
+ "sha1 0.10.7",
  "sync_wrapper",
  "tokio",
  "tokio-tungstenite 0.29.0",
@@ -1184,9 +1184,9 @@ dependencies = [
 
 [[package]]
 name = "granit-parser"
-version = "1.3.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e20f99e46474f56bd905c56e817ebddcf377a611f94c53ac4649e4d3fa3c0cd0"
+checksum = "da55feca5d1625466bae068f9fd4b87892caeae70c3fe671ddb0f50d41aebf37"
 dependencies = [
  "arraydeque",
  "smallvec",
@@ -2431,9 +2431,9 @@ dependencies = [
 
 [[package]]
 name = "serde-saphyr"
-version = "1.3.0"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b8050abb251097357e24aff63ba2c52a6309ecb7d23a5474023df960a02694d8"
+checksum = "a253edfdea34032da21af84e16fcc94f4c7a6ba237f9f3bc2dbf43cea8535c44"
 dependencies = [
  "annotate-snippets",
  "encoding_rs_io",
@@ -2565,6 +2565,17 @@ dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
  "digest 0.10.7",
+]
+
+[[package]]
+name = "sha1"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aacc4cc499359472b4abe1bf11d0b12e688af9a805fa5e3016f9a386dc2d0214"
+dependencies = [
+ "cfg-if",
+ "cpufeatures 0.3.1",
+ "digest 0.11.3",
 ]
 
 [[package]]
@@ -2766,7 +2777,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -2923,22 +2934,6 @@ dependencies = [
 
 [[package]]
 name = "tokio-tungstenite"
-version = "0.26.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7a9daff607c6d2bf6c16fd681ccb7eecc83e4e2cdc1ca067ffaadfca5de7f084"
-dependencies = [
- "futures-util",
- "log",
- "rustls",
- "rustls-pki-types",
- "tokio",
- "tokio-rustls",
- "tungstenite 0.26.2",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
-name = "tokio-tungstenite"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "489a59b6730eda1b0171fcfda8b121f4bee2b35cba8645ca35c5f7ba3eb736c1"
@@ -2959,6 +2954,22 @@ dependencies = [
  "log",
  "tokio",
  "tungstenite 0.29.0",
+]
+
+[[package]]
+name = "tokio-tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "17a073bfed563fa236697a068031408a93cd9522e08abf9933ead3e73411bd71"
+dependencies = [
+ "futures-util",
+ "log",
+ "rustls",
+ "rustls-pki-types",
+ "tokio",
+ "tokio-rustls",
+ "tungstenite 0.30.0",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -3062,25 +3073,6 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tungstenite"
-version = "0.26.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4793cb5e56680ecbb1d843515b23b6de9a75eb04b66643e256a396d43be33c13"
-dependencies = [
- "bytes",
- "data-encoding",
- "http",
- "httparse",
- "log",
- "rand 0.9.5",
- "rustls",
- "rustls-pki-types",
- "sha1",
- "thiserror 2.0.21",
- "utf-8",
-]
-
-[[package]]
-name = "tungstenite"
 version = "0.27.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "eadc29d668c91fcc564941132e17b28a7ceb2f3ebf0b9dae3e03fd7a6748eb0d"
@@ -3091,7 +3083,7 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
- "sha1",
+ "sha1 0.10.7",
  "thiserror 2.0.21",
  "utf-8",
 ]
@@ -3108,7 +3100,25 @@ dependencies = [
  "httparse",
  "log",
  "rand 0.9.5",
- "sha1",
+ "sha1 0.10.7",
+ "thiserror 2.0.21",
+]
+
+[[package]]
+name = "tungstenite"
+version = "0.30.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48ac77174b19c110a50ab2128b24215ac9cb40e0e12e093fb602d175c569d22"
+dependencies = [
+ "bytes",
+ "data-encoding",
+ "http",
+ "httparse",
+ "log",
+ "rand 0.10.3",
+ "rustls",
+ "rustls-pki-types",
+ "sha1 0.11.0",
  "thiserror 2.0.21",
 ]
 

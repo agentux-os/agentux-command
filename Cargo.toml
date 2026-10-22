@@ -9,7 +9,7 @@ publish = false
 [dependencies]
 # AUXP, shared with agentux-core's node gateway and tested against the
 # protocol's schemas.
-auxp = { git = "https://github.com/agentux-os/agentux-protocol", rev = "9c219eebb88b1bd74a275f8a17ba287031723d3c" }
+auxp = { git = "https://github.com/agentux-os/agentux-protocol", rev = "aeced51393523ee7cd20c0b163cdb2664c2a038e" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
@@ -29,9 +29,9 @@ url = "2"
 [dev-dependencies]
 # The real node side for tests/end_to_end.rs: agentux-core's gateway in
 # front of an agentuxd with scripted agents.
-agentux-gateway = { git = "https://github.com/agentux-os/agentux-core", rev = "da4a80ca27f89e56b166a29a40900191285fa74e" }
-agentux-store = { git = "https://github.com/agentux-os/agentux-core", rev = "da4a80ca27f89e56b166a29a40900191285fa74e" }
-agentuxd = { git = "https://github.com/agentux-os/agentux-core", rev = "da4a80ca27f89e56b166a29a40900191285fa74e" }
+agentux-gateway = { git = "https://github.com/agentux-os/agentux-core", rev = "c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf" }
+agentux-store = { git = "https://github.com/agentux-os/agentux-core", rev = "c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf" }
+agentuxd = { git = "https://github.com/agentux-os/agentux-core", rev = "c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf" }
 tempfile = "3"
 http-body-util = "0.1"
 tokio-tungstenite = "0.27"
