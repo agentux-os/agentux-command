@@ -11,13 +11,17 @@ publish = false
 # protocol's schemas.
 auxp = { git = "https://github.com/agentux-os/agentux-protocol", rev = "aeced51393523ee7cd20c0b163cdb2664c2a038e" }
 async-trait = "0.1"
+base64 = "0.22"
 axum = { version = "0.8", features = ["ws"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde", "std"] }
 deadpool-postgres = "0.14"
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 getrandom = "0.3"
 hex = "0.4"
+# OIDC sign-in: ID token signatures, and the provider's endpoints.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 regex = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
@@ -33,6 +37,10 @@ agentux-gateway = { git = "https://github.com/agentux-os/agentux-core", rev = "c
 agentux-store = { git = "https://github.com/agentux-os/agentux-core", rev = "c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf" }
 agentuxd = { git = "https://github.com/agentux-os/agentux-core", rev = "c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf" }
 tempfile = "3"
+# A test OIDC provider's signing key.
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto", "use_pem"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.27"
 tower = { version = "0.5", features = ["util"] }

@@ -48,8 +48,15 @@ const ANY_ORGANIZATION: &str = "*";
 /// Service tokens start with this.
 pub const SERVICE_TOKEN_PREFIX: &str = "auxs1_";
 
+/// Operator sessions (after an OIDC sign-in) start with this.
+pub const SESSION_PREFIX: &str = "auxo1_";
+
+/// How long a signed-in session lasts. Group changes at the provider take
+/// effect at the next sign-in, so at most this late.
+pub const SESSION_HOURS: i64 = 8;
+
 /// Who is calling, and what it may do in each organization.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Principal {
     pub subject: String,
     grants: BTreeMap<String, BTreeSet<String>>,
@@ -74,6 +81,11 @@ impl Principal {
             .or_default()
             .extend(capabilities.into_iter().map(str::to_string));
         self
+    }
+
+    /// Every organization and the capabilities held there.
+    pub fn grants(&self) -> &BTreeMap<String, BTreeSet<String>> {
+        &self.grants
     }
 
     /// Whether the principal holds `capability` in `organization`.
@@ -553,5 +565,119 @@ mod tests {
             store.authenticate(&expired.secret).await.is_none(),
             "expired"
         );
+    }
+}
+
+/// Signed-in operators' sessions: the session secret (in a cookie) to the
+/// principal its sign-in mapped to. Only hashes are stored.
+#[async_trait]
+pub trait Sessions: Send + Sync {
+    /// Starts a session; its secret.
+    async fn start(&self, principal: &Principal, now: DateTime<Utc>) -> Result<String, Error>;
+    async fn resolve(&self, secret: &str, now: DateTime<Utc>) -> Option<Principal>;
+    async fn end(&self, secret: &str) -> Result<(), Error>;
+}
+
+fn new_session_secret() -> String {
+    format!("{SESSION_PREFIX}{}", random_hex(32))
+}
+
+/// Sessions in memory: the demo server and tests.
+#[derive(Default)]
+pub struct MemorySessions {
+    sessions: Mutex<HashMap<String, (DateTime<Utc>, Principal)>>,
+}
+
+#[async_trait]
+impl Sessions for MemorySessions {
+    async fn start(&self, principal: &Principal, now: DateTime<Utc>) -> Result<String, Error> {
+        let secret = new_session_secret();
+        let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions.retain(|_, (until, _)| now < *until);
+        sessions.insert(
+            hash(&secret),
+            (now + Duration::hours(SESSION_HOURS), principal.clone()),
+        );
+        Ok(secret)
+    }
+
+    async fn resolve(&self, secret: &str, now: DateTime<Utc>) -> Option<Principal> {
+        let sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+        sessions
+            .get(&hash(secret))
+            .filter(|(until, _)| now < *until)
+            .map(|(_, p)| p.clone())
+    }
+
+    async fn end(&self, secret: &str) -> Result<(), Error> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&hash(secret));
+        Ok(())
+    }
+}
+
+/// Sessions in Command's database (migration 004_operator_sessions), so
+/// they survive a restart and every replica sees them.
+pub struct PostgresSessions {
+    pool: deadpool_postgres::Pool,
+}
+
+impl PostgresSessions {
+    pub fn new(pool: deadpool_postgres::Pool) -> Self {
+        Self { pool }
+    }
+}
+
+#[async_trait]
+impl Sessions for PostgresSessions {
+    async fn start(&self, principal: &Principal, now: DateTime<Utc>) -> Result<String, Error> {
+        let secret = new_session_secret();
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM operator_sessions WHERE expires_at <= $1",
+                &[&now],
+            )
+            .await?;
+        client
+            .execute(
+                "INSERT INTO operator_sessions (session_hash, subject, principal, created_at, expires_at) VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    &hash(&secret),
+                    &principal.subject,
+                    &tokio_postgres::types::Json(principal),
+                    &now,
+                    &(now + Duration::hours(SESSION_HOURS)),
+                ],
+            )
+            .await?;
+        Ok(secret)
+    }
+
+    async fn resolve(&self, secret: &str, now: DateTime<Utc>) -> Option<Principal> {
+        let client = self.pool.get().await.ok()?;
+        let row = client
+            .query_opt(
+                "SELECT principal FROM operator_sessions WHERE session_hash = $1 AND expires_at > $2",
+                &[&hash(secret), &now],
+            )
+            .await
+            .ok()??;
+        let tokio_postgres::types::Json(principal): tokio_postgres::types::Json<Principal> =
+            row.get(0);
+        Some(principal)
+    }
+
+    async fn end(&self, secret: &str) -> Result<(), Error> {
+        let client = self.pool.get().await?;
+        client
+            .execute(
+                "DELETE FROM operator_sessions WHERE session_hash = $1",
+                &[&hash(secret)],
+            )
+            .await?;
+        Ok(())
     }
 }

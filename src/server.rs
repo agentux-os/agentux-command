@@ -8,8 +8,9 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::ws::rejection::WebSocketUpgradeRejection;
-use axum::extract::{Path, Query, State, WebSocketUpgrade};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::extract::{Path, Query, Request, State, WebSocketUpgrade};
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
@@ -17,8 +18,9 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use subtle::ConstantTimeEq;
 
-use crate::auth::{self, DemoTokens, Principal, ServiceTokens};
+use crate::auth::{self, DemoTokens, Principal, ServiceTokens, Sessions};
 use crate::channel::{Hub, SendError};
+use crate::oidc::{self, Oidc};
 use auxp::enrollment;
 use auxp::provision::{CommandJoin, Provision};
 
@@ -50,6 +52,10 @@ struct Inner {
     service_tokens: Arc<dyn ServiceTokens>,
     /// Accept the demo tokens (the demo server; development only).
     demo_tokens: bool,
+    /// Signed-in operators' sessions.
+    sessions: Arc<dyn Sessions>,
+    /// Sign-in with an OIDC provider, when configured.
+    oidc: Option<Arc<Oidc>>,
 }
 
 /// A Command server, configured with the `with_*` methods, served by
@@ -97,6 +103,8 @@ impl Handler {
                 public_url: String::new(),
                 service_tokens: Arc::new(auth::MemoryTokens::default()),
                 demo_tokens: true,
+                sessions: Arc::new(auth::MemorySessions::default()),
+                oidc: None,
             },
         }
     }
@@ -110,10 +118,23 @@ impl Handler {
             .map_err(|e| e.to_string())?;
         let handler = Self::with_office(Arc::new(office::PostgresStore::new(pool.clone())))
             .with_service_tokens(Arc::new(auth::PostgresTokens::new(pool.clone())))
+            .with_sessions(Arc::new(auth::PostgresSessions::new(pool.clone())))
             .with_enroll_store(Arc::new(enroll::Postgres::new(pool)))
             .await
             .map_err(|e| e.to_string())?;
         Ok(handler.with_open_nodes(false).with_demo_tokens(false))
+    }
+
+    /// Keeps signed-in operators' sessions in `store`.
+    pub fn with_sessions(mut self, store: Arc<dyn Sessions>) -> Self {
+        self.inner.sessions = store;
+        self
+    }
+
+    /// Signs operators in with an OIDC provider (`/v1/auth/login`).
+    pub fn with_oidc(mut self, provider: Oidc) -> Self {
+        self.inner.oidc = Some(Arc::new(provider));
+        self
     }
 
     /// Keeps operators' service tokens in `store`.
@@ -194,9 +215,17 @@ impl Handler {
                 "/v1/service-tokens/{token}/revoke",
                 post(revoke_service_token),
             )
+            .route("/v1/auth/login", get(login))
+            .route("/v1/auth/callback", get(callback))
+            .route("/v1/auth/logout", post(logout))
+            .route("/v1/auth/me", get(me))
             .fallback(not_found)
             .method_not_allowed_fallback(not_found)
             .layer(axum::extract::DefaultBodyLimit::max(MESSAGE_LIMIT))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                same_origin,
+            ))
             .with_state(state)
     }
 }
@@ -231,6 +260,43 @@ fn forbidden(capability: &str, organization: &str) -> Response {
     )
 }
 
+/// The session cookie a sign-in sets.
+const SESSION_COOKIE: &str = "agentux_session";
+
+/// The session secret in the request's cookie, if any.
+fn session_cookie(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get_all(header::COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(';'))
+        .filter_map(|pair| pair.trim().split_once('='))
+        .find(|(name, _)| *name == SESSION_COOKIE)
+        .map(|(_, value)| value)
+}
+
+/// Refuses a state-changing request that a browser sent on the strength of
+/// the session cookie alone from another origin (CSRF). Requests with an
+/// Authorization header, and reads, are not concerned.
+async fn same_origin(State(s): AppState, request: Request, next: Next) -> Response {
+    let reads = matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
+    let headers = request.headers();
+    if !reads && !headers.contains_key(header::AUTHORIZATION) && session_cookie(headers).is_some() {
+        let expected = s.base_url(headers);
+        let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+        if origin != Some(expected.as_str()) {
+            return error(
+                StatusCode::FORBIDDEN,
+                "a signed-in request must come from this server's own pages",
+            );
+        }
+    }
+    next.run(request).await
+}
+
 /// 401: no operator credential, or one Command does not accept.
 fn unauthenticated() -> Response {
     error(StatusCode::UNAUTHORIZED, "invalid credentials")
@@ -257,9 +323,19 @@ impl Inner {
     /// The operator behind a request: its service token, or a demo token
     /// where those are accepted. `Err` is the 401 to answer.
     async fn operator(&self, headers: &HeaderMap) -> Result<Principal, Box<Response>> {
-        let bearer = bearer(headers);
+        let bearer = match bearer(headers) {
+            "" => session_cookie(headers).unwrap_or(""),
+            given => given,
+        };
         if bearer.is_empty() {
             return Err(Box::new(unauthenticated()));
+        }
+        if bearer.starts_with(auth::SESSION_PREFIX) {
+            return self
+                .sessions
+                .resolve(bearer, Utc::now())
+                .await
+                .ok_or_else(|| Box::new(unauthenticated()));
         }
         if self.demo_tokens
             && let Some(p) = auth::Authenticator::authenticate(&DemoTokens, bearer).await
@@ -1010,4 +1086,122 @@ async fn revoke_service_token(
         Ok(()) => reply(StatusCode::OK, json!({"id": token.id, "status": "revoked"})),
         Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "token store unavailable"),
     }
+}
+
+#[derive(Deserialize)]
+struct LoginQuery {
+    #[serde(rename = "returnTo", default)]
+    return_to: String,
+}
+
+/// Starts a sign-in: sends the browser to the identity provider.
+async fn login(State(s): AppState, Query(query): Query<LoginQuery>) -> Response {
+    let Some(provider) = &s.oidc else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "sign-in is not configured on this server",
+        );
+    };
+    match provider.login_url(&query.return_to).await {
+        Ok(url) => redirect(&url, None),
+        Err(e) => error(StatusCode::BAD_GATEWAY, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct CallbackQuery {
+    #[serde(default)]
+    code: String,
+    #[serde(default)]
+    state: String,
+    #[serde(default)]
+    error: String,
+}
+
+/// The provider sends the browser back here: checks the sign-in, starts a
+/// session and sets its cookie.
+async fn callback(
+    State(s): AppState,
+    Query(query): Query<CallbackQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(provider) = &s.oidc else {
+        return error(
+            StatusCode::NOT_FOUND,
+            "sign-in is not configured on this server",
+        );
+    };
+    if !query.error.is_empty() {
+        return error(
+            StatusCode::UNAUTHORIZED,
+            &format!("the identity provider refused the sign-in: {}", query.error),
+        );
+    }
+    let signed_in = match provider.callback(&query.code, &query.state).await {
+        Ok(signed_in) => signed_in,
+        Err(e @ oidc::Error::UnknownState) => {
+            return error(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+        Err(e @ oidc::Error::InvalidToken(_)) => {
+            return error(StatusCode::UNAUTHORIZED, &e.to_string());
+        }
+        Err(e @ oidc::Error::NoAccess(_)) => return error(StatusCode::FORBIDDEN, &e.to_string()),
+        Err(e) => return error(StatusCode::BAD_GATEWAY, &e.to_string()),
+    };
+    let secret = match s.sessions.start(&signed_in.principal, Utc::now()).await {
+        Ok(secret) => secret,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "session store unavailable"),
+    };
+    let secure = if s.base_url(&headers).starts_with("https://") {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie = format!(
+        "{SESSION_COOKIE}={secret}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}{secure}",
+        auth::SESSION_HOURS * 3600
+    );
+    redirect(&signed_in.return_to, Some(cookie))
+}
+
+/// Ends the caller's session and clears its cookie.
+async fn logout(State(s): AppState, headers: HeaderMap) -> Response {
+    let secret = match bearer(&headers) {
+        "" => session_cookie(&headers).unwrap_or(""),
+        given => given,
+    };
+    if secret.starts_with(auth::SESSION_PREFIX) {
+        let _ = s.sessions.end(secret).await;
+    }
+    let mut response = reply(StatusCode::OK, json!({"status": "signed out"}));
+    if let Ok(value) = HeaderValue::from_str(&format!(
+        "{SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0"
+    )) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
+}
+
+/// Who the caller is and what it may do, for the console and the Office.
+async fn me(State(s): AppState, headers: HeaderMap) -> Response {
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    reply(
+        StatusCode::OK,
+        json!({"subject": operator.subject, "organizations": operator.grants(), "signIn": s.oidc.is_some()}),
+    )
+}
+
+/// A 303 to `location`, optionally setting a cookie.
+fn redirect(location: &str, cookie: Option<String>) -> Response {
+    let mut response = StatusCode::SEE_OTHER.into_response();
+    if let Ok(value) = HeaderValue::from_str(location) {
+        response.headers_mut().insert(header::LOCATION, value);
+    }
+    if let Some(value) = cookie.and_then(|c| HeaderValue::from_str(&c).ok()) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    response
 }

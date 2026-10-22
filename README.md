@@ -113,8 +113,37 @@ GET  /v1/service-tokens?organizationId=acme
 POST /v1/service-tokens/<id>/revoke
 ```
 
-Interactive sign-in for people (OIDC, with groups mapped to capabilities) is
-the next step ([#13](https://github.com/agentux-os/agentux-command/issues/13)).
+**Signing people in (OIDC).** With an OpenID Connect provider configured
+(Ferriskey, Keycloak, Entra ID, Google, or GitHub through a provider that
+brokers it), `GET /v1/auth/login?returnTo=/console` sends the browser to the
+provider (authorization code with PKCE S256 and a nonce), and
+`/v1/auth/callback` accepts the ID token only when its signature checks
+against the provider's published keys and its issuer, audience, expiry and
+nonce are right. The token's groups map to capabilities per organization
+through a role map; a person whose groups map to nothing is not signed in
+(403). The session is an `HttpOnly`, `SameSite=Lax` cookie (`Secure` over
+HTTPS) lasting 8 hours, stored hashed in PostgreSQL; group changes at the
+provider apply at the next sign-in. A state-changing request carried by the
+cookie alone must come from this server's own origin (CSRF). `GET
+/v1/auth/me` says who is signed in and what they may do; `POST
+/v1/auth/logout` ends the session.
+
+```sh
+AGENTUX_COMMAND_PUBLIC_URL=https://command.acme.org      # the callback is <this>/v1/auth/callback
+AGENTUX_COMMAND_OIDC_ISSUER=https://id.acme.org/realms/acme
+AGENTUX_COMMAND_OIDC_CLIENT_ID=agentux-command
+AGENTUX_COMMAND_OIDC_CLIENT_SECRET=…                     # from a Podman secret
+AGENTUX_COMMAND_OIDC_ROLES=/var/lib/agentux/command/roles.json
+AGENTUX_COMMAND_OIDC_GROUPS_CLAIM=groups                 # default
+AGENTUX_COMMAND_OIDC_SCOPES="openid profile email groups"  # default
+```
+
+```json
+{ "groups": {
+    "agentux-leads":    { "acme": ["organization.read", "node.command", "node.enroll", "approval.decide"] },
+    "agentux-admins":   { "acme": ["auth.admin", "organization.read"] },
+    "agentux-auditors": { "acme": ["organization.read"], "beta": ["organization.read"] } } }
+```
 The demo tokens (`demo-leader`: every capability but `auth.admin` in every
 organization; `demo-observer`: `organization.read`) work on the in-memory demo
 server, and on a real one only with `AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1`.
