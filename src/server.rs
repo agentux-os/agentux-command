@@ -17,6 +17,7 @@ use serde::Deserialize;
 use serde_json::{Map, Value, json};
 use subtle::ConstantTimeEq;
 
+use crate::auth::{self, DemoTokens, Principal, ServiceTokens};
 use crate::channel::{Hub, SendError};
 use auxp::enrollment;
 use auxp::provision::{CommandJoin, Provision};
@@ -45,6 +46,10 @@ struct Inner {
     open_nodes: bool,
     /// The address nodes reach this server at, for provision files.
     public_url: String,
+    /// Operators' service tokens (and, later, sessions).
+    service_tokens: Arc<dyn ServiceTokens>,
+    /// Accept the demo tokens (the demo server; development only).
+    demo_tokens: bool,
 }
 
 /// A Command server, configured with the `with_*` methods, served by
@@ -71,7 +76,8 @@ impl Default for Handler {
 }
 
 impl Handler {
-    /// The demo server: memory stores, open to nodes nobody enrolled.
+    /// The demo server: memory stores, open to nodes nobody enrolled, and
+    /// the demo tokens.
     pub fn new() -> Self {
         Self::with_office(Arc::new(office::Store::new()))
     }
@@ -89,21 +95,43 @@ impl Handler {
                 instance,
                 open_nodes: true,
                 public_url: String::new(),
+                service_tokens: Arc::new(auth::MemoryTokens::default()),
+                demo_tokens: true,
             },
         }
     }
 
-    /// The production server: PostgreSQL for the read model and enrollment,
-    /// closed to nodes nobody enrolled.
+    /// The production server: PostgreSQL for the read model, enrollment and
+    /// service tokens; closed to nodes nobody enrolled and to the demo
+    /// tokens.
     pub async fn postgres(database_url: &str) -> Result<Self, String> {
         let pool = office::open_postgres(database_url)
             .await
             .map_err(|e| e.to_string())?;
         let handler = Self::with_office(Arc::new(office::PostgresStore::new(pool.clone())))
+            .with_service_tokens(Arc::new(auth::PostgresTokens::new(pool.clone())))
             .with_enroll_store(Arc::new(enroll::Postgres::new(pool)))
             .await
             .map_err(|e| e.to_string())?;
-        Ok(handler.with_open_nodes(false))
+        Ok(handler.with_open_nodes(false).with_demo_tokens(false))
+    }
+
+    /// Keeps operators' service tokens in `store`.
+    pub fn with_service_tokens(mut self, store: Arc<dyn ServiceTokens>) -> Self {
+        self.inner.service_tokens = store;
+        self
+    }
+
+    /// Whether the demo tokens (`demo-leader`, `demo-observer`) are
+    /// accepted (AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1; development only).
+    pub fn with_demo_tokens(mut self, accept: bool) -> Self {
+        self.inner.demo_tokens = accept;
+        self
+    }
+
+    /// The operator token store, for issuing the first administrator token.
+    pub fn service_tokens(&self) -> Arc<dyn ServiceTokens> {
+        self.inner.service_tokens.clone()
     }
 
     /// Keeps enrolled nodes in `store` (PostgreSQL in production).
@@ -158,6 +186,14 @@ impl Handler {
             .route("/v1/protocol/messages", post(message))
             .route("/v1/office/projection", get(projection))
             .route("/v1/approvals/{approval}/resolve", post(resolve_approval))
+            .route(
+                "/v1/service-tokens",
+                get(list_service_tokens).post(issue_service_token),
+            )
+            .route(
+                "/v1/service-tokens/{token}/revoke",
+                post(revoke_service_token),
+            )
             .fallback(not_found)
             .method_not_allowed_fallback(not_found)
             .layer(axum::extract::DefaultBodyLimit::max(MESSAGE_LIMIT))
@@ -187,24 +223,17 @@ fn bearer(headers: &HeaderMap) -> &str {
     value.strip_prefix("Bearer ").unwrap_or(value)
 }
 
-/// What an operator's token allows. Only the demo tokens exist until
-/// organization sessions (agentux-command#13).
-fn has_capability(headers: &HeaderMap, capability: &str) -> bool {
-    match headers.get("authorization").and_then(|v| v.to_str().ok()) {
-        Some("Bearer demo-leader") => matches!(
-            capability,
-            "organization.read" | "approval.decide" | "node.command" | "node.enroll"
-        ),
-        Some("Bearer demo-observer") => capability == "organization.read",
-        _ => false,
-    }
+/// 403 for a capability the caller lacks in an organization.
+fn forbidden(capability: &str, organization: &str) -> Response {
+    error(
+        StatusCode::FORBIDDEN,
+        &format!("{capability} capability required in organization {organization}"),
+    )
 }
 
-fn authorized(headers: &HeaderMap) -> bool {
-    matches!(
-        headers.get("authorization").and_then(|v| v.to_str().ok()),
-        Some("Bearer demo-leader" | "Bearer demo-observer")
-    )
+/// 401: no operator credential, or one Command does not accept.
+fn unauthenticated() -> Response {
+    error(StatusCode::UNAUTHORIZED, "invalid credentials")
 }
 
 /// Parses a JSON body of at most `limit` bytes.
@@ -225,6 +254,38 @@ enum Access {
 }
 
 impl Inner {
+    /// The operator behind a request: its service token, or a demo token
+    /// where those are accepted. `Err` is the 401 to answer.
+    async fn operator(&self, headers: &HeaderMap) -> Result<Principal, Box<Response>> {
+        let bearer = bearer(headers);
+        if bearer.is_empty() {
+            return Err(Box::new(unauthenticated()));
+        }
+        if self.demo_tokens
+            && let Some(p) = auth::Authenticator::authenticate(&DemoTokens, bearer).await
+        {
+            return Ok(p);
+        }
+        self.service_tokens
+            .authenticate(bearer)
+            .await
+            .ok_or_else(|| Box::new(unauthenticated()))
+    }
+
+    /// The organization an enrolled node belongs to.
+    async fn node_organization(&self, node_id: &str) -> Option<String> {
+        if let Some(node) = self.registry.get(node_id) {
+            return Some(node.organization_id);
+        }
+        self.enroll
+            .credentials()
+            .await
+            .ok()?
+            .into_iter()
+            .find(|c| c.node_id == node_id)
+            .map(|c| c.organization_id)
+    }
+
     /// Checks the node's bearer token: its enrollment credential (bound to
     /// its organization), a static token, or, on the demo server only, none.
     async fn node_access(
@@ -341,14 +402,20 @@ async fn instance(State(s): AppState) -> Response {
 }
 
 async fn list_nodes(State(s): AppState, headers: HeaderMap) -> Response {
-    // Node telemetry names repositories, agents and spend: operators only.
-    if !has_capability(&headers, "organization.read") {
+    // Node telemetry names repositories, agents and spend: operators only,
+    // and only their organizations' nodes.
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    if !operator.can_somewhere(auth::ORGANIZATION_READ) {
         return error(
             StatusCode::FORBIDDEN,
             "organization.read capability required",
         );
     }
     let mut list = s.registry.list();
+    list.retain(|node| operator.can(&node.organization_id, auth::ORGANIZATION_READ));
     for node in &mut list {
         node.connected = s.hub.connected(&node.id);
     }
@@ -464,15 +531,28 @@ async fn command(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !authorized(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "invalid credentials");
-    }
-    if !has_capability(&headers, "node.command") {
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    if !operator.can_somewhere(auth::NODE_COMMAND) {
         return error(StatusCode::FORBIDDEN, "node.command capability required");
     }
-    let Some(node) = s.registry.get(&node_id) else {
+    // Another organization's node is answered as unknown: its existence is
+    // not the caller's to learn.
+    let visible = |org: &str| {
+        operator.can(org, auth::ORGANIZATION_READ) || operator.can(org, auth::NODE_COMMAND)
+    };
+    let Some(node) = s
+        .registry
+        .get(&node_id)
+        .filter(|n| visible(&n.organization_id))
+    else {
         return error(StatusCode::NOT_FOUND, "unknown node");
     };
+    if !operator.can(&node.organization_id, auth::NODE_COMMAND) {
+        return forbidden(auth::NODE_COMMAND, &node.organization_id);
+    }
     let request =
         parse::<CommandRequest>(&body, 1 << 20).filter(|r| auxp::methods::is_command(&r.method));
     let Some(request) = request else {
@@ -641,12 +721,19 @@ struct TokensRequest {
 
 /// Creates enrollment tokens (operators with node.enroll).
 async fn issue_tokens(State(s): AppState, headers: HeaderMap, body: Bytes) -> Response {
-    if !authorized(&headers) || !has_capability(&headers, "node.enroll") {
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    if !operator.can_somewhere(auth::NODE_ENROLL) {
         return error(StatusCode::FORBIDDEN, "node.enroll capability required");
     }
     let Some(request) = parse::<TokensRequest>(&body, 64 << 10) else {
         return error(StatusCode::BAD_REQUEST, "invalid JSON");
     };
+    if !operator.can(&request.organization_id, auth::NODE_ENROLL) {
+        return forbidden(auth::NODE_ENROLL, &request.organization_id);
+    }
     let base = s.base_url(&headers);
     if let Some(template) = &request.provision {
         if template.user.trim().is_empty() {
@@ -671,7 +758,7 @@ async fn issue_tokens(State(s): AppState, headers: HeaderMap, body: Bytes) -> Re
                 count: request.count,
                 ttl: chrono::Duration::minutes(request.ttl_minutes),
                 require_approval: request.require_approval,
-                created_by: String::new(),
+                created_by: operator.subject.clone(),
             },
             Utc::now(),
         )
@@ -701,17 +788,24 @@ async fn issue_tokens(State(s): AppState, headers: HeaderMap, body: Bytes) -> Re
 
 /// Every enrolled node and its state.
 async fn list_enrollments(State(s): AppState, headers: HeaderMap) -> Response {
-    if !authorized(&headers) || !has_capability(&headers, "organization.read") {
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    if !operator.can_somewhere(auth::ORGANIZATION_READ) {
         return error(
             StatusCode::FORBIDDEN,
             "organization.read capability required",
         );
     }
     match s.enroll.credentials().await {
-        Ok(credentials) => reply(
-            StatusCode::OK,
-            json!({"instanceId": s.instance, "nodes": credentials}),
-        ),
+        Ok(mut credentials) => {
+            credentials.retain(|c| operator.can(&c.organization_id, auth::ORGANIZATION_READ));
+            reply(
+                StatusCode::OK,
+                json!({"instanceId": s.instance, "nodes": credentials}),
+            )
+        }
         Err(_) => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "enrollment store unavailable",
@@ -738,8 +832,19 @@ async fn decide_node(
     headers: HeaderMap,
     action: &str,
 ) -> Response {
-    if !authorized(&headers) || !has_capability(&headers, "node.enroll") {
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    if !operator.can_somewhere(auth::NODE_ENROLL) {
         return error(StatusCode::FORBIDDEN, "node.enroll capability required");
+    }
+    match s.node_organization(&node_id).await {
+        Some(org) if operator.can(&org, auth::NODE_ENROLL) => {}
+        Some(org) if operator.can(&org, auth::ORGANIZATION_READ) => {
+            return forbidden(auth::NODE_ENROLL, &org);
+        }
+        _ => return error(StatusCode::NOT_FOUND, "unknown node"),
     }
     let result = if action == "approve" {
         s.enroll.approve(&node_id, Utc::now()).await
@@ -771,19 +876,23 @@ async fn projection(
     Query(query): Query<ProjectionQuery>,
     headers: HeaderMap,
 ) -> Response {
-    if !authorized(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "invalid credentials");
-    }
-    if !has_capability(&headers, "organization.read") {
-        return error(
-            StatusCode::FORBIDDEN,
-            "organization.read capability required",
-        );
-    }
-    let organization_id = match query.organization_id.as_str() {
-        "" => "org-demo",
-        id => id,
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
     };
+    // Without organizationId: the caller's one organization, or the demo's.
+    let organization_id = match query.organization_id.as_str() {
+        "" => match operator.organizations_with(auth::ORGANIZATION_READ) {
+            None => "org-demo".to_string(),
+            Some(orgs) if orgs.len() == 1 => orgs.into_iter().next().unwrap_or_default(),
+            Some(_) => return error(StatusCode::BAD_REQUEST, "organizationId is required"),
+        },
+        id => id.to_string(),
+    };
+    if !operator.can(&organization_id, auth::ORGANIZATION_READ) {
+        return forbidden(auth::ORGANIZATION_READ, &organization_id);
+    }
+    let organization_id = organization_id.as_str();
     match s.office.get_projection(organization_id).await {
         Ok(Some(projection)) => reply(
             StatusCode::OK,
@@ -800,15 +909,21 @@ async fn resolve_approval(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !authorized(&headers) {
-        return error(StatusCode::UNAUTHORIZED, "invalid credentials");
-    }
-    if !has_capability(&headers, "approval.decide") {
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    if !operator.can_somewhere(auth::APPROVAL_DECIDE) {
         return error(StatusCode::FORBIDDEN, "approval.decide capability required");
     }
     let Some(request) = parse::<ResolutionRequest>(&body, 64 << 10) else {
         return error(StatusCode::BAD_REQUEST, "invalid JSON");
     };
+    // The approval is scoped to the request's organization, so deciding
+    // needs the capability there.
+    if !operator.can(&request.organization_id, auth::APPROVAL_DECIDE) {
+        return forbidden(auth::APPROVAL_DECIDE, &request.organization_id);
+    }
     match s.office.resolve_approval(&approval_id, request).await {
         Ok(response) => reply(
             StatusCode::OK,
@@ -822,5 +937,77 @@ async fn resolve_approval(
             StatusCode::SERVICE_UNAVAILABLE,
             "approval_store_unavailable",
         ),
+    }
+}
+
+#[derive(Deserialize)]
+struct ServiceTokensQuery {
+    #[serde(rename = "organizationId", default)]
+    organization_id: String,
+}
+
+/// Issues an operator service token (auth.admin in its organization). The
+/// secret is in this answer only.
+async fn issue_service_token(State(s): AppState, headers: HeaderMap, body: Bytes) -> Response {
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let Some(mut request) = parse::<auth::TokenRequest>(&body, 16 << 10) else {
+        return error(StatusCode::BAD_REQUEST, "invalid JSON");
+    };
+    if !operator.can(&request.organization_id, auth::AUTH_ADMIN) {
+        return forbidden(auth::AUTH_ADMIN, &request.organization_id);
+    }
+    request.created_by = operator.subject.clone();
+    match s.service_tokens.issue(request, Utc::now()).await {
+        Ok(issued) => reply(
+            StatusCode::CREATED,
+            serde_json::to_value(issued).unwrap_or_default(),
+        ),
+        Err(auth::Error::Invalid(e)) => error(StatusCode::BAD_REQUEST, &e),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "token store unavailable"),
+    }
+}
+
+/// An organization's service tokens, without their secrets.
+async fn list_service_tokens(
+    State(s): AppState,
+    Query(query): Query<ServiceTokensQuery>,
+    headers: HeaderMap,
+) -> Response {
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    if !operator.can(&query.organization_id, auth::AUTH_ADMIN) {
+        return forbidden(auth::AUTH_ADMIN, &query.organization_id);
+    }
+    match s.service_tokens.list(&query.organization_id).await {
+        Ok(tokens) => reply(StatusCode::OK, json!({"tokens": tokens})),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "token store unavailable"),
+    }
+}
+
+/// Revokes a service token at once.
+async fn revoke_service_token(
+    State(s): AppState,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    let operator = match s.operator(&headers).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let token = match s.service_tokens.get(&id).await {
+        Ok(token) if operator.can(&token.organization_id, auth::AUTH_ADMIN) => token,
+        Ok(_) | Err(auth::Error::NotFound) => {
+            return error(StatusCode::NOT_FOUND, "unknown service token");
+        }
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "token store unavailable"),
+    };
+    match s.service_tokens.revoke(&token.id, Utc::now()).await {
+        Ok(()) => reply(StatusCode::OK, json!({"id": token.id, "status": "revoked"})),
+        Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "token store unavailable"),
     }
 }

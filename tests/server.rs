@@ -582,7 +582,7 @@ async fn the_node_list_needs_an_operator() {
         let (status, _) = call(&app, "GET", "/v1/nodes", token, None).await;
         assert_eq!(
             status,
-            StatusCode::FORBIDDEN,
+            StatusCode::UNAUTHORIZED,
             "listing nodes with {token:?}"
         );
     }

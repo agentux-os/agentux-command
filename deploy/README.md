@@ -15,7 +15,18 @@ The OS profile manager creates `/var/lib/agentux/command`. An operator then:
    password secret is shared with the Command service as `PGPASSWORD`);
 3. copies the Quadlet files to `/etc/containers/systemd/`;
 4. pins the Command image by digest in a local drop-in or release update;
-5. runs `systemctl daemon-reload` and enables the units in dependency order.
+5. runs `systemctl daemon-reload` and enables the units in dependency order;
+6. issues the first administrator's service token (shown once; keep it in the
+   operators' secret store):
+
+   ```sh
+   podman exec agentux-command agentux-command token issue \
+     --organization <org> --name admin \
+     --capabilities auth.admin,organization.read,node.enroll,node.command,approval.decide
+   ```
+
+   Further tokens come from `POST /v1/service-tokens`. The demo tokens are
+   refused unless `AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1` (development only).
 
 Example secret setup (values must come from an operator-managed secret store):
 
