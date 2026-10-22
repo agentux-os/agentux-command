@@ -6,8 +6,15 @@
 //! a draft and carries the result of its last validation. **Publishing** a
 //! draft that validates freezes it: a published version is never changed
 //! again, and the next change is a new draft with the next version number.
-//! Every creation, replacement and publication is recorded in the
+//! Every creation, replacement, review and publication is recorded in the
 //! organization's audit log with its actor.
+//!
+//! A draft has a **revision**, bumped by every replacement, so an editor
+//! working from an older revision is told (`Error::Stale`) instead of
+//! overwriting someone else's changes. **Reviews** approve a revision or ask
+//! for changes; nobody reviews their own edits. When the organization's
+//! `publication_policy` is `review-required`, only a revision someone
+//! other than its editor approved may be published.
 //!
 //! The document is the contract's, field for field (snake_case). Fields this
 //! version does not know are kept as they are.
@@ -282,6 +289,90 @@ pub struct Definition {
     pub published_by: Option<Actor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub published_at: Option<DateTime<Utc>>,
+    /// Bumped by every replacement of the draft.
+    #[serde(default = "first_revision")]
+    pub revision: i64,
+    /// Who last changed the document (its creator until then).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_by: Option<Actor>,
+    #[serde(default)]
+    pub reviews: Vec<Review>,
+}
+
+fn first_revision() -> i64 {
+    1
+}
+
+/// A review of one revision of a draft.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Review {
+    pub reviewer: Actor,
+    /// `approved` or `changes_requested`.
+    pub decision: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub comment: String,
+    pub revision: i64,
+    pub reviewed_at: DateTime<Utc>,
+}
+
+impl Definition {
+    /// Who the document's current revision is by.
+    pub fn editor(&self) -> &Actor {
+        self.updated_by.as_ref().unwrap_or(&self.created_by)
+    }
+
+    /// Whether publishing needs an approving review (the organization's
+    /// `publication_policy` is `review-required`).
+    pub fn review_required(&self) -> bool {
+        self.document["organization"]["publication_policy"].as_str() == Some("review-required")
+    }
+
+    /// Whether someone other than its editor approved the current revision.
+    pub fn approved(&self) -> bool {
+        self.reviews.iter().any(|r| {
+            r.decision == "approved" && r.revision == self.revision && &r.reviewer != self.editor()
+        })
+    }
+
+    fn check_revision(&self, expected: Option<i64>) -> Result<(), Error> {
+        match expected {
+            Some(expected) if expected != self.revision => Err(Error::Stale {
+                current: self.revision,
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    fn check_publishable(&self, expected: Option<i64>) -> Result<(), Error> {
+        if self.status != "draft" {
+            return Err(Error::Published);
+        }
+        self.check_revision(expected)?;
+        let problems = validate(&self.document, &self.organization_id);
+        if !problems.is_empty() {
+            return Err(Error::Invalid(problems));
+        }
+        if self.review_required() && !self.approved() {
+            return Err(Error::ReviewRequired);
+        }
+        Ok(())
+    }
+
+    fn check_review(&self, review: &Review, expected: Option<i64>) -> Result<(), Error> {
+        if self.status != "draft" {
+            return Err(Error::Published);
+        }
+        self.check_revision(expected)?;
+        if !matches!(review.decision.as_str(), "approved" | "changes_requested") {
+            return Err(Error::Invalid(vec![
+                "a review's decision is approved or changes_requested".into(),
+            ]));
+        }
+        if &review.reviewer == self.editor() {
+            return Err(Error::OwnReview);
+        }
+        Ok(())
+    }
 }
 
 /// One entry of an organization's audit log.
@@ -303,6 +394,14 @@ pub enum Error {
     Published,
     /// It does not validate; the problems.
     Invalid(Vec<String>),
+    /// The draft changed since the revision the request was based on.
+    Stale {
+        current: i64,
+    },
+    /// The organization requires an approving review of this revision.
+    ReviewRequired,
+    /// A reviewer cannot review their own changes.
+    OwnReview,
     Storage(String),
 }
 
@@ -318,6 +417,14 @@ impl std::fmt::Display for Error {
                 "the definition does not validate: {}",
                 problems.join("; ")
             ),
+            Error::Stale { current } => write!(
+                f,
+                "the draft changed meanwhile: it is at revision {current}"
+            ),
+            Error::ReviewRequired => f.write_str(
+                "this organization publishes only a revision someone other than its editor approved",
+            ),
+            Error::OwnReview => f.write_str("nobody reviews their own changes"),
             Error::Storage(m) => f.write_str(m),
         }
     }
@@ -348,7 +455,18 @@ pub trait Store: Send + Sync {
         actor: &Actor,
         now: DateTime<Utc>,
     ) -> Result<Definition, Error>;
-    /// Replaces a draft's document.
+    /// Replaces a draft's document, if the draft is still at revision
+    /// `expected` (when given).
+    async fn replace_at(
+        &self,
+        organization_id: &str,
+        version: i64,
+        document: Value,
+        actor: &Actor,
+        now: DateTime<Utc>,
+        expected: Option<i64>,
+    ) -> Result<Definition, Error>;
+    /// Replaces a draft's document, whatever its revision.
     async fn replace(
         &self,
         organization_id: &str,
@@ -356,14 +474,38 @@ pub trait Store: Send + Sync {
         document: Value,
         actor: &Actor,
         now: DateTime<Utc>,
+    ) -> Result<Definition, Error> {
+        self.replace_at(organization_id, version, document, actor, now, None)
+            .await
+    }
+    /// Publishes a draft that validates (and is approved, when the
+    /// organization requires it), if it is still at revision `expected`.
+    async fn publish_at(
+        &self,
+        organization_id: &str,
+        version: i64,
+        actor: &Actor,
+        now: DateTime<Utc>,
+        expected: Option<i64>,
     ) -> Result<Definition, Error>;
-    /// Publishes a draft that validates.
+    /// Publishes a draft, whatever its revision.
     async fn publish(
         &self,
         organization_id: &str,
         version: i64,
         actor: &Actor,
         now: DateTime<Utc>,
+    ) -> Result<Definition, Error> {
+        self.publish_at(organization_id, version, actor, now, None)
+            .await
+    }
+    /// Records a review of the draft's current revision.
+    async fn review(
+        &self,
+        organization_id: &str,
+        version: i64,
+        review: Review,
+        expected: Option<i64>,
     ) -> Result<Definition, Error>;
     async fn get(&self, organization_id: &str, version: i64) -> Result<Definition, Error>;
     /// Every version, newest first (documents left out).
@@ -437,6 +579,9 @@ impl Store for Memory {
             created_at: now,
             published_by: None,
             published_at: None,
+            revision: 1,
+            updated_by: None,
+            reviews: Vec::new(),
         };
         state.0.insert((org.into(), version), definition.clone());
         state
@@ -445,13 +590,14 @@ impl Store for Memory {
         Ok(definition)
     }
 
-    async fn replace(
+    async fn replace_at(
         &self,
         org: &str,
         version: i64,
         document: Value,
         actor: &Actor,
         now: DateTime<Utc>,
+        expected: Option<i64>,
     ) -> Result<Definition, Error> {
         let mut state = self.lock();
         let definition = state
@@ -461,8 +607,11 @@ impl Store for Memory {
         if definition.status != "draft" {
             return Err(Error::Published);
         }
+        definition.check_revision(expected)?;
         definition.problems = validate(&document, org);
         definition.document = document;
+        definition.revision += 1;
+        definition.updated_by = Some(actor.clone());
         let out = definition.clone();
         state
             .1
@@ -470,25 +619,24 @@ impl Store for Memory {
         Ok(out)
     }
 
-    async fn publish(
+    async fn publish_at(
         &self,
         org: &str,
         version: i64,
         actor: &Actor,
         now: DateTime<Utc>,
+        expected: Option<i64>,
     ) -> Result<Definition, Error> {
         let mut state = self.lock();
         let definition = state
             .0
             .get_mut(&(org.into(), version))
             .ok_or(Error::NotFound)?;
-        if definition.status != "draft" {
-            return Err(Error::Published);
-        }
-        let problems = validate(&definition.document, org);
-        if !problems.is_empty() {
-            definition.problems = problems.clone();
-            return Err(Error::Invalid(problems));
+        if let Err(e) = definition.check_publishable(expected) {
+            if let Error::Invalid(problems) = &e {
+                definition.problems = problems.clone();
+            }
+            return Err(e);
         }
         definition.status = "published".into();
         definition.published_by = Some(actor.clone());
@@ -501,6 +649,32 @@ impl Store for Memory {
             version,
             now,
         ));
+        Ok(out)
+    }
+
+    async fn review(
+        &self,
+        org: &str,
+        version: i64,
+        review: Review,
+        expected: Option<i64>,
+    ) -> Result<Definition, Error> {
+        let mut state = self.lock();
+        let definition = state
+            .0
+            .get_mut(&(org.into(), version))
+            .ok_or(Error::NotFound)?;
+        let review = Review {
+            revision: definition.revision,
+            ..review
+        };
+        definition.check_review(&review, expected)?;
+        let (actor, at) = (review.reviewer.clone(), review.reviewed_at);
+        definition.reviews.push(review);
+        let out = definition.clone();
+        state
+            .1
+            .push(audit_entry(org, "definition.reviewed", &actor, version, at));
         Ok(out)
     }
 
@@ -583,7 +757,7 @@ impl Postgres {
 
 use tokio_postgres::types::Json;
 
-const COLUMNS: &str = "organization_id, definition_version, status, document, problems, created_by, created_at, published_by, published_at";
+const COLUMNS: &str = "organization_id, definition_version, status, document, problems, created_by, created_at, published_by, published_at, revision, updated_by, reviews";
 
 fn row_definition(row: &tokio_postgres::Row) -> Definition {
     Definition {
@@ -599,6 +773,9 @@ fn row_definition(row: &tokio_postgres::Row) -> Definition {
         created_at: row.get(6),
         published_by: row.get::<_, Option<Json<Actor>>>(7).map(|j| j.0),
         published_at: row.get(8),
+        revision: row.get(9),
+        updated_by: row.get::<_, Option<Json<Actor>>>(10).map(|j| j.0),
+        reviews: row.get::<_, Json<Vec<Review>>>(11).0,
     }
 }
 
@@ -657,13 +834,14 @@ impl Store for Postgres {
         Ok(row_definition(&row))
     }
 
-    async fn replace(
+    async fn replace_at(
         &self,
         org: &str,
         version: i64,
         document: Value,
         actor: &Actor,
         now: DateTime<Utc>,
+        expected: Option<i64>,
     ) -> Result<Definition, Error> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
@@ -671,16 +849,20 @@ impl Store for Postgres {
         let row = tx
             .query_opt(
                 &format!(
-                    "UPDATE organization_definitions SET document = $3, problems = $4
-                     WHERE organization_id = $1 AND definition_version = $2 AND status = 'draft' RETURNING {COLUMNS}"
+                    "UPDATE organization_definitions SET document = $3, problems = $4, revision = revision + 1, updated_by = $5
+                     WHERE organization_id = $1 AND definition_version = $2 AND status = 'draft'
+                       AND ($6::bigint IS NULL OR revision = $6) RETURNING {COLUMNS}"
                 ),
-                &[&org, &version, &Json(&document), &Json(&problems)],
+                &[&org, &version, &Json(&document), &Json(&problems), &Json(actor), &expected],
             )
             .await?;
         let Some(row) = row else {
             drop(tx);
             return Err(match self.get(org, version).await {
-                Ok(_) => Error::Published,
+                Ok(d) if d.status != "draft" => Error::Published,
+                Ok(d) => Error::Stale {
+                    current: d.revision,
+                },
                 Err(e) => e,
             });
         };
@@ -689,12 +871,13 @@ impl Store for Postgres {
         Ok(row_definition(&row))
     }
 
-    async fn publish(
+    async fn publish_at(
         &self,
         org: &str,
         version: i64,
         actor: &Actor,
         now: DateTime<Utc>,
+        expected: Option<i64>,
     ) -> Result<Definition, Error> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
@@ -706,13 +889,7 @@ impl Store for Postgres {
             .await?
             .ok_or(Error::NotFound)?;
         let current = row_definition(&row);
-        if current.status != "draft" {
-            return Err(Error::Published);
-        }
-        let problems = validate(&current.document, org);
-        if !problems.is_empty() {
-            return Err(Error::Invalid(problems));
-        }
+        current.check_publishable(expected)?;
         let row = tx
             .query_one(
                 &format!(
@@ -732,6 +909,50 @@ impl Store for Postgres {
         Ok(published)
     }
 
+    async fn review(
+        &self,
+        org: &str,
+        version: i64,
+        review: Review,
+        expected: Option<i64>,
+    ) -> Result<Definition, Error> {
+        let mut client = self.pool.get().await?;
+        let tx = client.transaction().await?;
+        let row = tx
+            .query_opt(
+                &format!("SELECT {COLUMNS} FROM organization_definitions WHERE organization_id = $1 AND definition_version = $2 FOR UPDATE"),
+                &[&org, &version],
+            )
+            .await?
+            .ok_or(Error::NotFound)?;
+        let current = row_definition(&row);
+        let review = Review {
+            revision: current.revision,
+            ..review
+        };
+        current.check_review(&review, expected)?;
+        let row = tx
+            .query_one(
+                &format!(
+                    "UPDATE organization_definitions SET reviews = reviews || $3
+                     WHERE organization_id = $1 AND definition_version = $2 RETURNING {COLUMNS}"
+                ),
+                &[&org, &version, &Json(vec![&review])],
+            )
+            .await?;
+        record(
+            &tx,
+            org,
+            "definition.reviewed",
+            &review.reviewer,
+            version,
+            review.reviewed_at,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(row_definition(&row))
+    }
+
     async fn get(&self, org: &str, version: i64) -> Result<Definition, Error> {
         let client = self.pool.get().await?;
         let row = client
@@ -748,7 +969,7 @@ impl Store for Postgres {
         let client = self.pool.get().await?;
         let rows = client
             .query(
-                "SELECT organization_id, definition_version, status, NULL::jsonb, problems, created_by, created_at, published_by, published_at
+                "SELECT organization_id, definition_version, status, NULL::jsonb, problems, created_by, created_at, published_by, published_at, revision, updated_by, reviews
                  FROM organization_definitions WHERE organization_id = $1 ORDER BY definition_version DESC",
                 &[&org],
             )

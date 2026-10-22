@@ -162,6 +162,8 @@ GET  /v1/organizations/<org>/definitions                    organization.read  (
 POST /v1/organizations/<org>/definitions                    organization.edit  (a new draft)
 GET  /v1/organizations/<org>/definitions/<version>          organization.read
 PUT  /v1/organizations/<org>/definitions/<version>          organization.edit  (a draft only; 409 once published)
+POST /v1/organizations/<org>/definitions?from=<version>     organization.edit  (a new draft from a version: the next change, or a rollback)
+POST /v1/organizations/<org>/definitions/<version>/reviews  approval.decide    {"decision": "approved" | "changes_requested", "comment"}
 POST /v1/organizations/<org>/definitions/<version>/publish  organization.publish
 GET  /v1/organizations/<org>/audit                          organization.read  (drafted, replaced, published; actor and time)
 ```
@@ -172,7 +174,17 @@ not exist, a step going outside its workflow, unknown permissions, a
 `human-required` gate no human role can pass, a `schema_version` other than
 1.x). Only a draft without problems is published (422 otherwise); a published
 version never changes again, and the next change is a new draft with the next
-number. Publishing records `organization.definition.published` in the Office
+number.
+
+Editors work on revisions: a draft's `revision` goes up with every save, and
+responses carry it as `ETag`. A save or publication sent with `If-Match:
+"<revision>"` is refused with 409 `stale_draft` (and `currentRevision`) if
+someone saved the draft since; nobody overwrites changes they did not see.
+Reviews approve a revision or ask for changes, and nobody reviews their own
+edits (403). An organization whose definition says `"publication_policy":
+"review-required"` publishes only a revision someone other than its editor
+approved (409 `review_required` otherwise; a later save needs a new approval).
+Two publications of the same draft: the second gets 409. Publishing records `organization.definition.published` in the Office
 event log, and the Office projection takes the organization, its areas,
 missions and agents, and the definition version from it.
 
