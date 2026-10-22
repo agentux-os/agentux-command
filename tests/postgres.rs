@@ -278,3 +278,26 @@ async fn service_tokens_live_in_the_database() {
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn sessions_live_in_the_database() {
+    use agentux_command::auth::{NODE_COMMAND, PostgresSessions, Principal, Sessions};
+    let Some((_, pool, ..)) = store().await else {
+        return;
+    };
+    let sessions = PostgresSessions::new(pool);
+    let principal = Principal::new("oidc:ana").grant("acme", [NODE_COMMAND]);
+    let now = chrono::Utc::now();
+    let secret = sessions.start(&principal, now).await.unwrap();
+    assert_eq!(sessions.resolve(&secret, now).await, Some(principal));
+    assert!(
+        sessions
+            .resolve(&secret, now + chrono::Duration::hours(9))
+            .await
+            .is_none(),
+        "expired"
+    );
+    assert!(sessions.resolve("auxo1_wrong", now).await.is_none());
+    sessions.end(&secret).await.unwrap();
+    assert!(sessions.resolve(&secret, now).await.is_none(), "ended");
+}

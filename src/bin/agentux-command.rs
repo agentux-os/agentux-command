@@ -63,6 +63,13 @@ async fn run() -> Result<(), String> {
     if !public_url.is_empty() {
         handler = handler.with_public_url(&public_url);
     }
+    if let Some(provider) = oidc_from_env(&public_url)? {
+        eprintln!(
+            "operators sign in with {}",
+            env("AGENTUX_COMMAND_OIDC_ISSUER")
+        );
+        handler = handler.with_oidc(provider);
+    }
     eprintln!("agentux-command instance {}", handler.instance_id());
 
     let listener = tokio::net::TcpListener::bind(&address)
@@ -131,4 +138,48 @@ async fn token(args: &[String]) -> Result<(), String> {
     );
     println!("{}", issued.secret);
     Ok(())
+}
+
+/// OIDC sign-in from the environment, when AGENTUX_COMMAND_OIDC_ISSUER is
+/// set: the client (ID, secret), the role map (a JSON file), the groups
+/// claim and the scopes. The callback is <public URL>/v1/auth/callback.
+fn oidc_from_env(public_url: &str) -> Result<Option<agentux_command::oidc::Oidc>, String> {
+    use agentux_command::oidc::{Config, Oidc, RoleMap};
+    let env = |name: &str| std::env::var(name).unwrap_or_default();
+    let issuer = env("AGENTUX_COMMAND_OIDC_ISSUER");
+    if issuer.is_empty() {
+        return Ok(None);
+    }
+    if public_url.is_empty() {
+        return Err(
+            "AGENTUX_COMMAND_OIDC_ISSUER needs AGENTUX_COMMAND_PUBLIC_URL (the callback address)"
+                .into(),
+        );
+    }
+    let roles_file = env("AGENTUX_COMMAND_OIDC_ROLES");
+    if roles_file.is_empty() {
+        return Err(
+            "AGENTUX_COMMAND_OIDC_ROLES must name the role map (groups to capabilities)".into(),
+        );
+    }
+    let roles = std::fs::read_to_string(&roles_file).map_err(|e| format!("{roles_file}: {e}"))?;
+    let roles = RoleMap::parse(&roles).map_err(|e| format!("{roles_file}: {e}"))?;
+    let scopes = match env("AGENTUX_COMMAND_OIDC_SCOPES") {
+        s if s.is_empty() => "openid profile email groups".to_string(),
+        s => s,
+    };
+    let groups_claim = match env("AGENTUX_COMMAND_OIDC_GROUPS_CLAIM") {
+        c if c.is_empty() => "groups".to_string(),
+        c => c,
+    };
+    let config = Config {
+        issuer,
+        client_id: env("AGENTUX_COMMAND_OIDC_CLIENT_ID"),
+        client_secret: env("AGENTUX_COMMAND_OIDC_CLIENT_SECRET"),
+        redirect_url: format!("{}/v1/auth/callback", public_url.trim_end_matches('/')),
+        scopes: scopes.split_whitespace().map(str::to_string).collect(),
+        groups_claim,
+        roles,
+    };
+    Oidc::new(config).map(Some).map_err(|e| e.to_string())
 }

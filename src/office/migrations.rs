@@ -18,6 +18,10 @@ const FILES: &[(&str, &str)] = &[
         "003_service_tokens.sql",
         include_str!("../../migrations/003_service_tokens.sql"),
     ),
+    (
+        "004_operator_sessions.sql",
+        include_str!("../../migrations/004_operator_sessions.sql"),
+    ),
 ];
 
 pub(crate) struct Migration {
@@ -105,7 +109,7 @@ mod tests {
 
     #[test]
     fn versions_are_ordered_and_start_at_one() {
-        assert_eq!(migration_versions(), vec![1, 2, 3]);
+        assert_eq!(migration_versions(), vec![1, 2, 3, 4]);
     }
 
     #[test]
