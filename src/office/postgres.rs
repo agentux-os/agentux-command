@@ -43,6 +43,17 @@ pub fn pool(config: tokio_postgres::Config) -> Pool {
         .expect("a pool without a runtime-specific setting")
 }
 
+/// Takes the password from `PGPASSWORD` when the URL has none: the Quadlet
+/// keeps it out of the URL and hands it over from a Podman secret, as libpq
+/// tools expect.
+pub fn with_env_password(config: &mut tokio_postgres::Config, password: Option<String>) {
+    if config.get_password().is_none()
+        && let Some(password) = password.filter(|p| !p.is_empty())
+    {
+        config.password(password);
+    }
+}
+
 /// Connects to `database_url` and applies the migrations.
 pub async fn open_postgres(database_url: &str) -> Result<Pool, Error> {
     if database_url.trim().is_empty() {
@@ -50,9 +61,10 @@ pub async fn open_postgres(database_url: &str) -> Result<Pool, Error> {
             "AGENTUX_COMMAND_DATABASE_URL is required".into(),
         ));
     }
-    let config = tokio_postgres::Config::from_str(database_url).map_err(|_| {
+    let mut config = tokio_postgres::Config::from_str(database_url).map_err(|_| {
         Error::Invalid("AGENTUX_COMMAND_DATABASE_URL is not a PostgreSQL URL".into())
     })?;
+    with_env_password(&mut config, std::env::var("PGPASSWORD").ok());
     let pool = pool(config);
     let mut client = pool
         .get()
@@ -375,5 +387,27 @@ impl OfficeRepository for PostgresStore {
             .await
             .map_err(storage("commit approval decision"))?;
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_password_comes_from_pgpassword_when_the_url_has_none() {
+        let mut config =
+            tokio_postgres::Config::from_str("postgres://agentux@db:5432/agentux").unwrap();
+        with_env_password(&mut config, Some("secret".into()));
+        assert_eq!(config.get_password(), Some(&b"secret"[..]));
+
+        let mut config =
+            tokio_postgres::Config::from_str("postgres://agentux:inline@db/agentux").unwrap();
+        with_env_password(&mut config, Some("secret".into()));
+        assert_eq!(config.get_password(), Some(&b"inline"[..]));
+
+        let mut config = tokio_postgres::Config::from_str("postgres://agentux@db/agentux").unwrap();
+        with_env_password(&mut config, Some(String::new()));
+        assert_eq!(config.get_password(), None);
     }
 }

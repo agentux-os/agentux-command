@@ -137,3 +137,9 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
+The image the Quadlet runs, `ghcr.io/agentux-os/agentux-command`, is built
+from `Containerfile` for amd64 and arm64 by `.github/workflows/image.yml`:
+`:main` and `:sha-<12>` from `main`, `:X.Y.Z` and `:latest` from a `vX.Y.Z`
+tag that matches `Cargo.toml`. Locally: `podman build -t agentux-command -f Containerfile .`
+
+

@@ -46,10 +46,11 @@ pub async fn run(
             && u.host_str().is_some_and(|h| !h.is_empty())
     });
     let config = valid.and_then(|_| tokio_postgres::Config::from_str(database_url).ok());
-    let Some(config) = config else {
+    let Some(mut config) = config else {
         let _ = writeln!(stderr, "AGENTUX_COMMAND_DATABASE_URL is invalid");
         return 2;
     };
+    crate::office::with_env_password(&mut config, std::env::var("PGPASSWORD").ok());
     let (mut client, connection) = match config.connect(NoTls).await {
         Ok(pair) => pair,
         Err(e) => {

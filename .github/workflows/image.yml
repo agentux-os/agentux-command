@@ -1,0 +1,92 @@
+name: Command image
+
+# Builds ghcr.io/agentux-os/agentux-command for amd64 and arm64, each on a
+# native runner. Pull requests only build it; main publishes :main and
+# :sha-<12>; a vX.Y.Z tag matching Cargo.toml publishes :X.Y.Z and :latest,
+# the tags the Quadlet pins.
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/agentux-os/agentux-command
+
+jobs:
+  build:
+    name: build (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches Cargo.toml
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+
+      - name: Build
+        run: podman build --pull --tag "$IMAGE:build-${{ matrix.arch }}" --file Containerfile .
+
+      - name: Smoke test
+        run: |
+          podman run --rm --entrypoint /usr/local/bin/agentux-command-storage-report "$IMAGE:build-${{ matrix.arch }}" --help 2>&1 | grep -q usage
+          # Without a database the server refuses to start.
+          if podman run --rm -e AGENTUX_COMMAND_DATABASE_URL= "$IMAGE:build-${{ matrix.arch }}"; then
+            echo "::error::the server started without a database"
+            exit 1
+          fi
+          podman run --rm --entrypoint curl "$IMAGE:build-${{ matrix.arch }}" --version > /dev/null
+
+      - name: Push by architecture
+        if: github.event_name != 'pull_request'
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io --username "${{ github.actor }}" --password-stdin
+          podman push "$IMAGE:build-${{ matrix.arch }}" "docker://$IMAGE:${{ github.sha }}-${{ matrix.arch }}"
+
+  publish:
+    name: publish
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Manifest
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | podman login ghcr.io --username "${{ github.actor }}" --password-stdin
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            tags="${GITHUB_REF_NAME#v} latest"
+          else
+            tags="main sha-${GITHUB_SHA::12}"
+          fi
+          podman manifest create agentux-command
+          for arch in amd64 arm64; do
+            podman manifest add agentux-command "docker://$IMAGE:$GITHUB_SHA-$arch"
+          done
+          for tag in $tags; do
+            podman manifest push --all agentux-command "docker://$IMAGE:$tag"
+            echo "pushed $IMAGE:$tag"
+          done

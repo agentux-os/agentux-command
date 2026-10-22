@@ -18,7 +18,7 @@ pub use growth::{
     DetailedGrowth, GrowthReport, OrganizationGrowth, PartitionGrowth, collect_growth_report,
 };
 pub use migrations::{migrate, migration_versions};
-pub use postgres::{PostgresStore, open_postgres, pool};
+pub use postgres::{PostgresStore, open_postgres, pool, with_env_password};
 
 /// Events kept in a projection; older ones stay in the log only.
 const PROJECTION_EVENT_LIMIT: usize = 100;
