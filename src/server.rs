@@ -258,6 +258,8 @@ impl Handler {
         }
         Router::new()
             .route("/healthz", get(healthz))
+            .route("/livez", get(livez))
+            .route("/readyz", get(healthz))
             .route("/v1/instance", get(instance))
             .route("/v1/nodes", get(list_nodes))
             .route("/v1/enroll", post(redeem))
@@ -624,14 +626,22 @@ impl Inner {
     }
 }
 
+/// Readiness (`/readyz`, and `/healthz` as before): the process and its
+/// database. 503 while the database does not answer.
 async fn healthz(State(s): AppState) -> Response {
     match s.office.ping().await {
-        Ok(()) => reply(StatusCode::OK, json!({"status": "ok"})),
+        Ok(()) => reply(StatusCode::OK, json!({"status": "ok", "database": "ok"})),
         Err(_) => reply(
             StatusCode::SERVICE_UNAVAILABLE,
-            json!({"status": "unavailable"}),
+            json!({"status": "unavailable", "database": "unreachable"}),
         ),
     }
+}
+
+/// Liveness: the process answers, whatever its dependencies do. A container
+/// manager restarts Command when this fails, not when its database is down.
+async fn livez() -> Response {
+    reply(StatusCode::OK, json!({"status": "alive"}))
 }
 
 async fn instance(State(s): AppState) -> Response {

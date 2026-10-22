@@ -350,7 +350,12 @@ async fn without_credentials_everything_fails_closed() {
     }
     // Health and the instance stay public, with no tenant data.
     let (status, health) = call(&f.app, "GET", "/healthz", "", None).await;
-    assert_eq!((status, health), (StatusCode::OK, json!({"status": "ok"})));
+    assert_eq!(
+        (status, health),
+        (StatusCode::OK, json!({"status": "ok", "database": "ok"}))
+    );
+    let (status, live) = call(&f.app, "GET", "/livez", "", None).await;
+    assert_eq!((status, live), (StatusCode::OK, json!({"status": "alive"})));
     let (status, _) = call(&f.app, "GET", "/v1/instance", "", None).await;
     assert_eq!(status, StatusCode::OK);
 }

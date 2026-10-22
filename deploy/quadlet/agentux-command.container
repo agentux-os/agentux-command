@@ -1,22 +1,29 @@
 [Unit]
 Description=AgentUX Command control plane
-Requires=agentux-command-postgres.service agentux-command-nats.service agentux-command-object-store.service
-After=agentux-command-postgres.service agentux-command-nats.service agentux-command-object-store.service
+# PostgreSQL holds all of Command's state. NATS and the object store are
+# part of the bundle for what comes next (ADR 0020); Command does not need
+# them to run, so their failure does not stop it.
+Requires=agentux-command-postgres.service
+After=agentux-command-postgres.service
+Wants=agentux-command-nats.service agentux-command-object-store.service
 
 [Container]
 Image=ghcr.io/agentux-os/agentux-command:0.1.1
 ContainerName=agentux-command
+Network=agentux-command.network
 EnvironmentFile=/var/lib/agentux/command/command.env
 Environment=AGENTUX_COMMAND_ADDR=:8080
 Environment=AGENTUX_COMMAND_DATABASE_URL=postgres://agentux@agentux-command-postgres:5432/agentux?sslmode=disable
 Secret=agentux-command-postgres-password,type=env,target=PGPASSWORD
-Environment=AGENTUX_COMMAND_NATS_URL=nats://agentux-command-nats:4222
-Environment=AGENTUX_COMMAND_OBJECT_STORE_URL=http://agentux-command-object-store:9000
 PublishPort=8080:8080
-HealthCmd=curl --fail http://localhost:8080/healthz
+# Liveness: a Command that stops answering is restarted. Whether its
+# database answers is readiness (/readyz), for monitoring and proxies: a
+# database outage must not restart Command in a loop.
+HealthCmd=curl --fail --silent http://localhost:8080/livez
 HealthInterval=10s
 HealthTimeout=5s
 HealthRetries=5
+HealthOnFailure=kill
 
 [Service]
 Restart=on-failure
@@ -25,4 +32,3 @@ TimeoutStartSec=120s
 
 [Install]
 WantedBy=multi-user.target
-

@@ -6,6 +6,9 @@
 //!
 //!   agentux-command token issue --organization acme --name admin \
 //!       --capabilities auth.admin,organization.read,node.enroll,node.command,approval.decide
+//!
+//! `agentux-command check` verifies the database (after a restore): every
+//! organization's projection against its event log, and what it holds.
 
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -17,7 +20,10 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = match args.first().map(String::as_str) {
         Some("token") => token(&args[1..]).await,
-        Some(other) => Err(format!("unknown command {other:?} (try: token issue)")),
+        Some("check") => check().await,
+        Some(other) => Err(format!(
+            "unknown command {other:?} (try: token issue, check)"
+        )),
         None => run().await,
     };
     match result {
@@ -109,6 +115,74 @@ async fn shutdown() {
     }
     #[cfg(not(unix))]
     let _ = interrupt.await;
+}
+
+/// `check`: connects to the database (migrating it if needed), rebuilds
+/// every organization's Office projection from its event log and compares
+/// it with the stored one, and prints what the database holds as JSON. Exits
+/// non-zero if a projection differs: run it after a restore.
+async fn check() -> Result<(), String> {
+    use agentux_command::office::{self, PostgresStore};
+    let database_url = std::env::var("AGENTUX_COMMAND_DATABASE_URL").unwrap_or_default();
+    let pool = office::open_postgres(&database_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    let client = pool.get().await.map_err(|e| e.to_string())?;
+    let count = |table: &'static str| {
+        let client = &client;
+        async move {
+            client
+                .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+                .await
+                .map(|row| row.get::<_, i64>(0))
+                .map_err(|e| format!("count {table}: {e}"))
+        }
+    };
+    let organizations: Vec<String> = client
+        .query(
+            "SELECT organization_id FROM office_projections ORDER BY organization_id",
+            &[],
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    let store = PostgresStore::new(pool.clone());
+    let mut differing = Vec::new();
+    for organization in &organizations {
+        if let Err(e) = store.verify_projection(organization).await {
+            differing.push(format!("{organization}: {e}"));
+        }
+    }
+    let migration: i32 = client
+        .query_one(
+            "SELECT COALESCE(MAX(version), 0) FROM command_schema_migrations",
+            &[],
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .get(0);
+    let report = serde_json::json!({
+        "migration": migration,
+        "organizations": organizations.len(),
+        "events": count("office_events").await?,
+        "definitions": count("organization_definitions").await?,
+        "runs": count("mission_runs").await?,
+        "nodes": count("node_state").await?,
+        "enrolledNodes": count("node_credentials").await?,
+        "serviceTokens": count("service_tokens").await?,
+        "projectionsVerified": differing.is_empty(),
+    });
+    println!("{report}");
+    if differing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "projections differ from their event log: {}",
+            differing.join("; ")
+        ))
+    }
 }
 
 /// `token issue --organization ORG --name NAME --capabilities A,B [--days N]`:

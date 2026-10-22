@@ -1,0 +1,4 @@
+[Network]
+# The bundle's containers find each other by container name on this network
+# (Command reaches agentux-command-postgres:5432).
+NetworkName=agentux-command

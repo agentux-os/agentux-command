@@ -2,6 +2,7 @@
 Description=AgentUX Command object store
 
 [Container]
+Network=agentux-command.network
 Image=quay.io/minio/minio:latest
 ContainerName=agentux-command-object-store
 EnvironmentFile=/var/lib/agentux/command/command.env

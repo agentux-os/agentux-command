@@ -13,7 +13,8 @@ The OS profile manager creates `/var/lib/agentux/command`. An operator then:
    `/var/lib/agentux/command/command.env` and replaces every placeholder;
 2. creates the three Podman secrets named in the Quadlet files (the PostgreSQL
    password secret is shared with the Command service as `PGPASSWORD`);
-3. copies the Quadlet files to `/etc/containers/systemd/`;
+3. copies the Quadlet files (the `.container`, `.volume` and `.network`
+   units) to `/etc/containers/systemd/`;
 4. pins the Command image by digest in a local drop-in or release update;
 5. runs `systemctl daemon-reload` and enables the units in dependency order;
 6. issues the first administrator's service token (shown once; keep it in the
@@ -38,26 +39,99 @@ printf '%s' "$MINIO_ROOT_PASSWORD" | podman secret create agentux-command-minio-
 
 Do not commit the resulting env file, secrets or generated Quadlet drop-ins.
 
-## Operations policy
+## Operations
 
-- **Health:** each container has a health command; systemd restart policy makes
-  a failed dependency visible in `systemctl --failed` and `podman healthcheck`.
-  Command also checks PostgreSQL on `/healthz` and refuses startup if the
-  database is unreachable or migrations fail.
-- **Persistence:** PostgreSQL, NATS JetStream and MinIO use named volumes under
-  the Command data boundary. Removing a profile never removes these volumes.
-- **Backup:** before an upgrade, dump PostgreSQL with `pg_dump`, export the
-  NATS stream configuration, and mirror MinIO to operator-controlled storage.
-  Restore is tested into a clean host before a production promotion.
-- **Upgrade:** pin image digests, apply one dependency at a time, verify all
-  health checks and then migrate Command data. Keep the previous digest for
-  rollback; never run a destructive migration without a tested backup.
-- **Recovery:** restart the failed unit first. If storage is corrupt, stop the
-  stack, restore volumes into a new named volume, validate `/healthz`, then
-  re-enable the service. Incident evidence remains in the audit log.
-- **Capacity:** the development baseline is 4 vCPU, 8 GiB RAM and 50 GiB
-  persistent storage. Production sizing depends on event retention and node
-  count; this bundle is not a high-availability deployment.
+What follows was run as written: the restore drill in CI
+(`deploy/scripts/restore-drill.sh`, job `restore-drill`) backs up a filled
+database, restores it into a fresh one and checks they match.
+
+### Health
+
+| Endpoint | Says | Used by |
+|---|---|---|
+| `/livez` | the process answers | the Quadlet's `HealthCmd`; with `HealthOnFailure=kill`, systemd restarts a Command that hangs |
+| `/readyz` (and `/healthz`) | the process **and** PostgreSQL answer; 503 with `"database": "unreachable"` otherwise | monitoring, load balancers |
+
+A database outage makes Command unready, not dead: it is not restarted in a
+loop, and it answers again once PostgreSQL is back. Command refuses to start
+if the database is unreachable or a migration fails (`journalctl -u
+agentux-command`). PostgreSQL, NATS and the object store have their own health
+commands (`podman healthcheck run <container>`).
+
+Command `Requires=` PostgreSQL only. NATS and the object store come with the
+bundle for what is next ([ADR 0020](https://github.com/agentux-os/agentux/blob/main/docs/adr/0020-command-workflows-without-temporal.md));
+Command keeps nothing in them today, and their failure does not stop it.
+
+### Backups
+
+All of Command's state is in PostgreSQL: event log, projections,
+definitions, runs, node state, enrollment, service tokens (hashed),
+sessions and the event outbox. A database dump is a complete backup.
+
+```sh
+deploy/scripts/backup.sh /var/lib/agentux/command/backups
+# /var/lib/agentux/command/backups/agentux-command-20261022T120000Z.dump (+ .sha256)
+```
+
+- **When:** at least daily, and always before an upgrade, from a systemd
+  timer or cron. The interval is your recovery point objective: what an
+  incident can lose.
+- **Keep:** for example 7 daily, 4 weekly and 3 monthly dumps, plus the one
+  taken before each upgrade until the next upgrade has proven itself.
+- **Encrypt** before a dump leaves the host. It holds tenant data and token
+  hashes. For example: `age -r <recipient> -o dump.age dump`, with the
+  identity kept away from the backup storage.
+- **Test** restores (below) on a schedule, not only when needed.
+
+### Restore
+
+```sh
+systemctl stop agentux-command
+deploy/scripts/restore.sh --yes /var/lib/agentux/command/backups/agentux-command-<time>.dump
+systemctl start agentux-command
+podman exec agentux-command agentux-command check
+```
+
+The restore runs in one transaction (all or nothing) after checking the
+dump's sha256. `agentux-command check` rebuilds every organization's Office
+projection from its event log, compares it with the stored one, and prints
+what the database holds (migration, organizations, events, definitions,
+runs, nodes, tokens). It exits non-zero on a mismatch. To restore onto a new
+host, bootstrap the bundle as above, start PostgreSQL only, restore, then
+start Command.
+
+Nodes reconnect by themselves, and events they sent after the backup are
+deduplicated when they replay them. Operators' sessions and tokens are those
+of the backup: revoke anything issued after it was taken.
+
+### Upgrades and rollback
+
+1. Take a backup (above) and note the running image digest:
+   `podman inspect --format '{{.Image}}' agentux-command`.
+2. Change `Image=` in `agentux-command.container`, pinned by digest,
+   `systemctl daemon-reload`, `systemctl restart agentux-command`.
+3. Command applies its migrations at startup. They are forward-only and
+   additive; one that fails leaves the database as it was, and Command does
+   not start. Check `/readyz` and `agentux-command check`.
+
+**Rollback:** a migrated database may not suit the previous version. Stop
+Command, restore the backup from step 1, put the previous digest back and
+start it. Events taken in between are lost from the log, though nodes resend
+what they still hold. Upgrade PostgreSQL itself (a major version) through a
+dump and restore into a new volume, never in place. The named volumes are
+never removed with a profile.
+
+### Recovery objectives
+
+| | Objective | How |
+|---|---|---|
+| Recovery point | your backup interval (daily: up to 24 h of changes) | `backup.sh` on a timer; shorten the interval for a tighter RPO |
+| Recovery time | minutes for a database of a few GiB: the restore drill restores and checks in seconds | `restore.sh` + `check`; measure yours on your data |
+| Process failure | ~1 min | `/livez` + `HealthOnFailure=kill` + `Restart=on-failure` |
+
+This bundle is a single host: no high availability. Capacity baseline for
+development: 4 vCPU, 8 GiB RAM, 50 GiB of persistent storage; production
+sizing follows event volume (see the growth report below) and node count.
 
 ### Office event growth report
 
@@ -93,5 +167,4 @@ Command applies embedded, versioned PostgreSQL migrations at startup. Event
 append, per-node cursor advancement and projection updates share a transaction;
 approval decisions and their organization-scoped idempotency records are
 durable. Keep a verified database backup before upgrading the service image.
-Authentication/session integration and live event streaming are still
-development work; this bundle is not a complete production deployment.
+The bundle runs one Command and one PostgreSQL; it is not highly available.

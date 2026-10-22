@@ -43,3 +43,15 @@ jobs:
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           grep -qx "Image=ghcr.io/agentux-os/agentux-command:$version" deploy/quadlet/agentux-command.container \
             || { echo "::error::deploy/quadlet/agentux-command.container must pin agentux-command:$version"; exit 1; }
+
+  restore-drill:
+    # Back up a filled database, restore it into a fresh one, check both match.
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --bin agentux-command
+      - run: sh deploy/scripts/restore-drill.sh target/debug/agentux-command
