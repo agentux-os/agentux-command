@@ -487,6 +487,32 @@ impl Inner {
         }
     }
 
+    /// Takes a node's event into the Office log, when the Office shows that
+    /// kind. A replayed event is a no-op (by event id); one the log refuses
+    /// (out of order, malformed) is reported, and the node's message still
+    /// counts as received: the registry has it.
+    async fn project(&self, method: &str, body: &[u8]) {
+        let Some(params) = serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|v| v.get("params").cloned())
+        else {
+            return;
+        };
+        let Some(event) = office::from_node_event(method, &params) else {
+            return;
+        };
+        let (org, node, sequence) = (
+            event.organization_id.clone(),
+            event.node_id.clone(),
+            event.sequence,
+        );
+        if let Err(e) = self.office.apply_event(event).await {
+            eprintln!(
+                "agentux-command: the Office did not take {method} {sequence} from {node} in {org}: {e}"
+            );
+        }
+    }
+
     /// Where nodes reach this server.
     fn base_url(&self, headers: &HeaderMap) -> String {
         if !self.public_url.is_empty() {
@@ -578,7 +604,10 @@ async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Respons
             s.registry
                 .heartbeat_with(&p.node_id, "pending_approval", None, &p.occurred_at);
         }
-        Access::Full => s.apply(&body),
+        Access::Full => {
+            s.apply(&body);
+            s.project(&message.method, &body).await;
+        }
     }
     reply(
         StatusCode::ACCEPTED,
@@ -1021,10 +1050,32 @@ async fn projection(
     }
     let organization_id = organization_id.as_str();
     match s.office.get_projection(organization_id).await {
-        Ok(Some(projection)) => reply(
-            StatusCode::OK,
-            serde_json::to_value(projection).unwrap_or_default(),
-        ),
+        Ok(Some(mut projection)) => {
+            let nodes = s
+                .registry
+                .list()
+                .into_iter()
+                .filter(|n| n.organization_id == organization_id)
+                .filter_map(|n| {
+                    let mut node = json!({
+                        "id": n.id,
+                        "status": n.status,
+                        "presence": n.presence,
+                        "connected": s.hub.connected(&n.id),
+                        "agentuxVersion": n.agentux_version,
+                    });
+                    if !n.last_seen_at.is_empty() {
+                        node["lastHeartbeatAt"] = Value::String(n.last_seen_at);
+                    }
+                    node.as_object().cloned()
+                })
+                .collect();
+            office::with_nodes(&mut projection, nodes);
+            reply(
+                StatusCode::OK,
+                serde_json::to_value(projection).unwrap_or_default(),
+            )
+        }
         Ok(None) => error(StatusCode::NOT_FOUND, "projection_not_found"),
         Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "projection_unavailable"),
     }

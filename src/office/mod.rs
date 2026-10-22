@@ -110,6 +110,111 @@ pub(crate) fn stamp_definition(event: &mut Event, projection: &Projection) {
     }
 }
 
+/// The organization's nodes as Command sees them now (each with `id` and
+/// `presence`: `online`, `degraded` or `offline`) replace the projected ones,
+/// and set the freshness: `fresh` while every node reports, `degraded` while
+/// some do not, `stale` when none does, since then nothing can bring the
+/// projection up to date. Without nodes the stored freshness stands.
+pub fn with_nodes(projection: &mut Projection, nodes: Vec<Object>) {
+    if nodes.is_empty() {
+        return;
+    }
+    let online = nodes
+        .iter()
+        .filter(|n| n.get("presence").and_then(Value::as_str) == Some("online"))
+        .count();
+    projection.freshness = match online {
+        n if n == nodes.len() => "fresh",
+        0 => "stale",
+        _ => "degraded",
+    }
+    .into();
+    projection.nodes = nodes;
+}
+
+/// The envelope fields of an AUXP message's params; the rest is the event's
+/// data.
+const ENVELOPE: &[&str] = &[
+    "protocolVersion",
+    "organizationId",
+    "nodeId",
+    "messageId",
+    "occurredAt",
+    "eventId",
+    "sequence",
+    "correlationId",
+    "causationId",
+];
+
+/// The node events the Office log takes: what runs, approvals, gates,
+/// artifacts, alerts and commands do. Harness status and session traffic
+/// stay in the node registry.
+const NODE_EVENTS: &[&str] = &[
+    "node.status_changed",
+    "node.alert",
+    "run.accepted",
+    "run.started",
+    "run.updated",
+    "run.completed",
+    "run.failed",
+    "approval.requested",
+    "gate.completed",
+    "artifact.available",
+    "command.denied",
+    "command.completed",
+];
+
+/// The Office event for a node's AUXP event (`params` as the node sent
+/// them), when the Office shows that kind. A node's approval is known by its
+/// `requestId`, and its `kind` is the approval's action.
+pub fn from_node_event(method: &str, params: &Value) -> Option<Event> {
+    if !NODE_EVENTS.contains(&method) {
+        return None;
+    }
+    let text = |key: &str| {
+        params
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let mut data: Object = params.as_object()?.clone();
+    data.retain(|k, _| !ENVELOPE.contains(&k.as_str()));
+    if method == "approval.requested" {
+        if !data.contains_key("id")
+            && let Some(id) = data.get("requestId").cloned()
+        {
+            data.insert("id".into(), id);
+        }
+        if !data.contains_key("action")
+            && let Some(kind) = data.get("kind").cloned()
+        {
+            data.insert("action".into(), kind);
+        }
+    }
+    Some(Event {
+        event_id: text("eventId"),
+        event_type: method.into(),
+        organization_id: text("organizationId"),
+        node_id: text("nodeId"),
+        run_id: text("runId"),
+        occurred_at: text("occurredAt"),
+        sequence: params.get("sequence").and_then(Value::as_i64).unwrap_or(0),
+        correlation_id: text("correlationId"),
+        causation_id: text("causationId"),
+        data: Some(Value::Object(data)),
+        ..Event::default()
+    })
+}
+
+/// Inserts `item` into `list`, or merges it into the one with the same `id`.
+fn upsert(list: &mut Vec<Object>, item: Object) {
+    match list.iter_mut().find(|o| o.get("id") == item.get("id")) {
+        Some(existing) => existing.extend(item),
+        None => list.push(item),
+    }
+}
+
 /// Stamps what the log needs on an event it takes: when, and who for a
 /// node's own events.
 pub(crate) fn prepare(event: &mut Event) {
@@ -595,6 +700,51 @@ pub(crate) fn apply_projection_event(
             projection.agents = agents;
         }
     }
+    let run_status = match event.event_type.as_str() {
+        "run.accepted" => Some("accepted"),
+        "run.started" | "run.updated" => Some("running"),
+        "run.completed" => Some("completed"),
+        "run.failed" => Some("failed"),
+        _ => None,
+    };
+    if let Some(status) = run_status {
+        let mut run = data().as_object().cloned().unwrap_or_default();
+        let id = run
+            .remove("runId")
+            .or_else(|| (!event.run_id.is_empty()).then(|| Value::String(event.run_id.clone())));
+        if let Some(id) = id {
+            // A node's own word for the state (`waiting`, `paused`, ...) wins
+            // over the method's while the run goes on.
+            let state = run.remove("state");
+            let status = match (status, state) {
+                ("running", Some(Value::String(s))) if !s.is_empty() => s,
+                _ => status.to_string(),
+            };
+            run.insert("id".into(), id);
+            run.insert("status".into(), Value::String(status));
+            if !event.node_id.is_empty() {
+                run.insert("nodeId".into(), Value::String(event.node_id.clone()));
+            }
+            run.insert("updatedAt".into(), Value::String(event.occurred_at.clone()));
+            upsert(&mut projection.runs, run);
+        }
+    }
+    if event.event_type == "artifact.available" {
+        let mut artifact = data().as_object().cloned().unwrap_or_default();
+        let id = artifact
+            .get("artifactId")
+            .or_else(|| artifact.get("id"))
+            .cloned()
+            .unwrap_or_else(|| Value::String(event.event_id.clone()));
+        artifact.insert("id".into(), id);
+        if !event.node_id.is_empty() {
+            artifact.insert("nodeId".into(), Value::String(event.node_id.clone()));
+        }
+        if !event.run_id.is_empty() {
+            artifact.insert("runId".into(), Value::String(event.run_id.clone()));
+        }
+        upsert(&mut projection.artifacts, artifact);
+    }
     if event.event_type == "approval.resolved" {
         let Value::Object(resolution) = data() else {
             return Err(Error::Invalid(
@@ -637,6 +787,108 @@ mod tests {
         let projection = store.get_projection("org-demo").await.unwrap().unwrap();
         assert_eq!(projection.last_event_id, "evt-1");
         assert_eq!(projection.last_sequence, 8);
+    }
+
+    #[test]
+    fn freshness_follows_the_organizations_nodes() {
+        let mut projection = empty_projection("acme");
+        let nodes = |states: &[(&str, &str)]| -> Vec<Object> {
+            states
+                .iter()
+                .map(|(n, p)| objects(json!([{"id": n, "presence": p}])).remove(0))
+                .collect()
+        };
+        with_nodes(&mut projection, Vec::new());
+        assert_eq!(projection.freshness, "fresh", "no nodes: as stored");
+        with_nodes(
+            &mut projection,
+            nodes(&[("n1", "online"), ("n2", "offline")]),
+        );
+        assert_eq!(projection.freshness, "degraded");
+        assert_eq!(projection.nodes.len(), 2);
+        with_nodes(&mut projection, nodes(&[("n1", "degraded")]));
+        assert_eq!(projection.freshness, "stale");
+        with_nodes(&mut projection, nodes(&[("n1", "online")]));
+        assert_eq!(projection.freshness, "fresh");
+    }
+
+    fn node_event(method: &str, sequence: i64, extra: Value) -> Event {
+        let mut params = json!({
+            "protocolVersion": "v1", "organizationId": "acme", "nodeId": "node-1",
+            "messageId": format!("m-{sequence}"), "occurredAt": "2026-10-22T12:00:00Z",
+            "eventId": format!("e-{sequence}"), "sequence": sequence,
+        });
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        from_node_event(method, &params).unwrap()
+    }
+
+    #[tokio::test]
+    async fn node_events_project_runs_approvals_and_artifacts() {
+        assert!(from_node_event("harness.status", &json!({})).is_none());
+        let store = Store::new();
+        for event in [
+            node_event(
+                "run.updated",
+                1,
+                json!({"runId": "r1", "state": "waiting", "title": "Fix", "costUsd": 0.5}),
+            ),
+            node_event(
+                "approval.requested",
+                2,
+                json!({"runId": "r1", "requestId": "q1", "kind": "push", "title": "Push?"}),
+            ),
+            node_event(
+                "artifact.available",
+                3,
+                json!({"runId": "r1", "artifactId": "a1", "name": "report.md"}),
+            ),
+            node_event(
+                "run.completed",
+                4,
+                json!({"runId": "r1", "state": "done", "costUsd": 0.9}),
+            ),
+        ] {
+            store.apply_event(event).await.unwrap();
+        }
+        let p = store.get_projection("acme").await.unwrap().unwrap();
+        assert_eq!(p.runs.len(), 1, "one run, updated in place");
+        let run = &p.runs[0];
+        assert_eq!(
+            (run["id"].as_str(), run["status"].as_str()),
+            (Some("r1"), Some("completed"))
+        );
+        assert_eq!(
+            (run["title"].as_str(), run["costUsd"].as_f64()),
+            (Some("Fix"), Some(0.9))
+        );
+        assert_eq!(run["nodeId"], "node-1");
+        let approval = &p.approvals[0];
+        assert_eq!(
+            (
+                approval["id"].as_str(),
+                approval["action"].as_str(),
+                approval["status"].as_str()
+            ),
+            (Some("q1"), Some("push"), Some("pending"))
+        );
+        assert_eq!(p.artifacts[0]["id"], "a1");
+        assert_eq!(p.events.len(), 4);
+        assert_eq!(
+            p.events[0].actor,
+            Some(json!({"kind": "node", "id": "node-1"}))
+        );
+        assert!(
+            p.events[0]
+                .data
+                .as_ref()
+                .unwrap()
+                .get("protocolVersion")
+                .is_none(),
+            "the envelope is the event's, not its data"
+        );
     }
 
     #[tokio::test]

@@ -204,14 +204,35 @@ backoff from 5 s to 10 min that survives restarts. Delivered events leave the
 outbox after a day; one the sink has not taken in 7 days is dropped from it,
 and stays in the log for replay.
 
-## Office projection slice
-
-The current gateway exposes a storage-independent first slice for AgentUX Office:
+## Office projection
 
 ```text
-GET  /v1/office/projection?organizationId=org-demo
-POST /v1/approvals/{approvalId}/resolve
+GET  /v1/office/projection?organizationId=<org>      organization.read in <org>
+POST /v1/approvals/{approvalId}/resolve               approval.decide in the body's organization
 ```
+
+The projection is `office-projection.v1` from
+[agentux-protocol](https://github.com/agentux-os/agentux-protocol), and
+`tests/contract.rs` checks what Command serves against that schema (through
+`auxp::schemas`, at the revision Command pins). What fills it:
+
+- **Nodes' events.** A node's `run.*` events keep one entry per run in
+  `runs` (its title, step, cost, branch, pull request, `status` and
+  `nodeId`); `approval.requested` adds a pending approval (its `requestId` is
+  the id, its `kind` the action); `artifact.available` adds to `artifacts`.
+  `gate.completed`, `node.status_changed`, `node.alert` and `command.*` go to
+  the timeline. Harness status and session traffic stay in the node registry
+  (`GET /v1/nodes`).
+- **Published definitions**: the organization, its areas, missions and
+  agents, and `definitionVersion` ([Organization definitions](#organization-definitions)).
+- **Nodes and freshness, when read.** `nodes` lists the organization's nodes
+  as Command sees them at that moment (`presence` `online`, `degraded` or
+  `offline`, `lastHeartbeatAt`, `connected`), and `freshness` follows them:
+  `fresh` while every node reports, `degraded` while some do not, `stale`
+  when none does. `projectedAt` is when the last event was taken.
+- **Timeline.** `events` holds the latest 100; the whole log, from any
+  cursor or time, is [replayed](#events) from
+  `/v1/organizations/<org>/events`.
 
 Operators authenticate as described in [Operator access](#operator-access);
 the demo server also accepts `Bearer demo-leader` and `Bearer demo-observer`.
@@ -237,7 +258,8 @@ is enabled.
 Approval decisions are also appended to the event log, so the read model can be
 rebuilt and checked against replay after restart. The Office JSON contract stays
 independent of the storage implementation. Live updates depend on authenticated
-organization sessions ([#13](https://github.com/agentux-os/agentux-command/issues/13)) and remain tracked in [#14](https://github.com/agentux-os/agentux-command/issues/14).
+organization sessions, which exist now, and remain tracked in [#14](https://github.com/agentux-os/agentux-command/issues/14); until then a
+client polls the projection and replays the log from its cursor.
 
 Production startup requires `AGENTUX_COMMAND_DATABASE_URL`, connects to the
 database, applies versioned migrations and only then listens for requests.
