@@ -336,7 +336,7 @@ async fn healthz(State(s): AppState) -> Response {
 async fn instance(State(s): AppState) -> Response {
     reply(
         StatusCode::OK,
-        json!({"product": "agentux-command", "instanceId": s.instance, "protocolVersions": ["v1"]}),
+        serde_json::to_value(enrollment::Instance::new(&s.instance)).unwrap_or_default(),
     )
 }
 
@@ -543,47 +543,42 @@ async fn command(
     }
 }
 
-#[derive(Deserialize, Default)]
-#[serde(rename_all = "camelCase", default)]
-struct RedeemRequest {
-    #[serde(deserialize_with = "crate::nullable")]
-    token: String,
-    /// `null` from a gateway enrolling without a name.
-    #[serde(deserialize_with = "crate::nullable")]
-    node_name: String,
-    #[serde(deserialize_with = "crate::nullable")]
-    hostname: String,
-}
-
 /// Trades an enrollment token for the node's credential.
 async fn redeem(State(s): AppState, body: Bytes) -> Response {
-    let Some(request) = parse::<RedeemRequest>(&body, 16 << 10) else {
+    // The protocol's redemption: nodeName and hostname may be null.
+    let Some(request) = parse::<enrollment::Redemption>(&body, 16 << 10) else {
         return error(StatusCode::BAD_REQUEST, "invalid JSON");
     };
+    let node_name = request.node_name.unwrap_or_default();
+    let hostname = request.hostname.unwrap_or_default();
     match s
         .enroll
-        .redeem(
-            &request.token,
-            &request.node_name,
-            &request.hostname,
-            Utc::now(),
-        )
+        .redeem(&request.token, &node_name, &hostname, Utc::now())
         .await
     {
-        Ok(r) => reply(
-            StatusCode::OK,
-            json!({
-                "instanceId": s.instance,
-                "organizationId": r.credential.organization_id,
-                "nodeId": r.credential.node_id,
-                "nodeSecret": r.secret,
-                "approved": r.credential.approved,
-            }),
-        ),
-        Err(e @ enroll::Error::OtherInstance) => reply(
-            StatusCode::CONFLICT,
-            json!({"error": e.to_string(), "instanceId": s.instance}),
-        ),
+        Ok(r) => {
+            let enrolled = enrollment::Enrolled {
+                instance_id: s.instance.clone(),
+                organization_id: r.credential.organization_id,
+                node_id: r.credential.node_id,
+                node_secret: r.secret,
+                approved: r.credential.approved,
+            };
+            reply(
+                StatusCode::OK,
+                serde_json::to_value(enrolled).unwrap_or_default(),
+            )
+        }
+        Err(e @ enroll::Error::OtherInstance) => {
+            let refused = enrollment::Refused {
+                error: e.to_string(),
+                instance_id: Some(s.instance.clone()),
+            };
+            reply(
+                StatusCode::CONFLICT,
+                serde_json::to_value(refused).unwrap_or_default(),
+            )
+        }
         Err(
             e @ (enroll::Error::InvalidToken
             | enroll::Error::UsedToken
