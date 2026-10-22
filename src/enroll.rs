@@ -23,12 +23,12 @@ use subtle::ConstantTimeEq;
 
 use crate::random_hex;
 
-pub const TOKEN_PREFIX: &str = "auxe1_";
-pub const SECRET_PREFIX: &str = "auxn1_";
+pub use auxp::enrollment::{
+    CREDENTIAL_PREFIX as SECRET_PREFIX, TOKEN_PREFIX, token_instance, valid_instance_id,
+};
 
 static NODE_ID: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9._-]{0,62}$").unwrap());
-static INSTANCE_ID: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^cmd-[0-9a-f]{16}$").unwrap());
 static ORGANIZATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$").unwrap());
 
@@ -152,18 +152,6 @@ pub fn new_instance_id() -> String {
     format!("cmd-{}", random_hex(8))
 }
 
-/// Checks the shape of an instance id.
-pub fn valid_instance_id(id: &str) -> bool {
-    INSTANCE_ID.is_match(id)
-}
-
-/// The instance id a token names.
-pub fn token_instance(token: &str) -> Option<&str> {
-    let rest = token.trim().strip_prefix(TOKEN_PREFIX)?;
-    let (instance, secret) = rest.split_once('_')?;
-    (valid_instance_id(instance) && secret.len() == 64).then_some(instance)
-}
-
 fn hash(secret: &str) -> String {
     hex::encode(Sha256::digest(secret.as_bytes()))
 }
@@ -173,11 +161,11 @@ fn same(a: &str, b: &str) -> bool {
 }
 
 fn new_token(instance: &str) -> String {
-    format!("{TOKEN_PREFIX}{instance}_{}", random_hex(32))
+    auxp::enrollment::token(instance, &random_hex(32))
 }
 
 fn new_secret() -> String {
-    format!("{SECRET_PREFIX}{}", random_hex(32))
+    auxp::enrollment::credential(&random_hex(32))
 }
 
 /// Checks and fills a token request.
