@@ -55,7 +55,8 @@ enabled. Collect a read-only baseline from a trusted Linux build host using the
 same architecture as the Command container:
 
 ```sh
-go build -o /tmp/agentux-command-storage-report ./cmd/agentux-command-storage-report
+cargo build --release --bin agentux-command-storage-report
+cp target/release/agentux-command-storage-report /tmp/agentux-command-storage-report
 podman cp /tmp/agentux-command-storage-report agentux-command:/tmp/agentux-command-storage-report
 podman exec agentux-command /tmp/agentux-command-storage-report > office-event-growth.json
 podman exec agentux-command /tmp/agentux-command-storage-report --detailed > office-event-growth-detailed.json

@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  go:
+  rust:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -27,11 +27,14 @@ jobs:
           --health-retries 10
     env:
       AGENTUX_COMMAND_TEST_DATABASE_URL: postgres://agentux:agentux-test@localhost:5432/agentux_test?sslmode=disable
+      CARGO_TERM_COLOR: always
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          go-version-file: go.mod
-          cache: true
-      - run: go test ./... -count=1
-      - run: go vet ./...
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+      - run: node scripts/validate-bundle.mjs
