@@ -103,6 +103,13 @@ impl OfficeRepository for Failing {
     async fn apply_event(&self, _: office::Event) -> Result<(), office::Error> {
         Err(office::Error::Storage("database unavailable".into()))
     }
+    async fn events(
+        &self,
+        _: &str,
+        _: &office::Replay,
+    ) -> Result<Vec<office::Logged>, office::Error> {
+        Err(office::Error::Storage("database unavailable".into()))
+    }
     async fn resolve_approval(
         &self,
         _: &str,

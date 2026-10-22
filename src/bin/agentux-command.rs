@@ -8,6 +8,7 @@
 //!       --capabilities auth.admin,organization.read,node.enroll,node.command,approval.decide
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use agentux_command::server::{Handler, parse_node_tokens};
 
@@ -70,6 +71,18 @@ async fn run() -> Result<(), String> {
         );
         handler = handler.with_oidc(provider);
     }
+    // Events go to a webhook when one is set; the outbox is kept either way.
+    let events_url = env("AGENTUX_COMMAND_EVENTS_URL");
+    let sink: Option<Arc<dyn agentux_command::outbox::Sink>> = if events_url.is_empty() {
+        None
+    } else {
+        eprintln!("events are delivered to {events_url}");
+        Some(Arc::new(agentux_command::outbox::Webhook::new(
+            &events_url,
+            std::env::var("AGENTUX_COMMAND_EVENTS_TOKEN").ok(),
+        )?))
+    };
+    handler = handler.deliver_events(sink);
     eprintln!("agentux-command instance {}", handler.instance_id());
 
     let listener = tokio::net::TcpListener::bind(&address)

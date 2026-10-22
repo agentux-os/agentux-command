@@ -12,8 +12,9 @@ use tokio_postgres::NoTls;
 use tokio_postgres::types::Json;
 
 use super::{
-    Error, Event, OfficeRepository, Projection, ResolutionRequest, ResolutionResponse,
-    apply_projection_event, empty_projection, migrate, validate_event, validate_resolution,
+    Error, Event, Logged, OfficeRepository, Projection, Replay, ResolutionRequest,
+    ResolutionResponse, apply_projection_event, empty_projection, migrate, prepare,
+    stamp_definition, validate_event, validate_resolution,
 };
 use crate::now_rfc3339;
 
@@ -140,6 +141,115 @@ async fn save_projection(
     Ok(())
 }
 
+/// Takes `event` into the log within `tx`: the log row, the node's cursor,
+/// the projection and the outbox row commit together with whatever else
+/// `tx` changes. `false` when the event was taken before (by event id).
+pub async fn append_event(
+    tx: &deadpool_postgres::Transaction<'_>,
+    mut event: Event,
+) -> Result<bool, Error> {
+    validate_event(&event)?;
+    prepare(&mut event);
+    let initial = empty_projection(&event.organization_id);
+    tx.execute(
+        "INSERT INTO office_projections (organization_id, schema_version, definition_version, projected_at, source, freshness, last_event_id, last_node_id, last_sequence, payload) VALUES ($1,$2,$3,$4::text::timestamptz,$5,$6,$7,$8,$9,$10) ON CONFLICT (organization_id) DO NOTHING",
+        &[
+            &initial.organization_id,
+            &initial.schema_version,
+            &initial.definition_version,
+            &event.received_at,
+            &initial.source,
+            &initial.freshness,
+            &initial.last_event_id,
+            &initial.last_node_id,
+            &initial.last_sequence,
+            &Json(&initial),
+        ],
+    )
+    .await
+    .map_err(storage("initialize office projection"))?;
+    let Json(mut projection): Json<Projection> = tx
+        .query_one(
+            "SELECT payload FROM office_projections WHERE organization_id = $1 FOR UPDATE",
+            &[&event.organization_id],
+        )
+        .await
+        .map_err(storage("lock office projection"))?
+        .get(0);
+    let exists: bool = tx
+        .query_one(
+            "SELECT EXISTS (SELECT 1 FROM office_events WHERE organization_id = $1 AND event_id = $2)",
+            &[&event.organization_id, &event.event_id],
+        )
+        .await
+        .map_err(storage("check duplicate office event"))?
+        .get(0);
+    if exists {
+        return Ok(false);
+    }
+    stamp_definition(&mut event, &projection);
+    let last: i64 = tx
+        .query_opt(
+            "SELECT sequence FROM office_event_cursors WHERE organization_id = $1 AND node_id = $2 FOR UPDATE",
+            &[&event.organization_id, &event.node_id],
+        )
+        .await
+        .map_err(storage("read office event cursor"))?
+        .map(|row| row.get(0))
+        .unwrap_or(0);
+    if event.sequence <= last {
+        return Err(Error::conflict(
+            "stale_version",
+            format!(
+                "event sequence {} is not after {last} for organization {} node {}",
+                event.sequence, event.organization_id, event.node_id
+            ),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO office_events (organization_id, event_id, node_id, sequence, payload) VALUES ($1,$2,$3,$4,$5)",
+        &[&event.organization_id, &event.event_id, &event.node_id, &event.sequence, &Json(&event)],
+    )
+    .await
+    .map_err(storage("append office event"))?;
+    enqueue(tx, &event).await?;
+    tx.execute(
+        "INSERT INTO office_event_cursors (organization_id, node_id, sequence, last_event_id) VALUES ($1,$2,$3,$4) ON CONFLICT (organization_id,node_id) DO UPDATE SET sequence=EXCLUDED.sequence, last_event_id=EXCLUDED.last_event_id, updated_at=now()",
+        &[&event.organization_id, &event.node_id, &event.sequence, &event.event_id],
+    )
+    .await
+    .map_err(storage("advance office event cursor"))?;
+    apply_projection_event(&mut projection, &event)?;
+    if event.event_type == "approval.requested" {
+        let approval = event.data.clone().unwrap_or(Value::Null);
+        let approval_id = approval
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        tx.execute(
+            "INSERT INTO office_approval_state (organization_id, approval_id, status, payload) VALUES ($1,$2,'pending',$3) ON CONFLICT (organization_id,approval_id) DO NOTHING",
+            &[&event.organization_id, &approval_id, &Json(&approval)],
+        )
+        .await
+        .map_err(storage("record requested approval"))?;
+    }
+    save_projection(tx, &projection).await?;
+    Ok(true)
+}
+
+/// Queues `event` for delivery (migration 007), once per event id.
+async fn enqueue(client: &impl GenericClient, event: &Event) -> Result<(), Error> {
+    client
+        .execute(
+            "INSERT INTO office_outbox (organization_id, event_id, payload) VALUES ($1, $2, $3) ON CONFLICT (organization_id, event_id) DO NOTHING",
+            &[&event.organization_id, &event.event_id, &Json(event)],
+        )
+        .await
+        .map_err(storage("queue office event"))?;
+    Ok(())
+}
+
 #[async_trait]
 impl OfficeRepository for PostgresStore {
     async fn ping(&self) -> Result<(), Error> {
@@ -163,102 +273,43 @@ impl OfficeRepository for PostgresStore {
         Ok(row.map(|row| row.get::<_, Json<Projection>>(0).0))
     }
 
-    async fn apply_event(&self, mut event: Event) -> Result<(), Error> {
-        validate_event(&event)?;
-        if event.received_at.is_empty() {
-            event.received_at = now_rfc3339();
-        }
+    async fn apply_event(&self, event: Event) -> Result<(), Error> {
         let mut client = self.pool.get().await?;
         let tx = client
             .transaction()
             .await
             .map_err(storage("begin event transaction"))?;
-        let initial = empty_projection(&event.organization_id);
-        tx.execute(
-            "INSERT INTO office_projections (organization_id, schema_version, definition_version, projected_at, source, freshness, last_event_id, last_node_id, last_sequence, payload) VALUES ($1,$2,$3,$4::text::timestamptz,$5,$6,$7,$8,$9,$10) ON CONFLICT (organization_id) DO NOTHING",
-            &[
-                &initial.organization_id,
-                &initial.schema_version,
-                &initial.definition_version,
-                &event.received_at,
-                &initial.source,
-                &initial.freshness,
-                &initial.last_event_id,
-                &initial.last_node_id,
-                &initial.last_sequence,
-                &Json(&initial),
-            ],
-        )
-        .await
-        .map_err(storage("initialize office projection"))?;
-        let Json(mut projection): Json<Projection> = tx
-            .query_one(
-                "SELECT payload FROM office_projections WHERE organization_id = $1 FOR UPDATE",
-                &[&event.organization_id],
-            )
-            .await
-            .map_err(storage("lock office projection"))?
-            .get(0);
-        let exists: bool = tx
-            .query_one(
-                "SELECT EXISTS (SELECT 1 FROM office_events WHERE organization_id = $1 AND event_id = $2)",
-                &[&event.organization_id, &event.event_id],
-            )
-            .await
-            .map_err(storage("check duplicate office event"))?
-            .get(0);
-        if exists {
-            tx.commit().await.map_err(storage("commit"))?;
-            return Ok(());
-        }
-        let last: i64 = tx
-            .query_opt(
-                "SELECT sequence FROM office_event_cursors WHERE organization_id = $1 AND node_id = $2 FOR UPDATE",
-                &[&event.organization_id, &event.node_id],
-            )
-            .await
-            .map_err(storage("read office event cursor"))?
-            .map(|row| row.get(0))
-            .unwrap_or(0);
-        if event.sequence <= last {
-            return Err(Error::conflict(
-                "stale_version",
-                format!(
-                    "event sequence {} is not after {last} for organization {} node {}",
-                    event.sequence, event.organization_id, event.node_id
-                ),
-            ));
-        }
-        tx.execute(
-            "INSERT INTO office_events (organization_id, event_id, node_id, sequence, payload) VALUES ($1,$2,$3,$4,$5)",
-            &[&event.organization_id, &event.event_id, &event.node_id, &event.sequence, &Json(&event)],
-        )
-        .await
-        .map_err(storage("append office event"))?;
-        tx.execute(
-            "INSERT INTO office_event_cursors (organization_id, node_id, sequence, last_event_id) VALUES ($1,$2,$3,$4) ON CONFLICT (organization_id,node_id) DO UPDATE SET sequence=EXCLUDED.sequence, last_event_id=EXCLUDED.last_event_id, updated_at=now()",
-            &[&event.organization_id, &event.node_id, &event.sequence, &event.event_id],
-        )
-        .await
-        .map_err(storage("advance office event cursor"))?;
-        apply_projection_event(&mut projection, &event)?;
-        if event.event_type == "approval.requested" {
-            let approval = event.data.clone().unwrap_or(Value::Null);
-            let approval_id = approval
-                .get("id")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            tx.execute(
-                "INSERT INTO office_approval_state (organization_id, approval_id, status, payload) VALUES ($1,$2,'pending',$3) ON CONFLICT (organization_id,approval_id) DO NOTHING",
-                &[&event.organization_id, &approval_id, &Json(&approval)],
-            )
-            .await
-            .map_err(storage("record requested approval"))?;
-        }
-        save_projection(&tx, &projection).await?;
+        append_event(&tx, event).await?;
         tx.commit().await.map_err(storage("commit office event"))?;
         Ok(())
+    }
+
+    async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error> {
+        let client = self.pool.get().await?;
+        let rows = client
+            .query(
+                "SELECT ingest_id, payload FROM office_events
+                 WHERE organization_id = $1 AND ingest_id > $2
+                   AND ($3::timestamptz IS NULL OR received_at >= $3)
+                   AND ($4::timestamptz IS NULL OR received_at < $4)
+                 ORDER BY ingest_id LIMIT $5",
+                &[
+                    &organization_id,
+                    &replay.after,
+                    &replay.since,
+                    &replay.until,
+                    &replay.limit,
+                ],
+            )
+            .await
+            .map_err(storage("replay office events"))?;
+        Ok(rows
+            .iter()
+            .map(|row| Logged {
+                cursor: row.get(0),
+                event: row.get::<_, Json<Event>>(1).0,
+            })
+            .collect())
     }
 
     async fn resolve_approval(
@@ -347,14 +398,28 @@ impl OfficeRepository for PostgresStore {
         let identity =
             Sha256::digest(format!("{org}\0{approval_id}\0{}", request.idempotency_key).as_bytes());
         let now = now_rfc3339();
+        let text = |key: &str| {
+            approval
+                .get(key)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        };
+        let correlation_id = Some(text("correlationId"))
+            .filter(|c| !c.is_empty())
+            .unwrap_or_else(|| approval_id.to_string());
         let resolution = Event {
             event_id: format!("approval-resolved-{}", hex::encode(identity)),
             event_type: "approval.resolved".into(),
             organization_id: org.clone(),
             node_id: "command".into(),
+            run_id: text("runId"),
             occurred_at: now.clone(),
             received_at: now,
             sequence: command_sequence,
+            correlation_id,
+            actor: request.actor.clone(),
+            definition_version: projection.definition_version.clone(),
             data: Some(
                 json!({"approvalId": approval_id, "decision": request.decision, "reason": request.reason, "idempotencyKey": request.idempotency_key}),
             ),
@@ -367,6 +432,7 @@ impl OfficeRepository for PostgresStore {
         )
         .await
         .map_err(storage("append approval resolution event"))?;
+        enqueue(&tx, &resolution).await?;
         tx.execute(
             "INSERT INTO office_event_cursors (organization_id,node_id,sequence,last_event_id) VALUES ($1,$2,$3,$4) ON CONFLICT (organization_id,node_id) DO UPDATE SET sequence=EXCLUDED.sequence,last_event_id=EXCLUDED.last_event_id,updated_at=now()",
             &[org, &resolution.node_id, &resolution.sequence, &resolution.event_id],
