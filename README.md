@@ -37,9 +37,10 @@ That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/age
 ## Initial stack
 
 - Rust HTTP/WebSocket service (axum, tokio-postgres)
-- PostgreSQL for remote product state
-- Temporal for durable organization-level workflows
-- NATS for internal event distribution
+- PostgreSQL for remote product state, and for durable organization-level
+  workflows: explicit state machines with a transactional outbox
+  ([ADR 0020](https://github.com/agentux-os/agentux/blob/main/docs/adr/0020-command-workflows-without-temporal.md))
+- NATS for delivery only: waking workers, live views, routing commands between replicas
 - AgentUX node gateway for remote execution
 
 ## Planned capabilities

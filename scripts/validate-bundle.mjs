@@ -3,7 +3,6 @@ import { readdir, readFile } from 'node:fs/promises';
 const files = await readdir(new URL('../deploy/quadlet/', import.meta.url));
 const expected = [
   'agentux-command-postgres.container',
-  'agentux-command-temporal.container',
   'agentux-command-nats.container',
   'agentux-command-object-store.container',
   'agentux-command.container',

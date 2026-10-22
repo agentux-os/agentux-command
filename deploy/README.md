@@ -1,7 +1,7 @@
 # AgentUX Command server bundle
 
 This directory contains the optional `command-server` profile bundle. It is
-container-only: PostgreSQL, Temporal, NATS, MinIO and the Command service run
+container-only: PostgreSQL, NATS, MinIO and the Command service run
 as rootless Podman Quadlets. No host RPM installation or mutable `/usr` change
 is required.
 
