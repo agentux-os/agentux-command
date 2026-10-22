@@ -195,6 +195,20 @@ replays the log oldest first: after a cursor, within a time range (RFC 3339,
 Each entry is `{"cursor": n, "event": {...}}`; `next` is the cursor to go on
 from.
 
+```text
+GET /v1/organizations/<org>/events/stream?after=<cursor>   organization.read   (text/event-stream)
+```
+
+is the same log, live: what comes after the cursor (`after`, or the
+`Last-Event-ID` a reconnecting `EventSource` sends by itself), then each event
+as Command takes it. Each message is one event (`id:` its cursor,
+`event: office.event`, `data:` the event). Delivery is at least once: dedupe
+by `eventId`. `event: unavailable` means the log cannot be read at the moment;
+the stream keeps trying. A slow reader is sent only as fast as it reads, and a
+comment every 15 s keeps proxies from closing the stream. Signed-in operators'
+browsers authenticate with their session cookie, which `EventSource` sends.
+Cursors do not expire, because the log keeps everything (#18 tracks retention).
+
 With `AGENTUX_COMMAND_EVENTS_URL` set, Command also POSTs each event as JSON
 to that URL (`Idempotency-Key: <eventId>`, and `Authorization: Bearer
 <AGENTUX_COMMAND_EVENTS_TOKEN>` when that is set), from an outbox written in
@@ -258,8 +272,8 @@ is enabled.
 Approval decisions are also appended to the event log, so the read model can be
 rebuilt and checked against replay after restart. The Office JSON contract stays
 independent of the storage implementation. Live updates depend on authenticated
-organization sessions, which exist now, and remain tracked in [#14](https://github.com/agentux-os/agentux-command/issues/14); until then a
-client polls the projection and replays the log from its cursor.
+organization sessions; Office keeps current by loading the projection once
+and then following [the live stream](#events) from its `lastEventId`'s cursor.
 
 Production startup requires `AGENTUX_COMMAND_DATABASE_URL`, connects to the
 database, applies versioned migrations and only then listens for requests.

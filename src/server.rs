@@ -62,6 +62,8 @@ struct Inner {
     /// The database, when Command keeps its state in one: event delivery
     /// reads its outbox.
     database: Option<deadpool_postgres::Pool>,
+    /// Woken whenever this server takes an event, for live streams.
+    changed: tokio::sync::Notify,
 }
 
 /// A Command server, configured with the `with_*` methods, served by
@@ -113,6 +115,7 @@ impl Handler {
                 oidc: None,
                 definitions: Arc::new(definitions::Memory::default()),
                 database: None,
+                changed: tokio::sync::Notify::new(),
             },
         }
     }
@@ -266,6 +269,7 @@ impl Handler {
             )
             .route("/v1/organizations/{org}/audit", get(organization_audit))
             .route("/v1/organizations/{org}/events", get(organization_events))
+            .route("/v1/organizations/{org}/events/stream", get(stream_events))
             .route("/v1/auth/login", get(login))
             .route("/v1/auth/callback", get(callback))
             .route("/v1/auth/logout", post(logout))
@@ -506,10 +510,11 @@ impl Inner {
             event.node_id.clone(),
             event.sequence,
         );
-        if let Err(e) = self.office.apply_event(event).await {
-            eprintln!(
+        match self.office.apply_event(event).await {
+            Ok(()) => self.changed.notify_waiters(),
+            Err(e) => eprintln!(
                 "agentux-command: the Office did not take {method} {sequence} from {node} in {org}: {e}"
-            );
+            ),
         }
     }
 
@@ -1103,7 +1108,11 @@ async fn resolve_approval(
     if !operator.can(&request.organization_id, auth::APPROVAL_DECIDE) {
         return forbidden(auth::APPROVAL_DECIDE, &request.organization_id);
     }
-    match s.office.resolve_approval(&approval_id, request).await {
+    let resolved = s.office.resolve_approval(&approval_id, request).await;
+    if resolved.is_ok() {
+        s.changed.notify_waiters();
+    }
+    match resolved {
         Ok(response) => reply(
             StatusCode::OK,
             serde_json::to_value(response).unwrap_or_default(),
@@ -1461,6 +1470,7 @@ async fn publish_definition(
             "agentux-command: definition {org} v{version} published, but the Office projection did not take it: {e}"
         );
     }
+    s.changed.notify_waiters();
     reply(
         StatusCode::OK,
         serde_json::to_value(published).unwrap_or_default(),
@@ -1545,4 +1555,99 @@ async fn organization_events(
         }
         Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "event log unavailable"),
     }
+}
+
+#[derive(Deserialize)]
+struct StreamQuery {
+    #[serde(default)]
+    after: Option<i64>,
+}
+
+/// Events taken from the log per read.
+const STREAM_BATCH: i64 = 500;
+/// How long a stream waits for a wake-up before it looks anyway: events
+/// another Command instance took wake nobody here.
+const STREAM_POLL: Duration = Duration::from_secs(5);
+
+/// The organization's events, live, as server-sent events: the log after a
+/// cursor (`after`, or the `Last-Event-ID` a reconnecting `EventSource`
+/// sends), then each event as Command takes it. Each message is one event:
+/// `id` its cursor, `event: office.event`, `data` the event (clients
+/// deduplicate by `eventId`; delivery is at least once). `event: unavailable`
+/// says the log cannot be read right now; the stream goes on trying. A slow
+/// reader is never sent more than it reads.
+async fn stream_events(
+    State(s): AppState,
+    Path(org): Path<String>,
+    Query(query): Query<StreamQuery>,
+    headers: HeaderMap,
+) -> Response {
+    use axum::response::sse::{Event as Sse, KeepAlive};
+    use std::collections::VecDeque;
+    if let Err(denied) = operator_in(&s, &headers, &org, auth::ORGANIZATION_READ).await {
+        return *denied;
+    }
+    let after = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .or(query.after)
+        .unwrap_or(0)
+        .max(0);
+    let start = (s, org, after, VecDeque::<Sse>::new());
+    let stream =
+        futures_util::stream::unfold(start, |(s, org, mut after, mut pending)| async move {
+            loop {
+                if let Some(next) = pending.pop_front() {
+                    return Some((
+                        Ok::<_, std::convert::Infallible>(next),
+                        (s, org, after, pending),
+                    ));
+                }
+                let unavailable = {
+                    // Listen before reading, so an event taken in between
+                    // wakes us.
+                    let changed = s.changed.notified();
+                    tokio::pin!(changed);
+                    changed.as_mut().enable();
+                    let replay = office::Replay {
+                        after,
+                        limit: STREAM_BATCH,
+                        ..office::Replay::default()
+                    };
+                    match s.office.events(&org, &replay).await {
+                        Ok(batch) if !batch.is_empty() => {
+                            for logged in batch {
+                                after = logged.cursor;
+                                let message = Sse::default()
+                                    .id(logged.cursor.to_string())
+                                    .event("office.event")
+                                    .json_data(&logged.event)
+                                    .unwrap_or_default();
+                                pending.push_back(message);
+                            }
+                            false
+                        }
+                        Ok(_) => {
+                            tokio::select! {
+                                _ = changed => {}
+                                _ = tokio::time::sleep(STREAM_POLL) => {}
+                            }
+                            false
+                        }
+                        Err(_) => true,
+                    }
+                };
+                if unavailable {
+                    tokio::time::sleep(STREAM_POLL).await;
+                    let message = Sse::default()
+                        .event("unavailable")
+                        .data("the event log is unavailable");
+                    return Some((Ok(message), (s, org, after, pending)));
+                }
+            }
+        });
+    axum::response::sse::Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
