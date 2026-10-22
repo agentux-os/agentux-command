@@ -2,6 +2,7 @@
 Description=AgentUX Command NATS event bus
 
 [Container]
+Network=agentux-command.network
 Image=docker.io/library/nats:2.10
 ContainerName=agentux-command-nats
 Volume=agentux-command-nats.volume:/data
