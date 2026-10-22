@@ -230,3 +230,51 @@ async fn a_failed_storage_report_writes_nothing_to_stdout() {
     assert_ne!(code, 0);
     assert!(out.is_empty() && !err.is_empty());
 }
+
+#[tokio::test]
+async fn service_tokens_live_in_the_database() {
+    use agentux_command::auth::{
+        Authenticator, NODE_COMMAND, PostgresTokens, ServiceTokens, TokenRequest,
+    };
+    let Some((_, pool, ..)) = store().await else {
+        return;
+    };
+    let tokens = PostgresTokens::new(pool);
+    let issued = tokens
+        .issue(
+            TokenRequest {
+                name: "ci".into(),
+                organization_id: "acme".into(),
+                capabilities: vec![NODE_COMMAND.into()],
+                days: Some(7),
+                ..TokenRequest::default()
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+    let principal = tokens
+        .authenticate(&issued.secret)
+        .await
+        .expect("the token authenticates");
+    assert!(principal.can("acme", NODE_COMMAND) && !principal.can("other", NODE_COMMAND));
+    let listed = tokens.list("acme").await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].capabilities, [NODE_COMMAND]);
+    tokens
+        .revoke(&issued.token.id, chrono::Utc::now())
+        .await
+        .unwrap();
+    assert!(
+        tokens.authenticate(&issued.secret).await.is_none(),
+        "revoked"
+    );
+    assert!(
+        tokens
+            .get(&issued.token.id)
+            .await
+            .unwrap()
+            .revoked_at
+            .is_some()
+    );
+}

@@ -86,6 +86,39 @@ Static tokens (`AGENTUX_COMMAND_NODE_TOKENS`) still work. Nodes that are neither
 
 Nodes keep a command connection open: the gateway dials `GET /v1/protocol/connect?nodeId=<id>` (WebSocket, with its enrollment credential (or a static token)). Operators send a node a command with `POST /v1/nodes/<nodeId>/commands` and `{ "method", "params", "commandId"? }`, with the `node.command` capability (`Bearer demo-leader` in the demo). Methods: `run.start`, `run.cancel`, `run.pause`, `run.resume`, `run.snapshot`, `request.resolve`, `bus.post`, `harness.list`, `harness.test`, `limits.clear`, `preferences.set`. Command fills in the envelope and a `commandId` when none is given, and answers with the node's `result` (200), its error (409 when the node holds the command for local confirmation or its policy denies it, 502 otherwise), 503 when the node is not connected, or 504 when it does not answer within 150 seconds. A command sent again with the same `commandId` gets the first answer. `GET /v1/nodes` says which nodes are `connected`.
 
+## Operator access
+
+Every operator request resolves to a principal holding capabilities **per
+organization**: `organization.read`, `node.command`, `node.enroll`,
+`approval.decide` and `auth.admin`. A route acts on a record (a node, an
+enrollment, an approval) only with the capability in **that record's
+organization**; another organization's nodes and enrollments are not listed,
+and are answered as unknown. No credential, or one Command does not accept,
+is 401; a missing capability is 403. Without credentials every operator route
+fails closed; `/healthz` and `/v1/instance` stay public and carry no tenant
+data.
+
+**Service tokens** (`auxs1_…`) are for automation and the first
+administrator. Only their hashes are stored; the secret is shown once.
+
+```sh
+# The first administrator, on the server (straight in the database):
+podman exec agentux-command agentux-command token issue \
+  --organization acme --name admin \
+  --capabilities auth.admin,organization.read,node.enroll,node.command,approval.decide
+
+# Then, with auth.admin in that organization:
+POST /v1/service-tokens        { "name", "organizationId", "capabilities": [...], "days"? }
+GET  /v1/service-tokens?organizationId=acme
+POST /v1/service-tokens/<id>/revoke
+```
+
+Interactive sign-in for people (OIDC, with groups mapped to capabilities) is
+the next step ([#13](https://github.com/agentux-os/agentux-command/issues/13)).
+The demo tokens (`demo-leader`: every capability but `auth.admin` in every
+organization; `demo-observer`: `organization.read`) work on the in-memory demo
+server, and on a real one only with `AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1`.
+
 ## Office projection slice
 
 The current gateway exposes a storage-independent first slice for AgentUX Office:
@@ -95,9 +128,8 @@ GET  /v1/office/projection?organizationId=org-demo
 POST /v1/approvals/{approvalId}/resolve
 ```
 
-The demo server accepts `Bearer demo-leader` (`organization.read` and
-`approval.decide`) and `Bearer demo-observer` (`organization.read`). Production
-authentication and organization sessions are tracked in [#13](https://github.com/agentux-os/agentux-command/issues/13).
+Operators authenticate as described in [Operator access](#operator-access);
+the demo server also accepts `Bearer demo-leader` and `Bearer demo-observer`.
 
 Projection responses carry `schemaVersion`, `definitionVersion`, `projectedAt`,
 `source`, `freshness`, `lastEventId` and event replay metadata. Events use

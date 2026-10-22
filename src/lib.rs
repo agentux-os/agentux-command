@@ -5,6 +5,7 @@
 //! each node's agentuxd stays the authority for its runs, and the node's
 //! policy decides which commands it accepts.
 
+pub mod auth;
 pub mod channel;
 pub mod enroll;
 pub mod nodes;
