@@ -402,8 +402,9 @@ and receive time for time-window replay and retention queries.
 Operators can collect read-only partition-size and growth diagnostics with the
 standalone `agentux-command-storage-report` command; detailed per-organization
 aggregates are opt-in. See [the operations runbook](deploy/README.md#office-event-growth-report).
-Events are retained indefinitely by default; no automated pruning or archival
-is enabled.
+Events are kept indefinitely by default; an operator can turn on retention,
+which archives old events and keeps projections verifiable through checkpoints
+([Event retention](deploy/README.md#event-retention)).
 Approval decisions are also appended to the event log, so the read model can be
 rebuilt and checked against replay after restart. The Office JSON contract stays
 independent of the storage implementation. Live updates depend on authenticated
