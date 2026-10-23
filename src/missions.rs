@@ -673,6 +673,11 @@ impl Engine {
             ("repository", run.input.repository.clone()),
             ("prompt", run.input.prompt.clone()),
             ("title", run.input.title.clone()),
+            // The node keeps it with the run and reports it on its events.
+            (
+                "definitionVersion",
+                format!("definition-{}", run.definition_version),
+            ),
         ] {
             params.insert(key.into(), Value::String(value));
         }
@@ -882,17 +887,26 @@ impl Engine {
         &self,
         org: &str,
         node_run_id: &str,
+        correlation_id: &str,
         event_type: &str,
         error: &str,
         nodes: &dyn Nodes,
     ) -> Result<Option<Run>, Error> {
-        if node_run_id.is_empty() || !matches!(event_type, "run.completed" | "run.failed") {
+        if (node_run_id.is_empty() && correlation_id.is_empty())
+            || !matches!(event_type, "run.completed" | "run.failed")
+        {
             return Ok(None);
         }
+        // The node's run, by its own id, or by the correlation it reports:
+        // Command's run id, for a run a node started for a mission.
         let run = self.store.active(Some(org)).await?.into_iter().find(|r| {
-            r.steps
-                .get(&r.step)
-                .is_some_and(|s| s.status == "waiting" && s.node_run_id == node_run_id)
+            r.steps.get(&r.step).is_some_and(|s| {
+                s.status == "waiting"
+                    && ((!node_run_id.is_empty() && s.node_run_id == node_run_id)
+                        || (!correlation_id.is_empty()
+                            && correlation_id == r.run_id
+                            && s.kind == "agent"))
+            })
         });
         let Some(run) = run else {
             return Ok(None);

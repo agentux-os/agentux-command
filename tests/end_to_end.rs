@@ -555,6 +555,14 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     ] {
         assert!(types.contains(&expected), "{expected} in {types:?}");
     }
+    // The node's own run events name the mission run they belong to.
+    let node_done = events
+        .iter()
+        .find(|e| e["eventType"] == "run.completed")
+        .unwrap();
+    assert_eq!(node_done["correlationId"], run_id.as_str(), "{node_done}");
+    assert_eq!(node_done["definitionVersion"], "definition-1");
+    assert_eq!(node_done["data"]["missionId"], "ship");
     let completed = events
         .iter()
         .find(|e| e["eventType"] == "mission.run.completed")

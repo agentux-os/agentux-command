@@ -550,6 +550,7 @@ impl Inner {
             event.sequence,
         );
         let data = event.data.clone().unwrap_or(Value::Null);
+        let correlation = event.correlation_id.clone();
         let (node_run, error) = (
             event.run_id.clone(),
             data["error"]
@@ -576,7 +577,7 @@ impl Inner {
                         .await
                 } else {
                     engine
-                        .node_event(&org, &node_run, method, &error, &nodes)
+                        .node_event(&org, &node_run, &correlation, method, &error, &nodes)
                         .await
                 };
                 if let Err(e) = moved {

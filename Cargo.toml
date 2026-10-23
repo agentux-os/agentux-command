@@ -33,9 +33,9 @@ url = "2"
 [dev-dependencies]
 # The real node side for tests/end_to_end.rs: agentux-core's gateway in
 # front of an agentuxd with scripted agents.
-agentux-gateway = { git = "https://github.com/agentux-os/agentux-core", rev = "c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf" }
-agentux-store = { git = "https://github.com/agentux-os/agentux-core", rev = "c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf" }
-agentuxd = { git = "https://github.com/agentux-os/agentux-core", rev = "c23cdd75b8bbce0096a13c5a0c00c944b8dca7cf" }
+agentux-gateway = { git = "https://github.com/agentux-os/agentux-core", rev = "8876e26547af079dc957c8039260001df68838a5" }
+agentux-store = { git = "https://github.com/agentux-os/agentux-core", rev = "8876e26547af079dc957c8039260001df68838a5" }
+agentuxd = { git = "https://github.com/agentux-os/agentux-core", rev = "8876e26547af079dc957c8039260001df68838a5" }
 tempfile = "3"
 # Contract tests against agentux-protocol's schemas (auxp::schemas).
 jsonschema = { version = "0.30", default-features = false }
