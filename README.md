@@ -212,7 +212,8 @@ cargo test --test end_to_end
    action step finishes the mission.
 6. The event log holds every step (definition, run, node and approval events),
    each with its actor and `definitionVersion`, and the Office projection
-   shows the mission run and the node's run as completed.
+   shows the mission run and the node's run as completed, with the pull
+   request the node opened as the run's artifact.
 
 To try it by hand, run Command with demo tokens and Office against it:
 
@@ -428,8 +429,8 @@ cargo clippy --all-targets -- -D warnings
 The image the Quadlet runs, `ghcr.io/agentux-os/agentux-command`, is built
 from `Containerfile` for amd64 and arm64 by `.github/workflows/image.yml`:
 `:main` and `:sha-<12>` from `main`, `:X.Y.Z` and `:latest` from a `vX.Y.Z`
-tag that matches `Cargo.toml`. Locally: `podman build -t agentux-command -f Containerfile .`
-
+tag that matches `Cargo.toml`. Locally: `podman build -t agentux-command -f Containerfile .`
+
 **Releases.** A pull request bumps `version` in `Cargo.toml`, `Cargo.lock` and
 the image the Quadlet pins (`deploy/quadlet/agentux-command.container`); CI
 checks they agree. Pushing the matching `vX.Y.Z` tag publishes the image

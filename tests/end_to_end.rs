@@ -581,6 +581,14 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
         .find(|r| r["id"] == step["nodeRunId"])
         .expect("the node's run, as the node reported it");
     assert_eq!(node_run["status"], "completed");
+    // ...and what it produced: the node's pull request, as an artifact.
+    let artifact = projection["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["runId"] == step["nodeRunId"])
+        .unwrap_or_else(|| panic!("the run's pull request: {projection:#}"));
+    assert_eq!(artifact["kind"], "pull_request");
     assert_eq!(projection["nodes"][0]["id"], "org-node");
     let pending: Vec<&Value> = projection["approvals"]
         .as_array()
