@@ -57,6 +57,9 @@ jobs:
             exit 1
           fi
           podman run --rm --entrypoint curl "$IMAGE:build-${{ matrix.arch }}" --version > /dev/null
+          # AgentUX Office is in the image, where the server looks for it.
+          podman run --rm --entrypoint sh "$IMAGE:build-${{ matrix.arch }}" -c \
+            'test -f "$AGENTUX_COMMAND_OFFICE_DIR/index.html" && test -f "$AGENTUX_COMMAND_OFFICE_DIR/editor.html" && cat "$AGENTUX_COMMAND_OFFICE_DIR/VERSION"'
 
       - name: Push by architecture
         if: github.event_name != 'pull_request'

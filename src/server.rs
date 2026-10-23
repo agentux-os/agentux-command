@@ -58,6 +58,11 @@ struct Inner {
     sessions: Arc<dyn Sessions>,
     /// Sign-in with an OIDC provider, when configured.
     oidc: Option<Arc<Oidc>>,
+    /// AgentUX Office's files (an agentux-office bundle), served at
+    /// `/office/` on this origin, where operators' sessions are.
+    office_dir: Option<std::path::PathBuf>,
+    /// The organization Office shows an operator who may see several.
+    office_organization: String,
     /// Organization definitions and their audit log.
     definitions: Arc<dyn definitions::Store>,
     /// The database, when Command keeps its state in one: event delivery
@@ -116,6 +121,8 @@ impl Handler {
                 demo_tokens: true,
                 sessions: Arc::new(auth::MemorySessions::default()),
                 oidc: None,
+                office_dir: None,
+                office_organization: String::new(),
                 definitions: Arc::new(definitions::Memory::default()),
                 database: None,
                 changed: tokio::sync::Notify::new(),
@@ -183,6 +190,15 @@ impl Handler {
     }
 
     /// Signs operators in with an OIDC provider (`/v1/auth/login`).
+    /// Serves AgentUX Office from `dir` (an agentux-office bundle) at
+    /// `/office/`; `organization` is the one it shows operators who may see
+    /// several (their first otherwise).
+    pub fn with_office_dir(mut self, dir: std::path::PathBuf, organization: &str) -> Self {
+        self.inner.office_dir = Some(dir);
+        self.inner.office_organization = organization.to_string();
+        self
+    }
+
     pub fn with_oidc(mut self, provider: Oidc) -> Self {
         self.inner.oidc = Some(Arc::new(provider));
         self
@@ -258,6 +274,9 @@ impl Handler {
         }
         Router::new()
             .route("/healthz", get(healthz))
+            .route("/office", get(office_root))
+            .route("/office/", get(office_index))
+            .route("/office/{file}", get(office_file))
             .route("/livez", get(livez))
             .route("/readyz", get(healthz))
             .route("/v1/instance", get(instance))
@@ -2346,4 +2365,100 @@ async fn deliver(
             json!({"nodeId": node, "delivered": false, "error": e})
         }
     }
+}
+
+/// `/office` → `/office/`, so Office's relative paths resolve under it.
+async fn office_root(State(s): AppState) -> Response {
+    if s.office_dir.is_none() {
+        return error(StatusCode::NOT_FOUND, "Office is not served here");
+    }
+    (
+        StatusCode::PERMANENT_REDIRECT,
+        [(header::LOCATION, "/office/")],
+    )
+        .into_response()
+}
+
+async fn office_index(state: AppState, headers: HeaderMap) -> Response {
+    office_file(state, Path("index.html".to_string()), headers).await
+}
+
+/// One of Office's files, or its `config.js`, made for the operator asking:
+/// the organization to show and whether this server signs people in.
+async fn office_file(State(s): AppState, Path(file): Path<String>, headers: HeaderMap) -> Response {
+    let Some(dir) = &s.office_dir else {
+        return error(StatusCode::NOT_FOUND, "Office is not served here");
+    };
+    if file == "config.js" {
+        // Who is asking, if anyone: their organization, or the default one.
+        let organization = match s.operator(&headers).await {
+            Ok(operator) => match operator.organizations_with(auth::ORGANIZATION_READ) {
+                Some(orgs) if orgs.len() == 1 => orgs.into_iter().next().unwrap_or_default(),
+                Some(orgs)
+                    if !s.office_organization.is_empty()
+                        && orgs.contains(&s.office_organization) =>
+                {
+                    s.office_organization.clone()
+                }
+                Some(orgs) => orgs.into_iter().next().unwrap_or_default(),
+                None => s.office_organization.clone(),
+            },
+            Err(_) => s.office_organization.clone(),
+        };
+        let organization = if organization.is_empty() {
+            "org-demo".to_string()
+        } else {
+            organization
+        };
+        let config =
+            json!({"command": true, "organizationId": organization, "signIn": s.oidc.is_some()});
+        return office_reply(
+            "text/javascript; charset=utf-8",
+            format!("globalThis.AGENTUX_OFFICE_CONFIG = {config};\n").into_bytes(),
+        );
+    }
+    // Only plain file names from the bundle: nothing above it, no hidden files.
+    let safe = !file.is_empty()
+        && !file.starts_with('.')
+        && file
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "._-".contains(c));
+    let kind = match file.rsplit_once('.').map(|(_, ext)| ext) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("webp") => "image/webp",
+        Some("woff2") => "font/woff2",
+        _ => "",
+    };
+    if !safe || kind.is_empty() {
+        return error(StatusCode::NOT_FOUND, "not found");
+    }
+    match tokio::fs::read(dir.join(&file)).await {
+        Ok(body) => office_reply(kind, body),
+        Err(_) => error(StatusCode::NOT_FOUND, "not found"),
+    }
+}
+
+/// An Office file, with the headers a page served next to an API wants.
+fn office_reply(kind: &str, body: Vec<u8>) -> Response {
+    let mut response = (StatusCode::OK, body).into_response();
+    let headers = response.headers_mut();
+    let set = |headers: &mut HeaderMap, name: header::HeaderName, value: &str| {
+        if let Ok(value) = HeaderValue::from_str(value) {
+            headers.insert(name, value);
+        }
+    };
+    set(headers, header::CONTENT_TYPE, kind);
+    set(headers, header::CACHE_CONTROL, "no-cache");
+    set(headers, header::X_CONTENT_TYPE_OPTIONS, "nosniff");
+    set(headers, header::REFERRER_POLICY, "same-origin");
+    set(
+        headers,
+        header::CONTENT_SECURITY_POLICY,
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'",
+    );
+    response
 }

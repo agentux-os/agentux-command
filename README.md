@@ -355,6 +355,15 @@ assert lines[-1]["digest"] == prev
 
 ## Office projection
 
+**AgentUX Office is served at `/office/`** when `AGENTUX_COMMAND_OFFICE_DIR`
+points at an agentux-office bundle (the image ships one, pinned by version
+and checksum). On Command's own origin, Office uses the operator's session:
+an operator who is not signed in is offered Command's sign-in. Its
+`config.js` is made per request: the operator's organization (their only
+one, or `AGENTUX_COMMAND_OFFICE_ORGANIZATION` when they may see several) and
+whether sign-in is configured. Only the bundle's web files are served, with a
+strict content security policy.
+
 ```text
 GET  /v1/office/projection?organizationId=<org>      organization.read in <org>
 POST /v1/approvals/{approvalId}/resolve               approval.decide in the body's organization

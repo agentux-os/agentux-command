@@ -67,6 +67,19 @@ async fn run() -> Result<(), String> {
         eprintln!("AGENTUX_COMMAND_INSECURE_OPEN_NODES=1: nodes that never enrolled may report");
         handler = handler.with_open_nodes(true);
     }
+    // AgentUX Office at /office/, from an agentux-office bundle (the image
+    // ships one).
+    let office_dir = env("AGENTUX_COMMAND_OFFICE_DIR");
+    if !office_dir.is_empty() {
+        let dir = std::path::PathBuf::from(&office_dir);
+        if !dir.join("index.html").is_file() {
+            return Err(format!(
+                "AGENTUX_COMMAND_OFFICE_DIR {office_dir} has no index.html"
+            ));
+        }
+        eprintln!("AgentUX Office is served at /office/ from {office_dir}");
+        handler = handler.with_office_dir(dir, &env("AGENTUX_COMMAND_OFFICE_ORGANIZATION"));
+    }
     let public_url = env("AGENTUX_COMMAND_PUBLIC_URL");
     if !public_url.is_empty() {
         handler = handler.with_public_url(&public_url);
