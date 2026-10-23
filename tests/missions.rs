@@ -166,7 +166,7 @@ async fn a_mission_runs_its_agent_step_its_human_gate_and_its_action() {
     // The node's run ends: the gate asks a human.
     let run = w
         .engine
-        .node_event("acme", &step.node_run_id, "run.completed", "", &node)
+        .node_event("acme", &step.node_run_id, "", "run.completed", "", &node)
         .await
         .unwrap()
         .unwrap();
@@ -336,6 +336,7 @@ async fn runs_pause_resume_and_cancel_and_a_rejected_gate_fails_the_run() {
             .node_event(
                 "acme",
                 &run.steps["implement"].node_run_id,
+                "",
                 "run.completed",
                 "",
                 &node
@@ -385,6 +386,7 @@ async fn runs_pause_resume_and_cancel_and_a_rejected_gate_fails_the_run() {
         .node_event(
             "acme",
             &run.steps["implement"].node_run_id,
+            "",
             "run.completed",
             "",
             &node,
@@ -645,7 +647,7 @@ async fn a_step_the_node_holds_waits_for_someone_there() {
     assert_eq!(run.steps["implement"].node_run_id, "local-7");
     let run = w
         .engine
-        .node_event("acme", "local-7", "run.completed", "", &node)
+        .node_event("acme", "local-7", "", "run.completed", "", &node)
         .await
         .unwrap()
         .unwrap();

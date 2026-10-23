@@ -144,6 +144,7 @@ const ENVELOPE: &[&str] = &[
     "sequence",
     "correlationId",
     "causationId",
+    "definitionVersion",
 ];
 
 /// The node events the Office log takes: what runs, approvals, gates,
@@ -206,6 +207,7 @@ pub fn from_node_event(method: &str, params: &Value) -> Option<Event> {
         sequence: params.get("sequence").and_then(Value::as_i64).unwrap_or(0),
         correlation_id: text("correlationId"),
         causation_id: text("causationId"),
+        definition_version: text("definitionVersion"),
         data: Some(Value::Object(data)),
         ..Event::default()
     })
