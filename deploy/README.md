@@ -135,8 +135,8 @@ sizing follows event volume (see the growth report below) and node count.
 
 ### Office event growth report
 
-The event log is retained indefinitely; no automatic pruning or archival is
-enabled. Collect a read-only baseline from a trusted Linux build host using the
+The event log keeps every event unless retention is turned on (below).
+Collect a read-only baseline from a trusted Linux build host using the
 same architecture as the Command container:
 
 ```sh
