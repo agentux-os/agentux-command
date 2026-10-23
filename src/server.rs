@@ -1978,9 +1978,28 @@ impl missions::Nodes for NodesVia<'_> {
         ] {
             params.insert(key.into(), Value::String(value));
         }
-        match tokio::time::timeout(ENGINE_COMMAND_TIMEOUT, s.hub.send(node_id, method, params))
-            .await
-        {
+        let mut answer = tokio::time::timeout(
+            ENGINE_COMMAND_TIMEOUT,
+            s.hub.send(node_id, method, params.clone()),
+        )
+        .await;
+        // A connection that dropped mid-command: the node reconnects by
+        // itself, and the same commandId gets the same answer, so send it
+        // once more when it is back.
+        if matches!(answer, Ok(Err(SendError::Disconnected))) {
+            for _ in 0..50 {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                if s.hub.connected(node_id) {
+                    answer = tokio::time::timeout(
+                        ENGINE_COMMAND_TIMEOUT,
+                        s.hub.send(node_id, method, params),
+                    )
+                    .await;
+                    break;
+                }
+            }
+        }
+        match answer {
             Err(_) => Err(NodeError::Unreachable(format!(
                 "node {node_id} did not answer in time"
             ))),

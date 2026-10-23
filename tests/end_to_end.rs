@@ -444,8 +444,12 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     assert_eq!(status, StatusCode::CREATED, "{run}");
     let run_id = run["runId"].as_str().unwrap().to_string();
     assert_eq!(run["definitionVersion"], 1);
+    // Dispatched (a connection that drops meanwhile is retried).
+    let run = wait_for_run(&app, &run_id, "the agent step on the node", |r| {
+        r["steps"]["implement"]["status"] == "waiting"
+    })
+    .await;
     let step = &run["steps"]["implement"];
-    assert_eq!(step["status"], "waiting", "{run}");
     assert!(
         !step["nodeRunId"].as_str().unwrap_or_default().is_empty(),
         "the node's own run id is known: {run}"
