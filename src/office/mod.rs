@@ -13,6 +13,7 @@ use crate::now_rfc3339;
 mod growth;
 mod migrations;
 mod postgres;
+pub mod retention;
 
 pub use growth::{
     DetailedGrowth, GrowthReport, OrganizationGrowth, PartitionGrowth, collect_growth_report,

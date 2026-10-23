@@ -21,8 +21,9 @@ async fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("token") => token(&args[1..]).await,
         Some("check") => check().await,
+        Some("prune-events") => prune_events(&args[1..]).await,
         Some(other) => Err(format!(
-            "unknown command {other:?} (try: token issue, check)"
+            "unknown command {other:?} (try: token issue, check, prune-events)"
         )),
         None => run().await,
     };
@@ -76,6 +77,52 @@ async fn run() -> Result<(), String> {
             env("AGENTUX_COMMAND_OIDC_ISSUER")
         );
         handler = handler.with_oidc(provider);
+    }
+    // Event retention, when an operator turned it on: once a day, archive and
+    // prune what is older than the retention (ADR-free default: keep all).
+    let retention = env("AGENTUX_COMMAND_EVENT_RETENTION_DAYS");
+    if !retention.is_empty() {
+        let days: i64 = retention
+            .parse()
+            .map_err(|_| "AGENTUX_COMMAND_EVENT_RETENTION_DAYS is a number of days".to_string())?;
+        let archive = env("AGENTUX_COMMAND_EVENT_ARCHIVE_DIR");
+        if archive.is_empty() {
+            return Err("AGENTUX_COMMAND_EVENT_RETENTION_DAYS needs AGENTUX_COMMAND_EVENT_ARCHIVE_DIR: pruned events are archived first".into());
+        }
+        if days < agentux_command::office::retention::MINIMUM_RETENTION_DAYS {
+            return Err(format!(
+                "AGENTUX_COMMAND_EVENT_RETENTION_DAYS must be at least {}",
+                agentux_command::office::retention::MINIMUM_RETENTION_DAYS
+            ));
+        }
+        let pool = agentux_command::office::open_postgres(&database_url)
+            .await
+            .map_err(|e| e.to_string())?;
+        eprintln!("events older than {days} days are archived to {archive} and pruned daily");
+        tokio::spawn(async move {
+            loop {
+                let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+                match agentux_command::office::retention::prune(
+                    &pool,
+                    cutoff,
+                    std::path::Path::new(&archive),
+                    false,
+                )
+                .await
+                {
+                    Ok(report) => {
+                        let events: u64 = report.iter().map(|r| r.events).sum();
+                        if events > 0 {
+                            eprintln!(
+                                "agentux-command: archived and pruned {events} events older than {cutoff}"
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!("agentux-command: event retention: {e}"),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(24 * 3600)).await;
+            }
+        });
     }
     // Events go to a webhook when one is set; the outbox is kept either way.
     let events_url = env("AGENTUX_COMMAND_EVENTS_URL");
@@ -183,6 +230,47 @@ async fn check() -> Result<(), String> {
             differing.join("; ")
         ))
     }
+}
+
+/// `prune-events --older-than-days N --archive DIR [--dry-run]`: archives
+/// and deletes the events every organization took more than N days ago
+/// (at least 30), keeping each projection verifiable through its checkpoint.
+/// Prints what it did as JSON. Nothing is pruned unless this runs.
+async fn prune_events(args: &[String]) -> Result<(), String> {
+    let usage = "usage: agentux-command prune-events --older-than-days N --archive DIR [--dry-run]";
+    let (mut days, mut archive, mut dry_run) = (None::<i64>, None::<String>, false);
+    let mut rest = args.iter();
+    while let Some(flag) = rest.next() {
+        match flag.as_str() {
+            "--older-than-days" => {
+                days = Some(rest.next().and_then(|v| v.parse().ok()).ok_or(usage)?)
+            }
+            "--archive" => archive = Some(rest.next().ok_or(usage)?.clone()),
+            "--dry-run" => dry_run = true,
+            _ => return Err(usage.into()),
+        }
+    }
+    let (Some(days), Some(archive)) = (days, archive) else {
+        return Err(usage.into());
+    };
+    let database_url = std::env::var("AGENTUX_COMMAND_DATABASE_URL").unwrap_or_default();
+    let pool = agentux_command::office::open_postgres(&database_url)
+        .await
+        .map_err(|e| e.to_string())?;
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(days);
+    let report = agentux_command::office::retention::prune(
+        &pool,
+        cutoff,
+        std::path::Path::new(&archive),
+        dry_run,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    println!(
+        "{}",
+        serde_json::json!({"cutoff": cutoff, "dryRun": dry_run, "organizations": report})
+    );
+    Ok(())
 }
 
 /// `token issue --organization ORG --name NAME --capabilities A,B [--days N]`:
