@@ -39,10 +39,17 @@ AGENTUX_COMMAND_DATABASE_URL=$url_a AGENTUX_COMMAND_ADDR=127.0.0.1:18080 \
     AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1 AGENTUX_COMMAND_INSECURE_OPEN_NODES=1 \
     "$bin" >"$work/server.log" 2>&1 &
 server=$!
-for _ in $(seq 60); do
-    curl --silent --fail http://127.0.0.1:18080/readyz >/dev/null && break
+ready=
+for _ in $(seq 90); do
+    curl --silent --fail http://127.0.0.1:18080/readyz >/dev/null && { ready=1; break; }
+    kill -0 "$server" 2>/dev/null || break
     sleep 1
 done
+if [ -z "$ready" ]; then
+    echo "Command did not become ready; its log:" >&2
+    cat "$work/server.log" >&2
+    exit 1
+fi
 api() { curl --silent --show-error --fail -H 'authorization: Bearer demo-leader' -H 'content-type: application/json' "$@"; }
 api -X POST http://127.0.0.1:18080/v1/organizations/acme/definitions -d '{
   "schema_version": "1.0", "organization": {"id": "acme", "name": "Acme"},
