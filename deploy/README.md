@@ -156,12 +156,50 @@ organization; it never emits event payloads, but the output contains tenant
 identifiers and should be handled as operationally sensitive data. Detailed
 aggregation can take longer on a large log.
 
-Capture reports periodically and compare total growth and partition skew. These
-measurements are observations, not a retention recommendation. Set alerts in the
-deployment's chosen monitoring system using its capacity and recovery objectives;
-this project does not prescribe a universal threshold. Do not delete or detach
-event partitions: replay and audit depend on the retained log. Define and review
-an audit/replay policy before any future archival or pruning workflow.
+Capture reports periodically and compare total growth and partition skew,
+and alert in your monitoring system before the volume's capacity.
+
+### Event retention
+
+**The policy: keep every event.** Nothing is ever deleted unless an operator
+turns retention on, and then only after archiving:
+
+```sh
+# Once, by hand (a dry run first):
+podman exec agentux-command agentux-command prune-events --older-than-days 365 --archive /var/lib/agentux-command/archive --dry-run
+podman exec agentux-command agentux-command prune-events --older-than-days 365 --archive /var/lib/agentux-command/archive
+
+# Or daily, from command.env (both are needed):
+AGENTUX_COMMAND_EVENT_RETENTION_DAYS=365
+AGENTUX_COMMAND_EVENT_ARCHIVE_DIR=/var/lib/agentux-command/archive
+```
+
+For each organization, in one transaction:
+
+1. Events taken before the cutoff are written to
+   `<archive>/<organization>/events-<from>-<to>.ndjson`, in the audit
+   export's tamper-evident format (each line chained by sha256, with a final
+   `digest`), and flushed to disk.
+2. They are folded into the organization's **checkpoint**: its projection as
+   of the last pruned event. `agentux-command check` and the projection
+   verification then replay the checkpoint plus the remaining events, so a
+   pruned log still verifies.
+3. Only then are they deleted.
+
+If the archive cannot be written, nothing is deleted. The cutoff must be at
+least 30 days back. A node resending a pruned event is still refused by its
+sequence cursor, which pruning never touches. The archives are listed in the
+`office_event_archives` table (path, range, count, digest). Back them up with
+the database and keep them as long as audits may ask. The log's replay API
+says where it starts after pruning (`prunedThrough`).
+
+**Why delete by time rather than drop time partitions.** The log is
+hash-partitioned by organization (even spread, cheap per-organization
+replay). Pruning deletes in batches by `received_at` under each
+organization's projection lock, with no partitions to provision ahead, no
+late-event edge at a partition boundary, and the same ordering guarantees as
+appends. If deletion ever becomes the bottleneck, time sub-partitions can be
+added behind the same `prune-events` without changing the policy.
 
 Command applies embedded, versioned PostgreSQL migrations at startup. Event
 append, per-node cursor advancement and projection updates share a transaction;

@@ -738,3 +738,123 @@ async fn mission_runs_live_in_the_database_and_refuse_stale_writes() {
     assert!(restarted.active(Some("acme")).await.unwrap().is_empty());
     assert_eq!(restarted.list("acme").await.unwrap().len(), 1);
 }
+
+#[tokio::test]
+async fn old_events_are_archived_then_pruned_and_the_projection_still_verifies() {
+    use agentux_command::office::retention;
+    let Some((store, pool, ..)) = store().await else {
+        return;
+    };
+    for (id, org, sequence) in [
+        ("a1", "org-a", 1),
+        ("a2", "org-a", 2),
+        ("a3", "org-a", 3),
+        ("b1", "org-b", 1),
+    ] {
+        store.apply_event(event(id, org, sequence)).await.unwrap();
+    }
+    let client = pool.get().await.unwrap();
+    // Taken two months ago; a4 is recent.
+    client
+        .execute(
+            "UPDATE office_events SET received_at = now() - interval '60 days'",
+            &[],
+        )
+        .await
+        .unwrap();
+    store.apply_event(event("a4", "org-a", 4)).await.unwrap();
+    let count = |org: &'static str| {
+        let client = &client;
+        async move {
+            client
+                .query_one(
+                    "SELECT count(*) FROM office_events WHERE organization_id = $1",
+                    &[&org],
+                )
+                .await
+                .unwrap()
+                .get::<_, i64>(0)
+        }
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let cutoff = chrono::Utc::now() - chrono::Duration::days(31);
+
+    // Too recent a cutoff is refused; a dry run only counts.
+    assert!(matches!(
+        retention::prune(
+            &pool,
+            chrono::Utc::now() - chrono::Duration::days(5),
+            dir.path(),
+            false
+        )
+        .await,
+        Err(office::Error::Invalid(_))
+    ));
+    let dry = retention::prune(&pool, cutoff, dir.path(), true)
+        .await
+        .unwrap();
+    assert_eq!(dry.iter().map(|p| p.events).sum::<u64>(), 4);
+    assert_eq!((count("org-a").await, count("org-b").await), (4, 1));
+
+    // An archive that cannot be written: nothing is deleted.
+    let blocked = dir.path().join("not-a-directory");
+    std::fs::write(&blocked, "x").unwrap();
+    assert!(
+        retention::prune(&pool, cutoff, &blocked, false)
+            .await
+            .is_err()
+    );
+    assert_eq!((count("org-a").await, count("org-b").await), (4, 1));
+
+    // Pruned: archived, checkpointed, deleted; the recent one stays.
+    let report = retention::prune(&pool, cutoff, dir.path(), false)
+        .await
+        .unwrap();
+    let a = report
+        .iter()
+        .find(|p| p.organization_id == "org-a")
+        .unwrap();
+    assert_eq!(a.events, 3);
+    assert_eq!((count("org-a").await, count("org-b").await), (1, 0));
+    store.verify_projection("org-a").await.unwrap();
+    store.verify_projection("org-b").await.unwrap();
+    let projection = store.get_projection("org-a").await.unwrap().unwrap();
+    assert_eq!(projection.last_event_id, "a4");
+
+    // The archive is complete and its chain holds.
+    let text = std::fs::read_to_string(a.archive.as_ref().unwrap()).unwrap();
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 4, "three events and the summary");
+    let mut prev = String::new();
+    for line in &lines[..3] {
+        let mut record = line.clone();
+        let hash = record.as_object_mut().unwrap().remove("hash").unwrap();
+        assert_eq!(
+            hash,
+            agentux_command::server::chain_hash(&prev, &record).as_str()
+        );
+        prev = hash.as_str().unwrap().to_string();
+    }
+    assert_eq!(lines[3]["digest"], prev.as_str());
+    assert_eq!(a.digest.as_deref(), Some(prev.as_str()));
+    let archived: i64 = client
+        .query_one("SELECT sum(events)::bigint FROM office_event_archives", &[])
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(archived, 4);
+
+    // A node resending a pruned event is still refused by its cursor.
+    match store.apply_event(event("a2", "org-a", 2)).await {
+        Err(office::Error::Conflict(c)) => assert_eq!(c.code, "stale_version"),
+        other => panic!("expected a stale cursor, got {other:?}"),
+    }
+    // Pruning again finds nothing more to do.
+    let again = retention::prune(&pool, cutoff, dir.path(), false)
+        .await
+        .unwrap();
+    assert_eq!(again.iter().map(|p| p.events).sum::<u64>(), 0);
+}

@@ -87,19 +87,22 @@ impl PostgresStore {
         Self { pool }
     }
 
-    /// Rebuilds an organization's projection from its event log and checks
-    /// it matches the stored one.
+    /// Rebuilds an organization's projection from its event log (from its
+    /// checkpoint, when events were pruned) and checks it matches the stored
+    /// one.
     pub async fn verify_projection(&self, organization_id: &str) -> Result<(), Error> {
         let stored = self
             .get_projection(organization_id)
             .await?
             .ok_or_else(|| Error::conflict("not_found", "projection not found"))?;
-        let mut rebuilt = empty_projection(organization_id);
         let client = self.pool.get().await?;
+        let (mut rebuilt, after) = super::retention::checkpoint(&client, organization_id)
+            .await?
+            .unwrap_or_else(|| (empty_projection(organization_id), 0));
         let rows = client
             .query(
-                "SELECT payload FROM office_events WHERE organization_id=$1 ORDER BY ingest_id",
-                &[&organization_id],
+                "SELECT payload FROM office_events WHERE organization_id=$1 AND ingest_id > $2 ORDER BY ingest_id",
+                &[&organization_id, &after],
             )
             .await
             .map_err(storage("read event log for replay"))?;

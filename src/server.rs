@@ -1821,10 +1821,15 @@ async fn organization_events(
     match s.office.events(&org, &replay).await {
         Ok(events) => {
             let next = events.last().map_or(replay.after, |e| e.cursor);
-            reply(
-                StatusCode::OK,
-                json!({"organizationId": org, "events": events, "next": next}),
-            )
+            let mut body = json!({"organizationId": org, "events": events, "next": next});
+            // Pruned events are in archives: the log here starts after them.
+            if let Some(pool) = &s.database
+                && let Ok(client) = pool.get().await
+                && let Ok(Some((_, last))) = office::retention::checkpoint(&client, &org).await
+            {
+                body["prunedThrough"] = json!(last);
+            }
+            reply(StatusCode::OK, body)
         }
         Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "event log unavailable"),
     }
