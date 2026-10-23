@@ -46,6 +46,8 @@ fn definition(org: &str) -> Value {
 #[derive(Default)]
 struct Scripted {
     online: Mutex<bool>,
+    /// The node's policy holds run.start for someone there.
+    hold: Mutex<bool>,
     refuse: Mutex<Option<String>>,
     snapshot: Mutex<Value>,
     sent: Mutex<Vec<(String, Map<String, Value>)>>,
@@ -90,6 +92,9 @@ impl Nodes for Scripted {
             .push((method.to_string(), params.clone()));
         if let Some(why) = self.refuse.lock().unwrap().clone() {
             return Err(NodeError::Refused(why));
+        }
+        if method == "run.start" && *self.hold.lock().unwrap() {
+            return Err(NodeError::Held("awaiting_local_confirmation".into()));
         }
         Ok(match method {
             "run.start" => json!({"id": format!("node-{}", params["commandId"].as_str().unwrap())}),
@@ -600,4 +605,79 @@ async fn a_mission_completes_through_the_api_with_a_node_and_a_human() {
         .cloned()
         .unwrap();
     assert_eq!(shown["status"], "completed");
+}
+
+#[tokio::test]
+async fn a_step_the_node_holds_waits_for_someone_there() {
+    let w = world().await;
+    let node = Scripted::online();
+    *node.hold.lock().unwrap() = true;
+    let run = w
+        .engine
+        .start("acme", input(), &ana(), &node)
+        .await
+        .unwrap();
+    assert_eq!(run.status, "waiting");
+    assert_eq!(run.steps["implement"].status, "held");
+    assert!(run.error.contains("to confirm"), "{}", run.error);
+    let command = run.steps["implement"].command_id.clone();
+    assert_eq!(
+        w.engine.tick(&node).await,
+        0,
+        "nothing to do until the node answers"
+    );
+
+    // Someone at the node accepted: the gateway's answer names its run.
+    let run = w
+        .engine
+        .command_completed(
+            "acme",
+            &command,
+            true,
+            &json!({"localRunId": "local-7", "run": {"id": "local-7"}}),
+            "",
+            &node,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, "running");
+    assert_eq!(run.steps["implement"].node_run_id, "local-7");
+    let run = w
+        .engine
+        .node_event("acme", "local-7", "run.completed", "", &node)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.step, "review");
+
+    // Rejected at the node: the step fails, and resuming asks again.
+    let held = w
+        .engine
+        .start("acme", input(), &ana(), &node)
+        .await
+        .unwrap();
+    let command = held.steps["implement"].command_id.clone();
+    let run = w
+        .engine
+        .command_completed(
+            "acme",
+            &command,
+            false,
+            &Value::Null,
+            "rejected at the node",
+            &node,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.status, "failed");
+    assert!(run.error.contains("rejected at the node"), "{}", run.error);
+    assert!(
+        w.engine
+            .command_completed("acme", "someone-else", true, &Value::Null, "", &node)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }

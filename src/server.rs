@@ -549,23 +549,37 @@ impl Inner {
             event.node_id.clone(),
             event.sequence,
         );
+        let data = event.data.clone().unwrap_or(Value::Null);
         let (node_run, error) = (
             event.run_id.clone(),
-            event
-                .data
-                .as_ref()
-                .and_then(|d| d["error"].as_str())
+            data["error"]
+                .as_str()
+                .or_else(|| data["error"]["message"].as_str())
                 .unwrap_or_default()
                 .to_string(),
         );
         match self.office.apply_event(event).await {
             Ok(()) => {
                 self.changed.notify_waiters();
-                if let Err(e) = self
-                    .engine()
-                    .node_event(&org, &node_run, method, &error, &NodesVia(self))
-                    .await
-                {
+                let engine = self.engine();
+                let nodes = NodesVia(self);
+                let moved = if method == "command.completed" {
+                    engine
+                        .command_completed(
+                            &org,
+                            data["commandId"].as_str().unwrap_or_default(),
+                            data["ok"].as_bool().unwrap_or(false),
+                            &data["result"],
+                            &error,
+                            &nodes,
+                        )
+                        .await
+                } else {
+                    engine
+                        .node_event(&org, &node_run, method, &error, &nodes)
+                        .await
+                };
+                if let Err(e) = moved {
                     eprintln!("agentux-command: missions: {e}");
                 }
             }
@@ -1254,6 +1268,26 @@ async fn resolve_approval(
     if !operator.can(&request.organization_id, auth::APPROVAL_DECIDE) {
         return forbidden(auth::APPROVAL_DECIDE, &request.organization_id);
     }
+    // A node's own approval (a tool call, a plan) goes back to that node.
+    let node_approval = s
+        .office
+        .get_projection(&org)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|p| {
+            p.approvals
+                .into_iter()
+                .find(|a| a.get("id").and_then(Value::as_str) == Some(approval_id.as_str()))
+        })
+        .filter(|a| {
+            a.get("requestId").is_some()
+                && a.get("nodeId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|n| !n.starts_with("command"))
+        });
+    let reason = request.reason.clone();
+    let key = request.idempotency_key.clone();
     let resolved = s.office.resolve_approval(&approval_id, request).await;
     if let Ok(response) = &resolved {
         if !response.idempotent_replay
@@ -1266,10 +1300,15 @@ async fn resolve_approval(
         s.changed.notify_waiters();
     }
     match resolved {
-        Ok(response) => reply(
-            StatusCode::OK,
-            serde_json::to_value(response).unwrap_or_default(),
-        ),
+        Ok(response) => {
+            let mut body = serde_json::to_value(&response).unwrap_or_default();
+            if let Some(approval) = node_approval
+                && !response.idempotent_replay
+            {
+                body["delivery"] = deliver(&s, &approval, &decision, &reason, &key).await;
+            }
+            reply(StatusCode::OK, body)
+        }
         Err(office::Error::Conflict(conflict)) => reply(
             StatusCode::CONFLICT,
             json!({"ok": false, "conflict": conflict}),
@@ -1947,6 +1986,7 @@ impl missions::Nodes for NodesVia<'_> {
             ))),
             Ok(Err(e)) => Err(NodeError::Unreachable(format!("node {node_id}: {e}"))),
             Ok(Ok(answer)) => match answer.error {
+                Some(e) if e.code == auxp::codes::HELD => Err(NodeError::Held(e.message)),
                 Some(e) => Err(NodeError::Refused(e.message)),
                 None => Ok(answer.result.unwrap_or(Value::Null)),
             },
@@ -2234,5 +2274,51 @@ async fn review_definition(
             definition_reply(StatusCode::OK, &definition)
         }
         Err(e) => definition_error(e),
+    }
+}
+
+/// Sends a decision on a node's approval to that node (`request.resolve`):
+/// what the delivery came to, for the decider.
+async fn deliver(
+    s: &Inner,
+    approval: &Map<String, Value>,
+    decision: &str,
+    reason: &str,
+    key: &str,
+) -> Value {
+    use missions::{NodeError, Nodes};
+    let text = |k: &str| {
+        approval
+            .get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string()
+    };
+    let node = text("nodeId");
+    let mut params = Map::new();
+    for (k, v) in [
+        ("commandId", format!("resolve-{}-{key}", text("id"))),
+        ("runId", text("runId")),
+        ("requestId", text("requestId")),
+        (
+            "resolution",
+            if decision == "approved" {
+                "approve"
+            } else {
+                "deny"
+            }
+            .to_string(),
+        ),
+    ] {
+        params.insert(k.into(), Value::String(v));
+    }
+    if !reason.is_empty() {
+        params.insert("answer".into(), Value::String(reason.into()));
+    }
+    match NodesVia(s).command(&node, "request.resolve", params).await {
+        Ok(_) => json!({"nodeId": node, "delivered": true}),
+        Err(NodeError::Unreachable(e) | NodeError::Held(e) | NodeError::Refused(e)) => {
+            json!({"nodeId": node, "delivered": false, "error": e})
+        }
     }
 }

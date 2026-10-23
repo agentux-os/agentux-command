@@ -62,7 +62,8 @@ pub struct Input {
 #[serde(rename_all = "camelCase", default)]
 pub struct Step {
     pub kind: String,
-    /// `dispatching`, `waiting`, `done`, `failed` or `rejected`.
+    /// `dispatching`, `held` (at the node, for someone to confirm),
+    /// `waiting`, `done`, `failed` or `rejected`.
     pub status: String,
     pub attempt: i64,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -314,6 +315,9 @@ impl Store for Postgres {
 pub enum NodeError {
     /// Not connected, or it went away: try again later.
     Unreachable(String),
+    /// Its policy holds the command for someone at the node to confirm; the
+    /// node reports the outcome later (`command.completed`).
+    Held(String),
     /// It answered with an error (its policy, or the command failed).
     Refused(String),
 }
@@ -585,6 +589,10 @@ impl Engine {
         nodes: &dyn Nodes,
     ) -> Result<Run, Error> {
         let now = Utc::now();
+        if state.status == "held" {
+            // The node answers with command.completed once someone decides.
+            return Ok(run);
+        }
         if state.status == "waiting" {
             if run.run_at.is_some_and(|at| at > now) {
                 return Ok(run);
@@ -672,11 +680,7 @@ impl Engine {
             Ok(result) => {
                 state.status = "waiting".into();
                 state.node_id = node;
-                state.node_run_id = result["id"]
-                    .as_str()
-                    .or_else(|| result["runId"].as_str())
-                    .unwrap_or_default()
-                    .to_string();
+                state.node_run_id = node_run_id(&result);
                 run.steps.insert(run.step.clone(), state);
                 run.status = RUNNING.into();
                 run.error = String::new();
@@ -684,6 +688,16 @@ impl Engine {
                 self.commit(run, "mission.run.dispatched", None).await
             }
             Err(NodeError::Unreachable(why)) => self.wait_for_node(run, &why).await,
+            Err(NodeError::Held(why)) => {
+                state.status = "held".into();
+                state.node_id = node.clone();
+                run.steps.insert(run.step.clone(), state);
+                run.status = WAITING.into();
+                run.error =
+                    format!("waiting for someone at node {node} to confirm the step ({why})");
+                run.run_at = None;
+                self.commit(run, "mission.run.held", None).await
+            }
             Err(NodeError::Refused(why)) => {
                 state.status = "failed".into();
                 state.error = format!("node {node} refused the step: {why}");
@@ -887,6 +901,55 @@ impl Engine {
         self.advance(run, nodes).await.map(Some)
     }
 
+    /// A command the node held was decided there (`command.completed`): the
+    /// held step starts, or fails if it was rejected or did not start.
+    pub async fn command_completed(
+        &self,
+        org: &str,
+        command_id: &str,
+        ok: bool,
+        result: &Value,
+        error: &str,
+        nodes: &dyn Nodes,
+    ) -> Result<Option<Run>, Error> {
+        if command_id.is_empty() {
+            return Ok(None);
+        }
+        let run = self.store.active(Some(org)).await?.into_iter().find(|r| {
+            r.steps
+                .get(&r.step)
+                .is_some_and(|s| s.status == "held" && s.command_id == command_id)
+        });
+        let Some(mut run) = run else {
+            return Ok(None);
+        };
+        let step = run.step.clone();
+        let state = run.steps.get_mut(&step).expect("the held step");
+        let now = Utc::now();
+        let run_id = node_run_id(result);
+        if ok && !run_id.is_empty() {
+            state.status = "waiting".into();
+            state.node_run_id = run_id;
+            run.status = RUNNING.into();
+            run.error = String::new();
+            run.run_at = Some(now + Duration::seconds(RECONCILE_AFTER));
+            return self
+                .commit(run, "mission.run.dispatched", None)
+                .await
+                .map(Some);
+        }
+        state.status = "failed".into();
+        state.finished_at = Some(now);
+        state.error = if error.is_empty() {
+            format!("node {} did not start the step", state.node_id)
+        } else {
+            format!("node {}: {error}", state.node_id)
+        };
+        run.status = RUNNING.into();
+        let run = self.commit(run, "mission.run.step_failed", None).await?;
+        self.advance(run, nodes).await.map(Some)
+    }
+
     /// Pauses, resumes or cancels a run. Resuming a failed run retries its
     /// step.
     pub async fn control(
@@ -973,7 +1036,8 @@ impl Engine {
             let idle_gate = run
                 .steps
                 .get(&run.step)
-                .is_some_and(|s| s.kind == "gate" && s.status == "waiting");
+                // Gates wait for people, held steps for someone at the node.
+                .is_some_and(|s| (s.kind == "gate" && s.status == "waiting") || s.status == "held");
             if !due || idle_gate {
                 continue;
             }
@@ -985,4 +1049,19 @@ impl Engine {
         }
         moved
     }
+}
+
+/// The node's own id for a run it started: `run.start` answers
+/// `{"localRunId", "run": {"id", ...}}` (agentux-core's gateway).
+fn node_run_id(result: &Value) -> String {
+    [
+        &result["localRunId"],
+        &result["run"]["id"],
+        &result["id"],
+        &result["runId"],
+    ]
+    .iter()
+    .find_map(|v| v.as_str())
+    .unwrap_or_default()
+    .to_string()
 }

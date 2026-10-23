@@ -191,6 +191,10 @@ pub fn from_node_event(method: &str, params: &Value) -> Option<Event> {
         {
             data.insert("action".into(), kind);
         }
+        // The node that asked: a decision goes back to it (request.resolve).
+        if let Some(node) = params.get("nodeId").cloned() {
+            data.insert("nodeId".into(), node);
+        }
     }
     Some(Event {
         event_id: text("eventId"),
@@ -431,6 +435,65 @@ impl Store {
     fn lock(&self) -> MutexGuard<'_, MemoryState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    /// The decision itself, under the lock: the response, the approval's run,
+    /// and whether it is a replay.
+    fn decide(
+        &self,
+        approval_id: &str,
+        request: &ResolutionRequest,
+    ) -> Result<(ResolutionResponse, Option<String>), Error> {
+        let mut state = self.lock();
+        let key = (
+            request.organization_id.clone(),
+            approval_id.to_string(),
+            request.idempotency_key.clone(),
+        );
+        if let Some(previous) = state.decisions.get(&key) {
+            return Ok((
+                ResolutionResponse {
+                    idempotent_replay: true,
+                    ..previous.clone()
+                },
+                None,
+            ));
+        }
+        let approval_key = (request.organization_id.clone(), approval_id.to_string());
+        match state.approvals.get(&approval_key).map(String::as_str) {
+            None => return Err(Error::conflict("not_found", "approval not found")),
+            Some("pending") => {}
+            Some(_) => {
+                return Err(Error::conflict(
+                    "already_decided",
+                    "approval already decided",
+                ));
+            }
+        }
+        let response = ResolutionResponse {
+            ok: true,
+            organization_id: request.organization_id.clone(),
+            approval_id: approval_id.to_string(),
+            decision: request.decision.clone(),
+            idempotency_key: request.idempotency_key.clone(),
+            idempotent_replay: false,
+        };
+        state.decisions.insert(key, response.clone());
+        state
+            .approvals
+            .insert(approval_key, request.decision.clone());
+        let run_id = state
+            .projections
+            .get(&request.organization_id)
+            .and_then(|p| {
+                p.approvals
+                    .iter()
+                    .find(|a| a.get("id").and_then(Value::as_str) == Some(approval_id))
+            })
+            .and_then(|a| a.get("runId").and_then(Value::as_str))
+            .unwrap_or_default()
+            .to_string();
+        Ok((response, Some(run_id)))
+    }
 }
 
 #[async_trait]
@@ -523,48 +586,38 @@ impl OfficeRepository for Store {
         request: ResolutionRequest,
     ) -> Result<ResolutionResponse, Error> {
         validate_resolution(&request)?;
-        let mut state = self.lock();
-        let key = (
-            request.organization_id.clone(),
-            approval_id.to_string(),
-            request.idempotency_key.clone(),
-        );
-        if let Some(previous) = state.decisions.get(&key) {
-            return Ok(ResolutionResponse {
-                idempotent_replay: true,
-                ..previous.clone()
-            });
-        }
-        let approval_key = (request.organization_id.clone(), approval_id.to_string());
-        match state.approvals.get(&approval_key).map(String::as_str) {
-            None => return Err(Error::conflict("not_found", "approval not found")),
-            Some("pending") => {}
-            Some(_) => {
-                return Err(Error::conflict(
-                    "already_decided",
-                    "approval already decided",
-                ));
-            }
-        }
-        let response = ResolutionResponse {
-            ok: true,
-            organization_id: request.organization_id.clone(),
-            approval_id: approval_id.to_string(),
-            decision: request.decision.clone(),
-            idempotency_key: request.idempotency_key.clone(),
-            idempotent_replay: false,
+        let (response, run_id) = self.decide(approval_id, &request)?;
+        let Some(run_id) = run_id else {
+            return Ok(response);
         };
-        state.decisions.insert(key, response.clone());
-        state
-            .approvals
-            .insert(approval_key, request.decision.clone());
-        if let Some(projection) = state.projections.get_mut(&request.organization_id) {
-            for approval in &mut projection.approvals {
-                if approval.get("id").and_then(Value::as_str) == Some(approval_id) {
-                    approval.insert("status".into(), Value::String(request.decision.clone()));
-                }
-            }
-        }
+        // In the log as in PostgreSQL: who decided, and how.
+        use sha2::{Digest, Sha256};
+        let identity = Sha256::digest(
+            format!(
+                "{}\0{approval_id}\0{}",
+                request.organization_id, request.idempotency_key
+            )
+            .as_bytes(),
+        );
+        let resolution = Event {
+            event_id: format!("approval-resolved-{}", hex::encode(identity)),
+            event_type: "approval.resolved".into(),
+            organization_id: request.organization_id.clone(),
+            node_id: "command.approvals".into(),
+            run_id: run_id.clone(),
+            occurred_at: now_rfc3339(),
+            correlation_id: if run_id.is_empty() {
+                approval_id.to_string()
+            } else {
+                run_id
+            },
+            actor: request.actor.clone(),
+            data: Some(
+                json!({"approvalId": approval_id, "decision": request.decision, "reason": request.reason, "idempotencyKey": request.idempotency_key}),
+            ),
+            ..Event::default()
+        };
+        self.apply_event(resolution).await?;
         Ok(response)
     }
 }

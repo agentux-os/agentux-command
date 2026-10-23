@@ -188,6 +188,46 @@ Two publications of the same draft: the second gets 409. Publishing records `org
 event log, and the Office projection takes the organization, its areas,
 missions and agents, and the definition version from it.
 
+## The whole workflow, end to end
+
+`tests/end_to_end.rs` runs an organization from definition to finished
+mission with nothing stubbed but the agents, and no model credentials. It
+needs Linux or macOS and git, and runs in CI on every change:
+
+```sh
+cargo test --test end_to_end
+```
+
+1. A leader drafts the organization. Validation catches a broken step, the
+   leader fixes it and publishes version 1.
+2. A node (agentux-core's gateway in front of an agentuxd with scripted
+   agents and a git project) enrolls with a token from this Command, pins it,
+   connects and advertises its capabilities.
+3. A mission run starts. Its agent step goes to the node as `run.start`.
+4. The node's own run asks to approve its plan. The approval appears in the
+   Office projection, a leader decides it, and the decision goes back to the
+   node (`request.resolve`).
+5. The node's run completes, and the mission's human-required gate asks for
+   approval. A service token is refused (403), a person approves, and the
+   action step finishes the mission.
+6. The event log holds every step (definition, run, node and approval events),
+   each with its actor and `definitionVersion`, and the Office projection
+   shows the mission run and the node's run as completed.
+
+To try it by hand, run Command with demo tokens and Office against it:
+
+```sh
+AGENTUX_COMMAND_DATABASE_URL=postgres://... AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1 cargo run
+# in agentux-apps:
+COMMAND_URL=http://127.0.0.1:8080 COMMAND_TOKEN=demo-leader COMMAND_ORGANIZATION=acme npm run serve
+```
+
+Then edit and publish the organization in Office's editor
+(`http://127.0.0.1:4173/editor.html`), enroll an AgentUX machine
+(`aux node enroll <token>`, with a token from `POST /v1/enrollment-tokens`),
+start a mission (`POST /v1/organizations/acme/runs`) and follow it on the
+floor.
+
 ## Missions
 
 A mission runs as its workflow from the organization's newest published
@@ -215,6 +255,9 @@ POST /v1/organizations/<org>/runs/<run>/cancel       node.command
   (a signed-in operator) with `approval.decide`; a service token gets 403.
   Rejected, the run fails; resumed, the gate asks again.
 - **action** steps are recorded as done (Command does not execute them).
+- **Held at the node**: a node's policy may hold `run.start` for someone there
+  to confirm (the default). The run waits (`held`) without retrying, and the
+  node's `command.completed` starts the step, or fails it if it was rejected.
 - **No node**: the run `waiting` with the reason, and it tries again every 30 s.
   **A node refusing** (its policy) or failing the step: the run `failed`,
   and resume retries the step as a new attempt.
