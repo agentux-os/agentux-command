@@ -8,7 +8,7 @@ After=agentux-command-postgres.service
 Wants=agentux-command-nats.service agentux-command-object-store.service
 
 [Container]
-Image=ghcr.io/agentux-os/agentux-command:0.1.1
+Image=ghcr.io/agentux-os/agentux-command:0.2.0
 ContainerName=agentux-command
 Network=agentux-command.network
 EnvironmentFile=/var/lib/agentux/command/command.env
