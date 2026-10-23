@@ -27,7 +27,9 @@ for name in a b; do
 done
 for name in a b; do
     for _ in $(seq 60); do
-        "$engine" exec "drill-pg-$name" pg_isready -U agentux -d agentux >/dev/null 2>&1 && break
+        # Over TCP: during initdb the image runs a socket-only server that
+        # pg_isready on the socket reports ready.
+        "$engine" exec "drill-pg-$name" pg_isready -h 127.0.0.1 -U agentux -d agentux >/dev/null 2>&1 && break
         sleep 1
     done
 done
