@@ -444,8 +444,12 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     assert_eq!(status, StatusCode::CREATED, "{run}");
     let run_id = run["runId"].as_str().unwrap().to_string();
     assert_eq!(run["definitionVersion"], 1);
+    // Dispatched (a connection that drops meanwhile is retried).
+    let run = wait_for_run(&app, &run_id, "the agent step on the node", |r| {
+        r["steps"]["implement"]["status"] == "waiting"
+    })
+    .await;
     let step = &run["steps"]["implement"];
-    assert_eq!(step["status"], "waiting", "{run}");
     assert!(
         !step["nodeRunId"].as_str().unwrap_or_default().is_empty(),
         "the node's own run id is known: {run}"
@@ -581,6 +585,14 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
         .find(|r| r["id"] == step["nodeRunId"])
         .expect("the node's run, as the node reported it");
     assert_eq!(node_run["status"], "completed");
+    // ...and what it produced: the node's pull request, as an artifact.
+    let artifact = projection["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["runId"] == step["nodeRunId"])
+        .unwrap_or_else(|| panic!("the run's pull request: {projection:#}"));
+    assert_eq!(artifact["kind"], "pull_request");
     assert_eq!(projection["nodes"][0]["id"], "org-node");
     let pending: Vec<&Value> = projection["approvals"]
         .as_array()

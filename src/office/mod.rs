@@ -785,6 +785,32 @@ pub(crate) fn apply_projection_event(
                 run.insert("nodeId".into(), Value::String(event.node_id.clone()));
             }
             run.insert("updatedAt".into(), Value::String(event.occurred_at.clone()));
+            // A run's pull request is its artifact (AUXP has artifact.available
+            // for others; nodes report pull requests on the run).
+            if let Some(Value::Object(pr)) = run.get("pullRequest").cloned() {
+                let uri = pr.get("url").and_then(Value::as_str).unwrap_or_default();
+                let number = pr.get("number").map(|n| n.to_string()).unwrap_or_default();
+                let mut artifact = Object::new();
+                let id = if uri.is_empty() {
+                    format!("pr-{}-{number}", run["id"].as_str().unwrap_or_default())
+                } else {
+                    uri.to_string()
+                };
+                artifact.insert("id".into(), Value::String(id));
+                artifact.insert("kind".into(), Value::String("pull_request".into()));
+                if !uri.is_empty() {
+                    artifact.insert("uri".into(), Value::String(uri.into()));
+                }
+                artifact.insert(
+                    "name".into(),
+                    Value::String(format!("Pull request #{number}")),
+                );
+                artifact.insert("runId".into(), run["id"].clone());
+                if !event.node_id.is_empty() {
+                    artifact.insert("nodeId".into(), Value::String(event.node_id.clone()));
+                }
+                upsert(&mut projection.artifacts, artifact);
+            }
             upsert(&mut projection.runs, run);
         }
     }
