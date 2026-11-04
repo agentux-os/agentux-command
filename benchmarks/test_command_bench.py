@@ -210,6 +210,7 @@ class BenchmarkTests(unittest.TestCase):
             report = bench.execute(config)
         self.assertEqual(report["instrumentation"]["target_process"]["status"], "unavailable")
         self.assertEqual(report["instrumentation"]["database"]["status"], "unavailable")
+        self.assertIn("cooperative", report["target"]["deadline_semantics"])
 
     def test_report_origin_does_not_include_credentials_or_paths(self):
         self.assertEqual(bench.safe_origin("https://operator:secret@example.test:8443/private"),

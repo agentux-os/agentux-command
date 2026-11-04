@@ -313,7 +313,8 @@ def execute(config, pid=None, database_url=None):
                          "topology": config.get("topology", "one host, one Command process, one PostgreSQL instance"),
                          "requests_per_scenario": config["requests"], "concurrency": config["concurrency"],
                          "timeout_seconds": config.get("timeout_seconds", 10),
-                         "max_duration_seconds": config.get("max_duration_seconds", 3600)},
+                         "max_duration_seconds": config.get("max_duration_seconds", 3600),
+                         "deadline_semantics": "cooperative: stops starting requests; in-flight socket operations may finish later"},
               "instrumentation": {
                   "target_process": {"status": "unavailable", "reason": "no Command PID was configured"},
                   "database": {"status": "unavailable", "reason": "no database URL environment variable was configured"},
