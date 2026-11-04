@@ -56,14 +56,8 @@ async fn the_projection_from_node_messages_follows_the_schema_per_organization()
     let send = |message: Value| {
         let app = app.clone();
         async move {
-            let (status, body) = call(
-                &app,
-                "POST",
-                "/v1/protocol/messages",
-                "",
-                Some(now(message)),
-            )
-            .await;
+            let (status, body) =
+                call(&app, "POST", "/v1/protocol/messages", "", Some(message)).await;
             assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         }
     };
@@ -79,8 +73,8 @@ async fn the_projection_from_node_messages_follows_the_schema_per_organization()
     .await;
     conforms(&demo);
 
-    send(hello("acme", "node-a")).await;
-    send(hello("beta", "node-b")).await;
+    send(now(hello("acme", "node-a"))).await;
+    send(now(hello("beta", "node-b"))).await;
     let messages = [
         event(
             "acme",
@@ -117,7 +111,8 @@ async fn the_projection_from_node_messages_follows_the_schema_per_organization()
             1,
             json!({"runId": "secret-run", "state": "running"}),
         ),
-    ];
+    ]
+    .map(now);
     for message in messages.clone() {
         send(message).await;
     }
