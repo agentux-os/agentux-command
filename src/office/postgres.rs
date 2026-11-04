@@ -70,7 +70,7 @@ pub async fn open_postgres(database_url: &str) -> Result<Pool, Error> {
     let mut client = pool
         .get()
         .await
-        .map_err(|e| Error::Storage(format!("connect to PostgreSQL: {e}")))?;
+        .map_err(|e| Error::Storage(format!("connect to PostgreSQL: {e:?}")))?;
     migrate(&mut client)
         .await
         .map_err(|e| Error::Storage(format!("migrate PostgreSQL database: {e}")))?;
