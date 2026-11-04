@@ -202,7 +202,7 @@ impl Handler {
     /// Enables `/metrics` for holders of a dedicated bearer token.
     pub fn with_metrics_token(mut self, token: &str) -> Result<Self, String> {
         let token = token.trim();
-        if !token.is_empty() && token.as_bytes().len() < 32 {
+        if !token.is_empty() && token.len() < 32 {
             return Err("AGENTUX_COMMAND_METRICS_TOKEN must contain at least 32 bytes".into());
         }
         self.inner.metrics_token = (!token.is_empty()).then(|| token.to_string());
