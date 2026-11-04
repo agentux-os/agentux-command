@@ -15,6 +15,9 @@ FROM docker.io/library/debian:bookworm-slim
 # AgentUX Office, served at /office/ (agentux-apps release, checked).
 ARG AGENTUX_OFFICE_VERSION=0.1.0
 ARG AGENTUX_OFFICE_SHA256=cd8103c327fb0bf029398960c3f9edbf9525dfd8a3f0ff83dc3fe241b2085696
+# AgentUX Command console, served at /console/ (agentux-apps release, checked).
+ARG AGENTUX_CONSOLE_VERSION=0.1.1
+ARG AGENTUX_CONSOLE_SHA256=d4fd26d3c572bdbed3497346883673f68a70b15c62bc89cebeb7e56cb28b4d96
 # curl is the Quadlet's health check (curl --fail http://localhost:8080/healthz).
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl \
@@ -27,11 +30,19 @@ RUN apt-get update \
     && mkdir -p /usr/share/agentux-command \
     && tar -xzf "/tmp/${office}" -C /usr/share/agentux-command --no-same-owner \
     && mv /usr/share/agentux-command/agentux-office /usr/share/agentux-command/office \
-    && rm -f "/tmp/${office}"
+    && rm -f "/tmp/${office}" \
+    && console="agentux-console-${AGENTUX_CONSOLE_VERSION}.tar.gz" \
+    && curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 \
+        "https://github.com/agentux-os/agentux-apps/releases/download/console-v${AGENTUX_CONSOLE_VERSION}/${console}" -o "/tmp/${console}" \
+    && echo "${AGENTUX_CONSOLE_SHA256}  /tmp/${console}" | sha256sum --check --strict \
+    && tar -xzf "/tmp/${console}" -C /usr/share/agentux-command --no-same-owner \
+    && mv /usr/share/agentux-command/agentux-console /usr/share/agentux-command/console \
+    && rm -f "/tmp/${console}"
 COPY --from=build /usr/local/bin/agentux-command /usr/local/bin/agentux-command-storage-report /usr/local/bin/
 USER agentux
 ENV AGENTUX_COMMAND_ADDR=:8080 \
-    AGENTUX_COMMAND_OFFICE_DIR=/usr/share/agentux-command/office
+    AGENTUX_COMMAND_OFFICE_DIR=/usr/share/agentux-command/office \
+    AGENTUX_COMMAND_CONSOLE_DIR=/usr/share/agentux-command/console
 EXPOSE 8080
 HEALTHCHECK --interval=10s --timeout=5s --retries=5 CMD curl --fail --silent http://localhost:8080/healthz || exit 1
 ENTRYPOINT ["/usr/local/bin/agentux-command"]

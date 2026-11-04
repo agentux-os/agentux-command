@@ -31,9 +31,9 @@ The OS profile manager creates `/var/lib/agentux/command`. An operator then:
    refused unless `AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1` (development only).
 
 For interactive web access, configure the OIDC issuer, client, and role map in
-`command.env.example`. Command serves Office at `/office/` on the same origin;
-when the image includes the released Console bundle and sets
-`AGENTUX_COMMAND_CONSOLE_DIR`, it also serves the fleet console at `/console/`.
+`command.env.example`. The published image includes the version-pinned Office
+and Console bundles and serves them at `/office/` and `/console/` on the same
+origin. Console 0.1.1 is pinned with its SHA-256 in the Command `Containerfile`.
 Each browser session is attributed to the signed-in operator and checked
 against that operator's organization capabilities; do not share a service
 token with web visitors.
