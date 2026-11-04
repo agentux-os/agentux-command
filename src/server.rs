@@ -63,6 +63,9 @@ struct Inner {
     office_dir: Option<std::path::PathBuf>,
     /// The organization Office shows an operator who may see several.
     office_organization: String,
+    /// AgentUX Command console's files (an agentux-console bundle), served at
+    /// `/console/` on this origin, where operators' sessions are.
+    console_dir: Option<std::path::PathBuf>,
     /// Organization definitions and their audit log.
     definitions: Arc<dyn definitions::Store>,
     /// The database, when Command keeps its state in one: event delivery
@@ -123,6 +126,7 @@ impl Handler {
                 oidc: None,
                 office_dir: None,
                 office_organization: String::new(),
+                console_dir: None,
                 definitions: Arc::new(definitions::Memory::default()),
                 database: None,
                 changed: tokio::sync::Notify::new(),
@@ -196,6 +200,12 @@ impl Handler {
     pub fn with_office_dir(mut self, dir: std::path::PathBuf, organization: &str) -> Self {
         self.inner.office_dir = Some(dir);
         self.inner.office_organization = organization.to_string();
+        self
+    }
+
+    /// Serves the Command console from a bundle at `/console/` on this origin.
+    pub fn with_console_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.inner.console_dir = Some(dir);
         self
     }
 
@@ -277,6 +287,9 @@ impl Handler {
             .route("/office", get(office_root))
             .route("/office/", get(office_index))
             .route("/office/{file}", get(office_file))
+            .route("/console", get(console_root))
+            .route("/console/", get(console_index))
+            .route("/console/{file}", get(console_file))
             .route("/livez", get(livez))
             .route("/readyz", get(healthz))
             .route("/v1/instance", get(instance))
@@ -2417,6 +2430,48 @@ async fn office_file(State(s): AppState, Path(file): Path<String>, headers: Head
             format!("globalThis.AGENTUX_OFFICE_CONFIG = {config};\n").into_bytes(),
         );
     }
+    bundle_asset(dir, &file).await
+}
+
+/// `/console` → `/console/`, so console assets resolve beside the page.
+async fn console_root(State(s): AppState) -> Response {
+    if s.console_dir.is_none() {
+        return error(StatusCode::NOT_FOUND, "Command console is not served here");
+    }
+    (
+        StatusCode::PERMANENT_REDIRECT,
+        [(header::LOCATION, "/console/")],
+    )
+        .into_response()
+}
+
+async fn console_index(state: AppState, headers: HeaderMap) -> Response {
+    console_file(state, Path("index.html".to_string()), headers).await
+}
+
+/// The console config contains public feature flags only; operator identity and
+/// authorization are resolved through the same-origin session API.
+async fn console_file(
+    State(s): AppState,
+    Path(file): Path<String>,
+    _headers: HeaderMap,
+) -> Response {
+    let Some(dir) = &s.console_dir else {
+        return error(StatusCode::NOT_FOUND, "Command console is not served here");
+    };
+    if file == "config.js" {
+        let config = json!({"command": true, "signIn": s.oidc.is_some()});
+        return office_reply(
+            "text/javascript; charset=utf-8",
+            format!("globalThis.AGENTUX_COMMAND_CONFIG = {config};\n").into_bytes(),
+        );
+    }
+    bundle_asset(dir, &file).await
+}
+
+/// A static asset from an app bundle: only plain, visible file names and
+/// supported web types are served.
+async fn bundle_asset(dir: &std::path::Path, file: &str) -> Response {
     // Only plain file names from the bundle: nothing above it, no hidden files.
     let safe = !file.is_empty()
         && !file.starts_with('.')
@@ -2436,13 +2491,13 @@ async fn office_file(State(s): AppState, Path(file): Path<String>, headers: Head
     if !safe || kind.is_empty() {
         return error(StatusCode::NOT_FOUND, "not found");
     }
-    match tokio::fs::read(dir.join(&file)).await {
+    match tokio::fs::read(dir.join(file)).await {
         Ok(body) => office_reply(kind, body),
         Err(_) => error(StatusCode::NOT_FOUND, "not found"),
     }
 }
 
-/// An Office file, with the headers a page served next to an API wants.
+/// A web app asset, with the headers a page served next to an API wants.
 fn office_reply(kind: &str, body: Vec<u8>) -> Response {
     let mut response = (StatusCode::OK, body).into_response();
     let headers = response.headers_mut();

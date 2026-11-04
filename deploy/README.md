@@ -18,7 +18,8 @@ The OS profile manager creates `/var/lib/agentux/command`. An operator then:
 4. pins the Command image by digest in a local drop-in or release update;
 5. runs `systemctl daemon-reload` and enables the units in dependency order;
 6. issues the first administrator's service token (shown once; keep it in the
-   operators' secret store):
+   operators' secret store). This token is for CLI and automation use; web
+   operators sign in separately through the configured OIDC provider:
 
    ```sh
    podman exec agentux-command agentux-command token issue \
@@ -28,6 +29,14 @@ The OS profile manager creates `/var/lib/agentux/command`. An operator then:
 
    Further tokens come from `POST /v1/service-tokens`. The demo tokens are
    refused unless `AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1` (development only).
+
+For interactive web access, configure the OIDC issuer, client, and role map in
+`command.env.example`. Command serves Office at `/office/` on the same origin;
+when the image includes the released Console bundle and sets
+`AGENTUX_COMMAND_CONSOLE_DIR`, it also serves the fleet console at `/console/`.
+Each browser session is attributed to the signed-in operator and checked
+against that operator's organization capabilities; do not share a service
+token with web visitors.
 
 Example secret setup (values must come from an operator-managed secret store):
 

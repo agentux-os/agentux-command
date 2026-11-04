@@ -80,6 +80,18 @@ async fn run() -> Result<(), String> {
         eprintln!("AgentUX Office is served at /office/ from {office_dir}");
         handler = handler.with_office_dir(dir, &env("AGENTUX_COMMAND_OFFICE_ORGANIZATION"));
     }
+    // AgentUX Command console at /console/ from a released bundle.
+    let console_dir = env("AGENTUX_COMMAND_CONSOLE_DIR");
+    if !console_dir.is_empty() {
+        let dir = std::path::PathBuf::from(&console_dir);
+        if !dir.join("index.html").is_file() {
+            return Err(format!(
+                "AGENTUX_COMMAND_CONSOLE_DIR {console_dir} has no index.html"
+            ));
+        }
+        eprintln!("AgentUX Command console is served at /console/ from {console_dir}");
+        handler = handler.with_console_dir(dir);
+    }
     let public_url = env("AGENTUX_COMMAND_PUBLIC_URL");
     if !public_url.is_empty() {
         handler = handler.with_public_url(&public_url);
