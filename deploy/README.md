@@ -300,10 +300,13 @@ never removed with a profile.
 The profile sets an initial target RPO of 24 hours (conditional on a successful
 daily off-host backup) and target RTO of 8 hours to restore `/readyz` and pass
 `agentux-command check`. Both are **UNQUALIFIED** until measured in the
-operator's environment. The repository's current scripts are manual; they do
-not schedule, encrypt, or copy backups off-host. The CI restore drill is not a
-production-sized recovery-time measurement. See the profile's [objectives and
-release qualification checklist](../docs/production-readiness.md#objectives-and-qualification-status).
+operator's environment. The Restic user-systemd timers above provide scheduled,
+encrypted off-host backups and recurring repository/restore checks when
+configured; they do not establish a production RPO/RTO until the operator
+measures copy age and restore duration. The manual `backup.sh` remains useful
+before upgrades. The CI restore drill is not a production-sized recovery-time
+measurement. See the profile's [objectives and release qualification
+checklist](../docs/production-readiness.md#objectives-and-qualification-status).
 
 The initial topology is one host, one Command process, and one PostgreSQL
 instance, with no automatic failover. The profile's 99.5% monthly readiness
@@ -318,8 +321,8 @@ Use the [event growth report](#office-event-growth-report) for observation;
 the measured envelope will be published through
 [#52](https://github.com/agentux-os/agentux-command/issues/52). Follow
 [#50](https://github.com/agentux-os/agentux-command/issues/50) for metrics and
-alerting, [#51](https://github.com/agentux-os/agentux-command/issues/51) for
-scheduled off-host backup and recurring restore verification,
+alerting; the scheduled off-host backup and recurring restore verification
+workflow was delivered in [#51](https://github.com/agentux-os/agentux-command/issues/51),
 [#54](https://github.com/agentux-os/agentux-command/issues/54) for staging
 release qualification, and [#55](https://github.com/agentux-os/agentux-command/issues/55)
 for the topology decision.

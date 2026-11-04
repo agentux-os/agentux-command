@@ -139,9 +139,9 @@ qualified**, not an assumed pass.
   report the achieved value and probe window. Until the observation period
   exists, availability remains unqualified.
 - [ ] Demonstrate a backup no older than 24 hours at recovery start, with an
-  encrypted off-host copy, and record the observed RPO. Until the automated
-  workflow and recurring verification in #51 are complete, the profile's RPO
-  target remains unqualified.
+  encrypted off-host copy, and record the observed RPO. The workflow was
+  delivered in #51; the profile's RPO target remains unqualified until the
+  operator configures it and records measured copy age.
 - [ ] Restore to a fresh or replacement database/host, pass `agentux-command
   check`, and record elapsed time against the 8-hour RTO target.
 - [ ] Confirm external TLS, OIDC, secret handling, persistent storage,

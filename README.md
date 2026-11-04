@@ -30,7 +30,7 @@ AgentUX nodes
   agentuxd · ACP · worktrees · approvals · technical execution
 ```
 
-Command must not manipulate a node's SQLite database or local Unix socket directly. The future node gateway will expose a versioned, authenticated contract for registration, capabilities, commands and events.
+Command must not manipulate a node's SQLite database or local Unix socket directly. The node gateway is implemented in agentux-core and connects through the versioned, authenticated AUXP contract for enrollment, capabilities, commands and events.
 
 That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/agentux-protocol).
 
@@ -40,16 +40,22 @@ That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/age
 - PostgreSQL for remote product state, and for durable organization-level
   workflows: explicit state machines with a transactional outbox
   ([ADR 0020](https://github.com/agentux-os/agentux/blob/main/docs/adr/0020-command-workflows-without-temporal.md))
-- NATS for delivery only: waking workers, live views, routing commands between replicas
-- AgentUX node gateway for remote execution
+- AUXP over HTTP and WebSocket for authenticated node enrollment, telemetry and remote commands
+- The deployment bundle also includes NATS and an object store for future integrations; the current Command service does not depend on them
+
+## Implemented capabilities
+
+- Versioned organization definitions with validation, review, publication and audit history
+- Durable mission runs with agent, approval-gate and recorded-action steps; pause, resume, cancel and recovery after restart
+- Node enrollment, approval/revocation, health and harness telemetry, plus authenticated remote commands
+- Organization-scoped event history, replay, live streams, audit export and Office projections for runs, approvals, artifacts and node status
+- OIDC operator sessions and capability-checked Console and Office access
 
 ## Planned capabilities
 
-- Organizations, offices, missions and agent rosters
-- Autonomy policies and human approval gates
-- Node registration, health and capability-aware placement
-- Aggregated run events, incidents, cost and telemetry
-- Remote leadership views and intervention controls
+- **Capability-aware placement:** runs may name a node; otherwise Command currently picks the lexicographically first online, connected node in the organization. It does not yet match mission requirements to advertised node capabilities. See [#67](https://github.com/agentux-os/agentux-command/issues/67).
+- **Aggregated incident and cost analytics:** node events can carry run-level cost and incident data, but Command does not yet provide cross-run or organization-level analytics and reporting. See [#68](https://github.com/agentux-os/agentux-command/issues/68).
+- **Scheduled and recurring missions** ([#58](https://github.com/agentux-os/agentux-command/issues/58)), **approval decisions through messaging channels** ([#59](https://github.com/agentux-os/agentux-command/issues/59)), and **organization-shared tool catalogs and policies** ([#57](https://github.com/agentux-os/agentux-command/issues/57)).
 
 ## Non-goals
 
@@ -60,7 +66,7 @@ That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/age
 
 ## Status
 
-The repository is under active integration development. The current gateway surface is always represented by `main`; versioned remote compatibility belongs to [AgentUX Protocol](https://github.com/agentux-os/agentux-protocol), so this README does not carry release-specific version numbers.
+The implementation on `main` is the source of truth for current Command and gateway behavior. Versioned remote compatibility belongs to [AgentUX Protocol](https://github.com/agentux-os/agentux-protocol); this README does not assign release-specific protocol versions. Production availability, capacity and recovery remain unqualified until the evidence in the [production profile](docs/production-readiness.md) is collected.
 
 ## Production profile
 
@@ -76,7 +82,7 @@ production availability or capacity claim.
 
 AgentUX nodes report themselves with the AgentUX node gateway (`aux node enroll`, then `aux node gateway`, in agentux-core). They POST AUXP messages to `/v1/protocol/messages`: `node.hello`, `node.heartbeat`, and events (`harness.status`, `harness.limits_changed`, `approval.requested`, `run.updated`, `run.completed`, `run.failed`, ...). `GET /v1/nodes` (operators with `organization.read`) lists each node with its version, last heartbeat and capacity, its agent CLIs (installed, signed in, version, spend, plan usage), its usage limits, its latest run states and its pending approvals.
 
-Events are applied once per node sequence (duplicates are ignored), and a node Command does not know yet (after a restart) is registered by its first event. The registry is kept in PostgreSQL behind every change and read back at startup, so a restarted Command still knows its nodes; each node is listed with a `presence` (`online` when heard from within 90 seconds, `degraded` within 5 minutes, else `offline`). With `AGENTUX_COMMAND_NODE_TOKENS=node-1=token,...` each node must send its own `Authorization: Bearer` token; without it, protocol messages are not authenticated (development only). Enrollment with issued tokens is tracked in [#3](https://github.com/agentux-os/agentux-command/issues/3) and [#7](https://github.com/agentux-os/agentux-command/issues/7).
+Events are applied once per node sequence (duplicates are ignored), and an enrolled node not yet known after a restart is registered by its first event. The registry is kept in PostgreSQL behind every change and read back at startup, so a restarted Command still knows its nodes; each node is listed with a `presence` (`online` when heard from within 90 seconds, `degraded` within 5 minutes, else `offline`). Enrolled nodes use their issued credential; static `AGENTUX_COMMAND_NODE_TOKENS=node-1=token,...` entries remain a compatibility option. The PostgreSQL production handler refuses unauthenticated nodes.
 
 ## Node enrollment
 
@@ -313,7 +319,10 @@ by `eventId`. `event: unavailable` means the log cannot be read at the moment;
 the stream keeps trying. A slow reader is sent only as fast as it reads, and a
 comment every 15 s keeps proxies from closing the stream. Signed-in operators'
 browsers authenticate with their session cookie, which `EventSource` sends.
-Cursors do not expire, because the log keeps everything (#18 tracks retention).
+With event retention disabled, cursors remain replayable because the log is
+kept. When retention is enabled, older events are archived and pruned from the
+live event table; API replay covers retained events, while older history must
+be recovered from the operator-managed archive ([Event retention](deploy/README.md#event-retention)).
 
 With `AGENTUX_COMMAND_EVENTS_URL` set, Command also POSTs each event as JSON
 to that URL (`Idempotency-Key: <eventId>`, and `Authorization: Bearer
@@ -322,7 +331,7 @@ the same transaction (ADR 0020): at least once, in order per organization (an
 organization's next event waits while an earlier one fails), retried with a
 backoff from 5 s to 10 min that survives restarts. Delivered events leave the
 outbox after a day; one the sink has not taken in 7 days is dropped from it,
-and stays in the log for replay.
+and stays in the event log for replay until event retention prunes it.
 
 ## Audit
 
