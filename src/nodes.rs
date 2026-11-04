@@ -149,6 +149,24 @@ impl Registry {
         self.heartbeat_with(id, status, None, "");
     }
 
+    /// Replaces one run's cached node snapshot after an expired event cursor.
+    /// The event timeline remains in the Office log and is not reconstructed
+    /// from this current-state summary.
+    pub fn snapshot(&self, node_id: &str, organization_id: &str, run_id: &str, value: Value) {
+        let mut nodes = self.lock();
+        let Some(node) = nodes
+            .get_mut(node_id)
+            .filter(|node| node.organization_id == organization_id)
+        else {
+            return;
+        };
+        node.runs.insert(run_id.to_string(), value);
+        if node.runs.len() > MAX_RUNS {
+            trim_runs(&mut node.runs);
+        }
+        self.stored(node);
+    }
+
     /// Records a heartbeat with the node's capacity and time.
     pub fn heartbeat_with(&self, id: &str, status: &str, capacity: Option<Value>, at: &str) {
         let mut nodes = self.lock();
@@ -242,13 +260,47 @@ pub mod persist {
     pub async fn load(pool: &deadpool_postgres::Pool) -> Result<Vec<Node>, String> {
         let client = pool.get().await.map_err(|e| e.to_string())?;
         let rows = client
-            .query("SELECT payload FROM node_state ORDER BY node_id", &[])
+            .query(
+                "SELECT ns.payload, c.accepted_capabilities
+                 FROM node_state ns
+                 LEFT JOIN command_node_capabilities c
+                   ON c.organization_id=ns.organization_id AND c.node_id=ns.node_id
+                 ORDER BY ns.node_id",
+                &[],
+            )
             .await
             .map_err(|e| format!("read node state: {e}"))?;
         Ok(rows
             .iter()
-            .map(|row| row.get::<_, Json<Node>>(0).0)
+            .map(|row| {
+                let mut node = row.get::<_, Json<Node>>(0).0;
+                if let Some(Json(capabilities)) = row.get::<_, Option<Json<Vec<String>>>>(1) {
+                    node.accepted_capabilities = capabilities;
+                }
+                node
+            })
             .collect())
+    }
+
+    /// Persists the negotiated optional protocol capabilities before
+    /// `node.hello` acknowledges them to the peer.
+    pub async fn store_capabilities(
+        pool: &deadpool_postgres::Pool,
+        node_id: &str,
+        organization_id: &str,
+        accepted: &[String],
+    ) -> Result<(), String> {
+        let client = pool.get().await.map_err(|e| e.to_string())?;
+        client
+            .execute(
+                "INSERT INTO command_node_capabilities (organization_id,node_id,accepted_capabilities)
+                 VALUES ($1,$2,$3) ON CONFLICT (organization_id,node_id)
+                 DO UPDATE SET accepted_capabilities=EXCLUDED.accepted_capabilities,updated_at=now()",
+                &[&organization_id, &node_id, &Json(&accepted)],
+            )
+            .await
+            .map_err(|e| format!("store accepted node capabilities: {e}"))?;
+        Ok(())
     }
 
     /// Starts the task that stores changed nodes; send it each change. A

@@ -12,9 +12,9 @@ use tokio_postgres::NoTls;
 use tokio_postgres::types::Json;
 
 use super::{
-    Error, Event, Logged, OfficeRepository, Projection, Replay, ResolutionRequest,
-    ResolutionResponse, apply_projection_event, empty_projection, migrate, prepare,
-    stamp_definition, validate_event, validate_resolution,
+    Error, Event, Logged, NodeEvent, NodeEventReceipt, OfficeRepository, Projection, Replay,
+    ResolutionRequest, ResolutionResponse, apply_projection_event, empty_projection, migrate,
+    prepare, stamp_definition, validate_event, validate_resolution,
 };
 use crate::now_rfc3339;
 
@@ -288,6 +288,195 @@ impl OfficeRepository for PostgresStore {
         append_event(&tx, event).await?;
         tx.commit().await.map_err(storage("commit office event"))?;
         Ok(())
+    }
+
+    async fn record_node_event(
+        &self,
+        event: NodeEvent,
+        projection: Option<Event>,
+        require_contiguous: bool,
+    ) -> Result<NodeEventReceipt, Error> {
+        if event.organization_id.is_empty()
+            || event.node_id.is_empty()
+            || event.event_id.is_empty()
+            || event.sequence < 1
+        {
+            return Err(Error::Invalid(
+                "node event requires authenticated identity, eventId and positive sequence".into(),
+            ));
+        }
+        let mut client = self.pool.get().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(storage("begin node event transaction"))?;
+        tx.execute(
+            "INSERT INTO command_node_event_cursors (organization_id,node_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+            &[&event.organization_id, &event.node_id],
+        )
+        .await
+        .map_err(storage("initialize node event cursor"))?;
+        let cursor: i64 = tx
+            .query_one(
+                "SELECT contiguous_sequence FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2 FOR UPDATE",
+                &[&event.organization_id, &event.node_id],
+            )
+            .await
+            .map_err(storage("lock node event cursor"))?
+            .get(0);
+
+        let by_sequence = tx
+            .query_opt(
+                "SELECT event_id,method,payload_sha256 FROM command_node_events WHERE organization_id=$1 AND node_id=$2 AND sequence=$3",
+                &[&event.organization_id, &event.node_id, &event.sequence],
+            )
+            .await
+            .map_err(storage("check node event sequence"))?;
+        if let Some(row) = by_sequence {
+            let previous_id: String = row.get(0);
+            let previous_method: String = row.get(1);
+            let previous_digest: String = row.get(2);
+            if previous_id == event.event_id
+                && previous_method == event.method
+                && previous_digest == event.payload_digest
+            {
+                let mut contiguous = cursor;
+                loop {
+                    let next = contiguous.saturating_add(1);
+                    let present: bool = tx
+                        .query_one(
+                            "SELECT EXISTS (SELECT 1 FROM command_node_events WHERE organization_id=$1 AND node_id=$2 AND sequence=$3)",
+                            &[&event.organization_id, &event.node_id, &next],
+                        )
+                        .await
+                        .map_err(storage("advance contiguous duplicate node event"))?
+                        .get(0);
+                    if !present {
+                        break;
+                    }
+                    contiguous = next;
+                }
+                if contiguous > cursor {
+                    tx.execute(
+                        "UPDATE command_node_event_cursors SET contiguous_sequence=$3,updated_at=now() WHERE organization_id=$1 AND node_id=$2",
+                        &[&event.organization_id, &event.node_id, &contiguous],
+                    )
+                    .await
+                    .map_err(storage("save contiguous duplicate node event cursor"))?;
+                }
+                tx.commit()
+                    .await
+                    .map_err(storage("commit duplicate node event"))?;
+                return Ok(NodeEventReceipt {
+                    contiguous_sequence: contiguous,
+                    duplicate: true,
+                });
+            }
+            return Err(Error::conflict(
+                "event_identity_conflict",
+                "node event sequence was reused with different content",
+            ));
+        }
+        let by_id = tx
+            .query_opt(
+                "SELECT sequence FROM command_node_events WHERE organization_id=$1 AND node_id=$2 AND event_id=$3",
+                &[&event.organization_id, &event.node_id, &event.event_id],
+            )
+            .await
+            .map_err(storage("check node event ID"))?;
+        if by_id.is_some() {
+            return Err(Error::conflict(
+                "event_identity_conflict",
+                "node event ID was reused at a different sequence",
+            ));
+        }
+        // A cursor seeded by migration can cover old rows whose payloads were
+        // not retained. New rows are always checked by both unique identities.
+        if event.sequence <= cursor {
+            tx.commit()
+                .await
+                .map_err(storage("commit previously acknowledged node event"))?;
+            return Ok(NodeEventReceipt {
+                contiguous_sequence: cursor,
+                duplicate: true,
+            });
+        }
+        if require_contiguous && event.sequence != cursor.saturating_add(1) {
+            return Err(Error::conflict(
+                "event_sequence_gap",
+                format!(
+                    "expected node event sequence {}, received {}",
+                    cursor + 1,
+                    event.sequence
+                ),
+            ));
+        }
+        tx.execute(
+            "INSERT INTO command_node_events (organization_id,node_id,sequence,event_id,method,payload_sha256) VALUES ($1,$2,$3,$4,$5,$6)",
+            &[&event.organization_id, &event.node_id, &event.sequence, &event.event_id, &event.method, &event.payload_digest],
+        )
+        .await
+        .map_err(storage("persist node event"))?;
+
+        if let Some(projection) = projection {
+            let last_projected: i64 = tx
+                .query_opt(
+                    "SELECT sequence FROM office_event_cursors WHERE organization_id=$1 AND node_id=$2",
+                    &[&event.organization_id, &event.node_id],
+                )
+                .await
+                .map_err(storage("read Office node cursor"))?
+                .map(|row| row.get(0))
+                .unwrap_or(0);
+            // Legacy peers may report a later sequence before an earlier one.
+            // Keep the old projection semantics while retaining the raw event.
+            if projection.sequence > last_projected {
+                append_event(&tx, projection).await?;
+            }
+        }
+
+        let mut contiguous = cursor;
+        loop {
+            let next = contiguous.saturating_add(1);
+            let present: bool = tx
+                .query_one(
+                    "SELECT EXISTS (SELECT 1 FROM command_node_events WHERE organization_id=$1 AND node_id=$2 AND sequence=$3)",
+                    &[&event.organization_id, &event.node_id, &next],
+                )
+                .await
+                .map_err(storage("advance contiguous node event cursor"))?
+                .get(0);
+            if !present {
+                break;
+            }
+            contiguous = next;
+        }
+        tx.execute(
+            "UPDATE command_node_event_cursors SET contiguous_sequence=$3,updated_at=now() WHERE organization_id=$1 AND node_id=$2",
+            &[&event.organization_id, &event.node_id, &contiguous],
+        )
+        .await
+        .map_err(storage("save contiguous node event cursor"))?;
+        tx.commit()
+            .await
+            .map_err(storage("commit node event transaction"))?;
+        Ok(NodeEventReceipt {
+            contiguous_sequence: contiguous,
+            duplicate: false,
+        })
+    }
+
+    async fn node_event_cursor(&self, organization_id: &str, node_id: &str) -> Result<i64, Error> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT contiguous_sequence FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2",
+                &[&organization_id, &node_id],
+            )
+            .await
+            .map_err(storage("read contiguous node event cursor"))?
+            .map(|row| row.get(0))
+            .unwrap_or(0))
     }
 
     async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error> {

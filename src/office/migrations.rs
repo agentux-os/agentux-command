@@ -54,6 +54,10 @@ const FILES: &[(&str, &str)] = &[
         "012_execution_activity_replay.sql",
         include_str!("../../migrations/012_execution_activity_replay.sql"),
     ),
+    (
+        "013_node_event_replay.sql",
+        include_str!("../../migrations/013_node_event_replay.sql"),
+    ),
 ];
 
 pub(crate) struct Migration {
@@ -143,7 +147,7 @@ mod tests {
     fn versions_are_ordered_and_start_at_one() {
         assert_eq!(
             migration_versions(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
         );
     }
 
@@ -178,6 +182,31 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(sql.trim_start().starts_with("CREATE INDEX"));
+    }
+
+    #[test]
+    fn node_event_replay_has_a_durable_identity_ledger_and_cursor() {
+        let migrations = load().unwrap();
+        let replay = migrations
+            .iter()
+            .find(|migration| migration.version == 13)
+            .unwrap();
+        assert!(replay.sql.contains("command_node_event_cursors"));
+        assert!(replay.sql.contains("command_node_events"));
+        assert!(replay.sql.contains("command_node_capabilities"));
+        assert!(replay.sql.contains("payload_sha256"));
+        assert!(
+            replay
+                .sql
+                .contains("UNIQUE (organization_id, node_id, event_id)")
+        );
+        assert!(
+            replay
+                .sql
+                .lines()
+                .all(|line| { !line.trim_start().starts_with("--") || !line.contains(';') }),
+            "migration runner splits SQL on semicolons, including comment text"
+        );
     }
 
     #[test]
