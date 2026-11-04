@@ -217,6 +217,11 @@ async fn activity_replay_is_tenant_scoped_and_schema_invalid_payloads_are_refuse
     invalid["params"]["activity"]["privateReasoning"] = json!("do not persist");
     let (status, _) = call(&app, "POST", "/v1/protocol/messages", "", Some(invalid)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let mut unknown = activity_message("acme", "node-1", "event-3", 2, "run-shared");
+    unknown["params"]["activity"]["unrecognizedPrivatePayload"] = json!("do not persist");
+    let (status, _) = call(&app, "POST", "/v1/protocol/messages", "", Some(unknown)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

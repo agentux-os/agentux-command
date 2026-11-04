@@ -385,6 +385,60 @@ async fn isolated_database_url(prefix: &str) -> Option<String> {
     Some(url.to_string())
 }
 
+async fn apply_legacy_cursor_migration(
+    database_url: &str,
+    organization_id: &str,
+    node_id: &str,
+) -> i64 {
+    let (client, connection) = tokio_postgres::connect(database_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let cursor: i64 = client
+        .query_one(
+            "SELECT contiguous_sequence FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2",
+            &[&organization_id, &node_id],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert!(cursor > 0, "the live node must have an acknowledged cursor");
+    client
+        .execute(
+            "DELETE FROM command_node_events WHERE organization_id=$1 AND node_id=$2",
+            &[&organization_id, &node_id],
+        )
+        .await
+        .unwrap();
+    client
+        .batch_execute(include_str!(
+            "../migrations/014_safe_legacy_node_event_cursor.sql"
+        ))
+        .await
+        .unwrap();
+    let migrated_cursor = client
+        .query_one(
+            "SELECT contiguous_sequence,history_gap_through_sequence FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2",
+            &[&organization_id, &node_id],
+        )
+        .await
+        .unwrap();
+    let preserved: i64 = migrated_cursor.get(0);
+    let gap: Option<i64> = migrated_cursor.get(1);
+    assert_eq!(
+        preserved, cursor,
+        "migration must preserve the sent ACK cursor"
+    );
+    assert_eq!(
+        gap,
+        Some(cursor),
+        "migration must mark the unverified prefix"
+    );
+    cursor
+}
+
 /// The whole organization workflow, nothing stubbed but the agents (and no
 /// model credentials): a leader drafts, edits and publishes an organization;
 /// a node enrolls and connects; a mission runs its agent step on the node's
@@ -806,6 +860,10 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     let _ = stop_command.send(());
     let _ = tokio::time::timeout(Duration::from_secs(10), command_server).await;
 
+    // Reproduce a legacy deployment where the stored cursor was already ACKed
+    // by Core but this receiver has no replay ledger proving its old prefix.
+    let legacy_cursor = apply_legacy_cursor_migration(&database_url, "acme", "org-node").await;
+
     let restarted_handler = Handler::postgres(&database_url)
         .await
         .unwrap()
@@ -862,7 +920,28 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     let (status, after_restart) = call(&app, "GET", &activity_path, &acme_reader, None).await;
     assert_eq!(status, StatusCode::OK, "{after_restart}");
     assert_eq!(after_restart["activities"], activity_page["activities"]);
-    assert!(after_restart["historyGap"].is_null(), "{after_restart}");
+    assert_eq!(
+        after_restart["historyGap"]["throughSequence"],
+        legacy_cursor
+    );
+    let (client, connection) = tokio_postgres::connect(&database_url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    let resumed_cursor: i64 = client
+        .query_one(
+            "SELECT contiguous_sequence FROM command_node_event_cursors WHERE organization_id='acme' AND node_id='org-node'",
+            &[],
+        )
+        .await
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        resumed_cursor, legacy_cursor,
+        "resume must not regress the cursor"
+    );
     let cursor = activity_page["next"].as_i64().unwrap();
     let (status, replay_tail) = call(
         &app,

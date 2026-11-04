@@ -1026,6 +1026,13 @@ async fn accept_node_event(
         let activity = params_value
             .get("activity")
             .ok_or(StatusCode::BAD_REQUEST)?;
+        let typed: auxp::activity::Activity =
+            serde_json::from_value(activity.clone()).map_err(|_| StatusCode::BAD_REQUEST)?;
+        typed.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let normalized = serde_json::to_value(typed).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if normalized != *activity {
+            return Err(StatusCode::BAD_REQUEST);
+        }
         validate_activity_scope(&state, organization_id, node_id, activity).await?;
     }
     let event_id = params_value
