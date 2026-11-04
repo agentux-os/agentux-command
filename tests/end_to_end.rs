@@ -382,7 +382,10 @@ async fn isolated_database_url(prefix: &str) -> Option<String> {
     let mut url = url::Url::parse(&common::database_url()?).unwrap();
     url.query_pairs_mut()
         .append_pair("options", &format!("-c search_path={schema}"));
-    Some(url.to_string())
+    Some(
+        url.to_string()
+            .replace("+search_path%3D", "%20search_path%3D"),
+    )
 }
 
 async fn apply_legacy_cursor_migration(
