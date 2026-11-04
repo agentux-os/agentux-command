@@ -76,7 +76,12 @@ impl Launcher for ActivityLauncher {
                         )
                         .await?;
                     if permission != "allow" {
-                        return Err(format!("the activity test was not approved: {permission}"));
+                        turn.tool_update(
+                            "tool-activity-e2e",
+                            acp::ToolCallStatus::Failed,
+                            Some(&permission),
+                        )?;
+                        return Ok(acp::StopReason::EndTurn);
                     }
                     turn.tool_update(
                         "tool-activity-e2e",
