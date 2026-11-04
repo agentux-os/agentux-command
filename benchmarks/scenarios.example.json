@@ -5,12 +5,13 @@
   "requests": 1000,
   "concurrency": 16,
   "timeout_seconds": 10,
+  "max_duration_seconds": 3600,
   "scenarios": [
     {
       "name": "event_ingestion",
       "method": "POST",
       "path": "/v1/protocol/messages",
-      "token_env": "BENCH_NODE_TOKEN",
+      "token_env": "BENCH_NODE_TOKEN_{lane}",
       "json": {
         "jsonrpc": "2.0",
         "method": "run.started",
@@ -30,7 +31,8 @@
       "name": "heartbeats",
       "method": "POST",
       "path": "/v1/protocol/messages",
-      "token_env": "BENCH_NODE_TOKEN",
+      "token_env": "BENCH_NODE_TOKEN_{lane}",
+      "interval_seconds": 5,
       "json": {
         "jsonrpc": "2.0",
         "method": "node.heartbeat",

@@ -26,6 +26,7 @@ def validate_config(config):
     requests = config.get("requests")
     concurrency = config.get("concurrency")
     timeout = config.get("timeout_seconds", 10)
+    max_duration = config.get("max_duration_seconds", 3600)
     scenarios = config.get("scenarios")
     if (parsed_url is None or parsed_url.scheme not in {"http", "https"}
             or not parsed_url.hostname or parsed_url.username or parsed_url.password):
@@ -36,6 +37,8 @@ def validate_config(config):
         raise ValueError("concurrency must be between 1 and min(requests, 512)")
     if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0 or timeout > 300:
         raise ValueError("timeout_seconds must be in (0, 300]")
+    if not isinstance(max_duration, (int, float)) or isinstance(max_duration, bool) or max_duration <= 0 or max_duration > 3600:
+        raise ValueError("max_duration_seconds must be in (0, 3600]")
     if not isinstance(scenarios, list) or not scenarios:
         raise ValueError("scenarios must be a non-empty list")
     names = set()
@@ -52,11 +55,18 @@ def validate_config(config):
             raise ValueError(f"scenario {scenario['name']} path must start with /")
         if scenario.get("json") is not None and not isinstance(scenario["json"], (dict, list)):
             raise ValueError(f"scenario {scenario['name']} json body must be an object or array")
+        interval = scenario.get("interval_seconds", 0)
+        if not isinstance(interval, (int, float)) or isinstance(interval, bool) or interval < 0 or interval > 300:
+            raise ValueError(f"scenario {scenario['name']} interval_seconds must be in [0, 300]")
         token_env = scenario.get("token_env")
         if token_env is not None and (not isinstance(token_env, str) or not token_env):
             raise ValueError(f"scenario {scenario['name']} token_env must be a non-empty environment variable name")
-        if token_env and not os.environ.get(token_env):
-            raise ValueError(f"environment variable {scenario['token_env']} is required")
+        if token_env:
+            token_names = ([token_env.replace("{lane}", str(lane)) for lane in range(1, concurrency + 1)]
+                           if "{lane}" in token_env else [token_env])
+            missing = [name for name in token_names if not os.environ.get(name)]
+            if missing:
+                raise ValueError(f"environment variable(s) required for scenario {scenario['name']}: {', '.join(missing)}")
     return config
 
 
@@ -97,6 +107,8 @@ def _request(base_url, scenario, index, lane, lane_sequence, timeout):
     headers = {"Accept": "application/json"}
     token_env = scenario.get("token_env")
     if token_env:
+        if "{lane}" in token_env:
+            token_env = token_env.replace("{lane}", str(lane + 1))
         headers["Authorization"] = "Bearer " + os.environ[token_env]
     data = None
     if body is not None:
@@ -119,18 +131,32 @@ def _request(base_url, scenario, index, lane, lane_sequence, timeout):
     return {"latency_ms": round(elapsed_ms, 3), "status": code, "ok": ok, "error": detail}
 
 
-def run_scenario(base_url, scenario, requests, concurrency, timeout):
+def run_scenario(base_url, scenario, requests, concurrency, timeout, deadline=None):
     samples = []
     lock = threading.Lock()
-    next_index = 0
     start = time.perf_counter()
+    interval = scenario.get("interval_seconds", 0)
 
     def worker(lane):
+        next_start = time.monotonic()
         for index in range(lane, requests, concurrency):
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                break
+            wait = max(0, next_start - now)
+            if deadline is not None:
+                wait = min(wait, max(0, deadline - now))
+            if wait:
+                time.sleep(wait)
+            now = time.monotonic()
+            if deadline is not None and now >= deadline:
+                break
             lane_sequence = index // concurrency + 1
-            sample = _request(base_url, scenario, index, lane, lane_sequence, timeout)
+            request_timeout = min(timeout, deadline - now) if deadline is not None else timeout
+            sample = _request(base_url, scenario, index, lane, lane_sequence, request_timeout)
             with lock:
                 samples.append(sample)
+            next_start += interval
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=concurrency) as pool:
         futures = [pool.submit(worker, lane) for lane in range(concurrency)]
@@ -145,10 +171,27 @@ def run_scenario(base_url, scenario, requests, concurrency, timeout):
         key = str(sample["status"]) if sample["status"] is not None else "transport_error"
         counts[key] = counts.get(key, 0) + 1
     return {
-        "name": scenario["name"], "requests": len(samples), "successes": successes, "errors": errors,
+        "name": scenario["name"], "requested": requests, "requests": len(samples),
+        "successes": successes, "errors": errors,
+        "input": scenario_metadata(scenario),
         "elapsed_seconds": round(elapsed, 6), "throughput_requests_per_second": round(len(samples) / elapsed, 3) if elapsed else None,
         "latency_ms": latencies, "latency_percentiles_ms": percentiles(latencies),
         "http_status_counts": counts, "error_samples": [s["error"] for s in samples if s["error"]][:20],
+        "stopped_due_to_duration": deadline is not None and len(samples) < requests and time.monotonic() >= deadline,
+    }
+
+
+def scenario_metadata(scenario):
+    body = scenario.get("json")
+    body_bytes = len(json.dumps(body, separators=(",", ":")).encode()) if body is not None else 0
+    return {
+        "name": scenario["name"],
+        "method": scenario.get("method", "GET").upper(),
+        "path": urllib.parse.urlsplit(scenario["path"]).path,
+        "request_body_bytes": body_bytes,
+        "interval_seconds": scenario.get("interval_seconds", 0),
+        "read_first_byte": bool(scenario.get("read_first_byte", False)),
+        "authenticated": bool(scenario.get("token_env")),
     }
 
 
@@ -231,6 +274,15 @@ def safe_origin(url):
     return f"{parsed.scheme}://{host}"
 
 
+def database_url_from_env(variable):
+    if not variable:
+        return None
+    value = os.environ.get(variable)
+    if not value:
+        raise ValueError(f"environment variable {variable} is required")
+    return value
+
+
 def source_commit():
     try:
         result = subprocess.run(["git", "rev-parse", "HEAD"], check=True, capture_output=True,
@@ -247,8 +299,12 @@ def execute(config, pid=None, database_url=None):
                          "source_commit": source_commit(),
                          "topology": config.get("topology", "one host, one Command process, one PostgreSQL instance"),
                          "requests_per_scenario": config["requests"], "concurrency": config["concurrency"],
-                         "timeout_seconds": config.get("timeout_seconds", 10)},
-              "instrumentation": {}, "scenarios": []}
+                         "timeout_seconds": config.get("timeout_seconds", 10),
+                         "max_duration_seconds": config.get("max_duration_seconds", 3600)},
+              "instrumentation": {
+                  "target_process": {"status": "unavailable", "reason": "no Command PID was configured"},
+                  "database": {"status": "unavailable", "reason": "no database URL environment variable was configured"},
+              }, "scenarios": []}
     stop_monitor = threading.Event()
     monitor = None
     if pid is not None:
@@ -257,9 +313,15 @@ def execute(config, pid=None, database_url=None):
         monitor.start()
     if database_url:
         result["instrumentation"]["database_before"] = database_size(database_url)
+        before = result["instrumentation"]["database_before"]
+        result["instrumentation"]["database"] = (
+            {"status": "available"} if before.get("status") == "available" else
+            {"status": "unavailable", "reason": before.get("reason", "database sampling failed")}
+        )
+    deadline = time.monotonic() + config.get("max_duration_seconds", 3600)
     for scenario in config["scenarios"]:
         result["scenarios"].append(run_scenario(config["base_url"], scenario, config["requests"],
-                                                config["concurrency"], config.get("timeout_seconds", 10)))
+                                                config["concurrency"], config.get("timeout_seconds", 10), deadline))
     if monitor is not None:
         stop_monitor.set()
         monitor.join()
@@ -270,6 +332,10 @@ def execute(config, pid=None, database_url=None):
         after = result["instrumentation"]["database_after"]
         result["instrumentation"]["database_growth_bytes"] = (
             after["bytes"] - before["bytes"] if before.get("status") == after.get("status") == "available" else None)
+        if after.get("status") != "available":
+            result["instrumentation"]["database"] = {
+                "status": "unavailable", "reason": after.get("reason", "database sampling failed")
+            }
     return result
 
 
@@ -278,17 +344,18 @@ def main(argv=None):
     parser.add_argument("--config", required=True, type=Path)
     parser.add_argument("--output", type=Path, help="write full JSON report here (default: stdout)")
     parser.add_argument("--pid", type=int, help="sample this Command process (requires optional psutil)")
-    parser.add_argument("--database-url", help="sample pg_database_size before/after using psql")
+    parser.add_argument("--database-url-env", help="environment variable holding the database URL (keeps credentials out of process arguments)")
     args = parser.parse_args(argv)
     try:
         config = json.loads(args.config.read_text(encoding="utf-8"))
-        report = execute(config, args.pid, args.database_url)
+        report = execute(config, args.pid, database_url_from_env(args.database_url_env))
         rendered = json.dumps(report, indent=2, sort_keys=True) + "\n"
         if args.output:
             args.output.write_text(rendered, encoding="utf-8")
         else:
             sys.stdout.write(rendered)
-        return 0 if all(item["errors"] == 0 for item in report["scenarios"]) else 2
+        return 0 if all(item["errors"] == 0 and not item["stopped_due_to_duration"]
+                        for item in report["scenarios"]) else 2
     except (OSError, ValueError, json.JSONDecodeError) as error:
         print(f"command-bench: {error}", file=sys.stderr)
         return 1

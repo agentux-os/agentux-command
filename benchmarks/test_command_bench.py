@@ -19,12 +19,14 @@ spec.loader.exec_module(bench)
 class FixtureHandler(BaseHTTPRequestHandler):
     active = 0
     peak = 0
+    authorizations = {}
     lock = threading.Lock()
 
     def do_GET(self):
         with self.lock:
             type(self).active += 1
             type(self).peak = max(type(self).peak, type(self).active)
+            type(self).authorizations[self.path] = self.headers.get("Authorization")
         time.sleep(0.015)
         try:
             self.send_response(503 if self.path == "/fail" else 200)
@@ -62,16 +64,13 @@ class BenchmarkTests(unittest.TestCase):
             bench.validate_config({"base_url": "https://u:p@example.test", "requests": 1,
                                    "concurrency": 1, "scenarios": [{"name": "x", "path": "/"}]})
         with self.assertRaises(ValueError):
+            bench.validate_config({"base_url": self.base, "requests": 1, "concurrency": 1,
+                                   "max_duration_seconds": 0, "scenarios": [{"name": "x", "path": "/"}]})
+        with self.assertRaises(ValueError):
+            bench.validate_config({"base_url": self.base, "requests": 1, "concurrency": 1,
+                                   "scenarios": [{"name": "x", "path": "/", "interval_seconds": -1}]})
+        with self.assertRaises(ValueError):
             bench.validate_config([])
-
-    def test_example_heartbeat_matches_the_protocol_contract(self):
-        example_path = Path(__file__).with_name("scenarios.example.json")
-        example = json.loads(example_path.read_text(encoding="utf-8"))
-        heartbeat = next(item for item in example["scenarios"] if item["name"] == "heartbeats")
-        self.assertEqual(heartbeat["json"]["method"], "node.heartbeat")
-        self.assertEqual(heartbeat["json"]["params"]["status"], "ready")
-        self.assertIsInstance(heartbeat["json"]["params"]["capacity"], dict)
-        self.assertTrue(heartbeat["json"]["params"]["capacity"])
 
     def test_worker_pool_is_bounded_and_http_errors_are_counted(self):
         FixtureHandler.peak = 0
@@ -90,6 +89,24 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(timed_out["errors"], 1)
 
+    def test_scenario_interval_paces_requests_per_lane(self):
+        result = bench.run_scenario(
+            self.base, {"name": "paced", "path": "/ok", "interval_seconds": 0.03},
+            requests=2, concurrency=1, timeout=2,
+        )
+        self.assertEqual(result["requests"], 2)
+        self.assertGreaterEqual(result["elapsed_seconds"], 0.04)
+
+    def test_scenario_stops_at_the_total_run_deadline(self):
+        deadline = time.monotonic() + 0.06
+        result = bench.run_scenario(
+            self.base, {"name": "bounded-time", "path": "/ok"},
+            requests=100, concurrency=2, timeout=2, deadline=deadline,
+        )
+        self.assertLess(result["requests"], 100)
+        self.assertEqual(result["requested"], 100)
+        self.assertTrue(result["stopped_due_to_duration"])
+
     def test_summary_percentiles_and_empty_sample(self):
         self.assertEqual(bench.percentiles([]), {"p50": None, "p95": None, "p99": None})
         self.assertEqual(bench.percentiles([1, 2, 3, 4])["p50"], 2.5)
@@ -107,11 +124,24 @@ class BenchmarkTests(unittest.TestCase):
         self.assertTrue(heartbeat["json"]["params"]["capacity"])
         original = dict(os.environ)
         try:
-            os.environ.update({"BENCH_NODE_TOKEN": "fixture", "BENCH_OPERATOR_TOKEN": "fixture"})
+            os.environ.update({"BENCH_NODE_TOKEN_1": "node-one", "BENCH_NODE_TOKEN_2": "node-two",
+                               "BENCH_OPERATOR_TOKEN": "fixture"})
             bench.validate_config(checked)
         finally:
             os.environ.clear()
             os.environ.update(original)
+
+    def test_node_token_template_uses_each_lane_bound_credential(self):
+        FixtureHandler.authorizations.clear()
+        with mock.patch.dict(os.environ, {"NODE_TOKEN_1": "node-one", "NODE_TOKEN_2": "node-two"}):
+            result = bench.run_scenario(
+                self.base,
+                {"name": "lane-token", "path": "/lane-{lane}", "token_env": "NODE_TOKEN_{lane}"},
+                requests=2, concurrency=2, timeout=2,
+            )
+        self.assertEqual(result["errors"], 0)
+        self.assertEqual(FixtureHandler.authorizations["/lane-1"], "Bearer node-one")
+        self.assertEqual(FixtureHandler.authorizations["/lane-2"], "Bearer node-two")
 
     def test_example_scenarios_use_declared_server_routes(self):
         routes = (Path(__file__).parents[1] / "src" / "server.rs").read_text(encoding="utf-8")
@@ -134,9 +164,40 @@ class BenchmarkTests(unittest.TestCase):
             database = bench.database_size("postgresql://redacted")
         self.assertEqual(database["status"], "unavailable")
 
+    def test_unconfigured_process_and_database_collectors_are_reported(self):
+        config = {"base_url": self.base, "requests": 1, "concurrency": 1,
+                  "scenarios": [{"name": "stub", "path": "/ok"}]}
+        with mock.patch.object(bench, "hardware_metadata", return_value={}), \
+             mock.patch.object(bench, "source_commit", return_value="fixture"), \
+             mock.patch.object(bench, "run_scenario", return_value={"name": "stub", "errors": 0,
+                                                                    "stopped_due_to_duration": False}):
+            report = bench.execute(config)
+        self.assertEqual(report["instrumentation"]["target_process"]["status"], "unavailable")
+        self.assertEqual(report["instrumentation"]["database"]["status"], "unavailable")
+
     def test_report_origin_does_not_include_credentials_or_paths(self):
         self.assertEqual(bench.safe_origin("https://operator:secret@example.test:8443/private"),
                          "https://example.test:8443")
+
+    def test_scenario_report_records_safe_workload_inputs_not_payloads(self):
+        scenario = {"name": "safe-report", "method": "POST", "path": "/v1/events?cursor=secret",
+                    "json": {"token": "must-not-be-reported"}, "token_env": "SECRET_TOKEN",
+                    "interval_seconds": 1, "read_first_byte": False}
+        metadata = bench.scenario_metadata(scenario)
+        self.assertEqual(metadata["path"], "/v1/events")
+        self.assertGreater(metadata["request_body_bytes"], 0)
+        self.assertTrue(metadata["authenticated"])
+        self.assertNotIn("must-not-be-reported", json.dumps(metadata))
+        self.assertNotIn("SECRET_TOKEN", json.dumps(metadata))
+
+    def test_database_url_is_read_by_environment_variable_name(self):
+        with mock.patch.dict(os.environ, {"BENCH_DATABASE_URL": "postgresql://operator:secret@db/test"}):
+            self.assertEqual(bench.database_url_from_env("BENCH_DATABASE_URL"),
+                             "postgresql://operator:secret@db/test")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertIsNone(bench.database_url_from_env(None))
+            with self.assertRaises(ValueError):
+                bench.database_url_from_env("BENCH_DATABASE_URL")
 
 
 if __name__ == "__main__":
