@@ -1096,7 +1096,10 @@ async fn connect(
     if node_id.is_empty() {
         return error(StatusCode::BAD_REQUEST, "nodeId is required");
     }
-    match s.node_access(&headers, &node_id, "").await {
+    let Some(organization_id) = s.node_organization(&node_id).await else {
+        return error(StatusCode::UNAUTHORIZED, "unknown node or token");
+    };
+    match s.node_access(&headers, &node_id, &organization_id).await {
         Access::None => return error(StatusCode::UNAUTHORIZED, "unknown node or token"),
         Access::Pending => {
             return error(
@@ -1115,8 +1118,10 @@ async fn connect(
         .max_message_size(MESSAGE_LIMIT)
         .on_upgrade(move |ws| async move {
             let message_state = state.clone();
-            let on_message =
-                move |node, raw| websocket_node_message(message_state.clone(), node, raw);
+            let connection_organization = organization_id.clone();
+            let on_message = move |node, raw| {
+                websocket_node_message(message_state.clone(), &connection_organization, node, raw)
+            };
             state.hub.serve_async(ws, &node_id, on_message).await;
         });
     // Nodes check they reached the Command server they enrolled with.
@@ -1128,6 +1133,7 @@ async fn connect(
 
 fn websocket_node_message<'a>(
     state: Arc<Inner>,
+    connection_organization: &'a str,
     node: &'a str,
     raw: &'a [u8],
 ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
@@ -1144,6 +1150,13 @@ fn websocket_node_message<'a>(
         let Ok(message) = protocol::read(raw) else {
             return;
         };
+        // Identity and capability negotiation are established over the
+        // authenticated HTTP hello. A WebSocket event cannot rewrite either.
+        if message.method == "node.hello"
+            || message.params.organization_id != connection_organization
+        {
+            return;
+        }
         if message.method == "execution.activity" {
             let params = &message.params;
             let negotiated = state.registry.get(node).is_some_and(|registered| {

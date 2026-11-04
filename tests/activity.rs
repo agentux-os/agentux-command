@@ -292,6 +292,69 @@ async fn websocket_execution_activity_is_authorized_and_projected_for_replay() {
     assert_eq!(page["activities"].as_array().unwrap().len(), 1);
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_hello_cannot_change_node_organization_or_negotiate_capabilities() {
+    let runs = Arc::new(missions::Memory::default());
+    seed_run(&runs, "run-1", "node-1").await;
+    let handler = Handler::with_office(Arc::new(office::Store::new())).with_runs(runs);
+    let reader = reader(&handler, "acme").await;
+    let app = handler.router();
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/protocol/messages",
+        "",
+        Some(hello("acme", "node-1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(axum::serve(listener, app.clone()).into_future());
+    let request = format!("ws://{address}/v1/protocol/connect?nodeId=node-1")
+        .into_client_request()
+        .unwrap();
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+
+    let mut spoofed_hello = hello("beta", "node-1");
+    spoofed_hello["params"]["capabilities"] = json!(["execution.activity.v1"]);
+    socket
+        .send(WebSocketMessage::Text(spoofed_hello.to_string().into()))
+        .await
+        .unwrap();
+    socket
+        .send(WebSocketMessage::Text(
+            activity_message("acme", "node-1", "ws-unnegotiated", 1, "run-1")
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+    socket
+        .send(WebSocketMessage::Text(
+            activity_message("beta", "node-1", "ws-foreign-org", 1, "run-1")
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let (status, page) = call(
+        &app,
+        "GET",
+        "/v1/organizations/acme/runs/run-1/activity",
+        &reader,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page["activities"].as_array().unwrap().is_empty());
+    let (status, nodes) = call(&app, "GET", "/v1/nodes", "demo-observer", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(nodes[0]["organizationId"], "acme");
+}
+
 #[tokio::test]
 async fn execution_activity_is_refused_until_the_node_negotiates_its_capability() {
     let handler = Handler::with_office(Arc::new(office::Store::new()));
