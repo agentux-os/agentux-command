@@ -117,7 +117,7 @@ POST /v1/service-tokens/<id>/revoke
 
 **Signing people in (OIDC).** With an OpenID Connect provider configured
 (Ferriskey, Keycloak, Entra ID, Google, or GitHub through a provider that
-brokers it), `GET /v1/auth/login?returnTo=/console` sends the browser to the
+brokers it), `GET /v1/auth/login?returnTo=/console/` sends the browser to the
 provider (authorization code with PKCE S256 and a nonce), and
 `/v1/auth/callback` accepts the ID token only when its signature checks
 against the provider's published keys and its issuer, audience, expiry and
@@ -356,13 +356,19 @@ assert lines[-1]["digest"] == prev
 ## Office projection
 
 **AgentUX Office is served at `/office/`** when `AGENTUX_COMMAND_OFFICE_DIR`
-points at an agentux-office bundle (the image ships one, pinned by version
-and checksum). On Command's own origin, Office uses the operator's session:
-an operator who is not signed in is offered Command's sign-in. Its
-`config.js` is made per request: the operator's organization (their only
-one, or `AGENTUX_COMMAND_OFFICE_ORGANIZATION` when they may see several) and
-whether sign-in is configured. Only the bundle's web files are served, with a
-strict content security policy.
+points at its versioned bundle (the image pins it by version and checksum).
+The Command console can be served at `/console/` when
+`AGENTUX_COMMAND_CONSOLE_DIR` points at its versioned bundle. Both pages share
+Command's origin and OIDC session. Their browser requests use the operator's
+`HttpOnly` session cookie; each API route checks that operator's organization
+capabilities. No shared service token is placed in browser configuration or
+forwarded on visitors' behalf. The Office config includes only the selected
+organization and whether sign-in is configured. The Console config contains
+only same-origin and sign-in flags. Only bundle web files are served, with a
+strict content security policy. OIDC must be configured for interactive web
+access; service tokens remain available for automation and CLI use. The
+Command console bundle must be released and pinned in the image before this
+route is available in the published deployment.
 
 ```text
 GET  /v1/office/projection?organizationId=<org>      organization.read in <org>

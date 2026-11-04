@@ -107,3 +107,41 @@ async fn office_is_served_at_office_with_a_config_for_the_operator() {
     let plain = Handler::new().router();
     assert_eq!(get(&plain, "/office/", "").await.0, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn console_is_served_on_command_origin_with_public_auth_config_only() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("index.html"), "<title>Command console</title>").unwrap();
+    std::fs::write(dir.path().join("app.js"), "console.log('console')").unwrap();
+    std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
+
+    let app = Handler::new()
+        .with_console_dir(dir.path().to_path_buf())
+        .router();
+    let (status, headers, _) = get(&app, "/console", "").await;
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(headers["location"], "/console/");
+
+    let (status, headers, body) = get(&app, "/console/", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Command console"));
+    assert!(headers["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .contains("default-src 'self'"));
+
+    let (status, headers, config) = get(&app, "/console/config.js", "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["cache-control"], "no-cache");
+    assert!(config.contains(r#""command":true"#), "{config}");
+    assert!(config.contains(r#""signIn":false"#), "{config}");
+    assert!(!config.contains("token"), "{config}");
+
+    assert_eq!(get(&app, "/console/app.js", "").await.0, StatusCode::OK);
+    for path in ["/console/.env", "/console/missing.js", "/console/..%2Foutside.html"] {
+        assert_eq!(get(&app, path, "").await.0, StatusCode::NOT_FOUND, "{path}");
+    }
+
+    let plain = Handler::new().router();
+    assert_eq!(get(&plain, "/console/", "").await.0, StatusCode::NOT_FOUND);
+}
