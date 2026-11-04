@@ -1,0 +1,78 @@
+{
+  "base_url": "http://127.0.0.1:8080",
+  "command_image_digest": "sha256:replace-with-deployed-image-digest",
+  "topology": "one host, one Command process, one PostgreSQL instance",
+  "requests": 1000,
+  "concurrency": 16,
+  "timeout_seconds": 10,
+  "max_duration_seconds": 3600,
+  "scenarios": [
+    {
+      "name": "event_ingestion",
+      "method": "POST",
+      "path": "/v1/protocol/messages",
+      "token_env": "BENCH_NODE_TOKEN_{lane}",
+      "json": {
+        "jsonrpc": "2.0",
+        "method": "run.started",
+        "params": {
+          "protocolVersion": "v1",
+          "organizationId": "bench-org",
+          "nodeId": "bench-node-{lane}",
+          "messageId": "event-{index}",
+          "eventId": "event-{index}",
+          "sequence": "{lane_sequence}",
+          "occurredAt": "2026-11-04T12:00:00Z",
+          "runId": "bench-run-{index}"
+        }
+      }
+    },
+    {
+      "name": "heartbeats",
+      "method": "POST",
+      "path": "/v1/protocol/messages",
+      "token_env": "BENCH_NODE_TOKEN_{lane}",
+      "interval_seconds": 5,
+      "json": {
+        "jsonrpc": "2.0",
+        "method": "node.heartbeat",
+        "params": {
+          "protocolVersion": "v1",
+          "organizationId": "bench-org",
+          "nodeId": "bench-node-{lane}",
+          "messageId": "heartbeat-{index}",
+          "occurredAt": "2026-11-04T12:00:00Z",
+          "status": "ready",
+          "capacity": {
+            "benchmark": true
+          }
+        }
+      }
+    },
+    {
+      "name": "office_replay",
+      "method": "GET",
+      "path": "/v1/organizations/bench-org/events?limit=1000",
+      "token_env": "BENCH_OPERATOR_TOKEN"
+    },
+    {
+      "name": "office_projection",
+      "method": "GET",
+      "path": "/v1/office/projection?organizationId=bench-org",
+      "token_env": "BENCH_OPERATOR_TOKEN"
+    },
+    {
+      "name": "office_live_stream_first_byte",
+      "method": "GET",
+      "path": "/v1/organizations/bench-org/events/stream?after=0",
+      "token_env": "BENCH_OPERATOR_TOKEN",
+      "read_first_byte": true
+    },
+    {
+      "name": "mission_transition_pause",
+      "method": "POST",
+      "path": "/v1/organizations/bench-org/runs/bench-active-run-{index}/pause",
+      "token_env": "BENCH_OPERATOR_TOKEN"
+    }
+  ]
+}
