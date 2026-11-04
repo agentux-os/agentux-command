@@ -1118,9 +1118,14 @@ async fn connect(
         .max_message_size(MESSAGE_LIMIT)
         .on_upgrade(move |ws| async move {
             let message_state = state.clone();
-            let connection_organization = organization_id.clone();
-            let on_message = move |node, raw| {
-                websocket_node_message(message_state.clone(), &connection_organization, node, raw)
+            let connection_organization = organization_id;
+            let on_message = move |node: &str, raw: &[u8]| {
+                websocket_node_message(
+                    message_state.clone(),
+                    connection_organization.clone(),
+                    node,
+                    raw,
+                )
             };
             state.hub.serve_async(ws, &node_id, on_message).await;
         });
@@ -1133,7 +1138,7 @@ async fn connect(
 
 fn websocket_node_message<'a>(
     state: Arc<Inner>,
-    connection_organization: &'a str,
+    connection_organization: String,
     node: &'a str,
     raw: &'a [u8],
 ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
