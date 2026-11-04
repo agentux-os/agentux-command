@@ -76,7 +76,18 @@ class BenchmarkTests(unittest.TestCase):
             bench.validate_config([])
 
     def test_worker_pool_is_bounded_and_http_errors_are_counted(self):
-        FixtureHandler.peak = 0
+        # Earlier tests may have intentionally timed out their clients while
+        # the fixture server is still finishing those handlers. Drain them so
+        # this assertion measures only the request batch below.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            with FixtureHandler.lock:
+                if FixtureHandler.active == 0:
+                    FixtureHandler.peak = 0
+                    break
+            time.sleep(0.005)
+        else:
+            self.fail("fixture server did not drain before bounded-pool assertion")
         scenario = {"name": "bounded", "method": "GET", "path": "/ok"}
         result = bench.run_scenario(self.base, scenario, requests=12, concurrency=3, timeout=2)
         self.assertEqual(result["successes"], 12)
