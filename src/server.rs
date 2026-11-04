@@ -2,6 +2,8 @@
 //! operator commands, and the Office projection.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1112,60 +1114,9 @@ async fn connect(
     let mut response = upgrade
         .max_message_size(MESSAGE_LIMIT)
         .on_upgrade(move |ws| async move {
-            let on_message = {
-                let state = state.clone();
-                move |node: &str, raw: &[u8]| {
-                    let state = state.clone();
-                    Box::pin(async move {
-                        // A node's own connection only speaks for that node.
-                        let speaks_for = serde_json::from_slice::<Value>(raw).ok().and_then(|v| {
-                            v.pointer("/params/nodeId")
-                                .and_then(Value::as_str)
-                                .map(str::to_string)
-                        });
-                        if speaks_for.as_deref() != Some(node) {
-                            return;
-                        }
-                        let Ok(message) = protocol::read(raw) else {
-                            return;
-                        };
-                        if message.method == "execution.activity" {
-                            let params = &message.params;
-                            let negotiated = state.registry.get(node).is_some_and(|registered| {
-                                registered.organization_id == params.organization_id
-                                    && registered
-                                        .accepted_capabilities
-                                        .iter()
-                                        .any(|capability| capability == "execution.activity.v1")
-                            });
-                            if !negotiated {
-                                return;
-                            }
-                            let activity = serde_json::from_slice::<Value>(raw)
-                                .ok()
-                                .and_then(|message| message.pointer("/params/activity").cloned());
-                            let Some(activity) = activity else {
-                                return;
-                            };
-                            if validate_activity_scope(
-                                &state,
-                                &params.organization_id,
-                                node,
-                                &activity,
-                            )
-                            .await
-                            .is_err()
-                            {
-                                return;
-                            }
-                            state.apply(raw, None);
-                            state.project(&message.method, raw).await;
-                        } else {
-                            state.apply(raw, None);
-                        }
-                    })
-                }
-            };
+            let message_state = state.clone();
+            let on_message =
+                move |node, raw| websocket_node_message(message_state.clone(), node, raw);
             state.hub.serve_async(ws, &node_id, on_message).await;
         });
     // Nodes check they reached the Command server they enrolled with.
@@ -1173,6 +1124,56 @@ async fn connect(
         response.headers_mut().insert(auxp::INSTANCE_HEADER, value);
     }
     response
+}
+
+fn websocket_node_message<'a>(
+    state: Arc<Inner>,
+    node: &'a str,
+    raw: &'a [u8],
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        // A node's own connection only speaks for that node.
+        let speaks_for = serde_json::from_slice::<Value>(raw).ok().and_then(|v| {
+            v.pointer("/params/nodeId")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+        if speaks_for.as_deref() != Some(node) {
+            return;
+        }
+        let Ok(message) = protocol::read(raw) else {
+            return;
+        };
+        if message.method == "execution.activity" {
+            let params = &message.params;
+            let negotiated = state.registry.get(node).is_some_and(|registered| {
+                registered.organization_id == params.organization_id
+                    && registered
+                        .accepted_capabilities
+                        .iter()
+                        .any(|capability| capability == "execution.activity.v1")
+            });
+            if !negotiated {
+                return;
+            }
+            let activity = serde_json::from_slice::<Value>(raw)
+                .ok()
+                .and_then(|message| message.pointer("/params/activity").cloned());
+            let Some(activity) = activity else {
+                return;
+            };
+            if validate_activity_scope(&state, &params.organization_id, node, &activity)
+                .await
+                .is_err()
+            {
+                return;
+            }
+            state.apply(raw, None);
+            state.project(&message.method, raw).await;
+        } else {
+            state.apply(raw, None);
+        }
+    })
 }
 
 #[derive(Deserialize)]
