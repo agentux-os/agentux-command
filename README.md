@@ -357,8 +357,8 @@ assert lines[-1]["digest"] == prev
 
 **AgentUX Office is served at `/office/`** when `AGENTUX_COMMAND_OFFICE_DIR`
 points at its versioned bundle (the image pins it by version and checksum).
-The Command console can be served at `/console/` when
-`AGENTUX_COMMAND_CONSOLE_DIR` points at its versioned bundle. Both pages share
+The published image also pins [Console 0.1.1](https://github.com/agentux-os/agentux-apps/releases/tag/console-v0.1.1)
+and serves it at `/console/` via `AGENTUX_COMMAND_CONSOLE_DIR`. Both pages share
 Command's origin and OIDC session. Their browser requests use the operator's
 `HttpOnly` session cookie; each API route checks that operator's organization
 capabilities. No shared service token is placed in browser configuration or
@@ -366,9 +366,7 @@ forwarded on visitors' behalf. The Office config includes only the selected
 organization and whether sign-in is configured. The Console config contains
 only same-origin and sign-in flags. Only bundle web files are served, with a
 strict content security policy. OIDC must be configured for interactive web
-access; service tokens remain available for automation and CLI use. The
-Command console bundle must be released and pinned in the image before this
-route is available in the published deployment.
+access; service tokens remain available for automation and CLI use.
 
 ```text
 GET  /v1/office/projection?organizationId=<org>      organization.read in <org>
