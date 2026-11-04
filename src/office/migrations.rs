@@ -165,6 +165,14 @@ mod tests {
                 .sql
                 .contains("payload->>'eventType' = 'execution.activity'")
         );
+        let statements = activity
+            .sql
+            .split(';')
+            .map(str::trim)
+            .filter(|statement| !statement.is_empty())
+            .collect::<Vec<_>>();
+        assert_eq!(statements.len(), 1, "migration runner splits on semicolons");
+        assert!(statements[0].starts_with("CREATE INDEX"));
     }
 
     #[test]

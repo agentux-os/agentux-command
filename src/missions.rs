@@ -714,7 +714,8 @@ impl Engine {
         if !nodes.belongs_to(&run.organization_id, &node) {
             return self.fail_node_scope(run, state).await;
         }
-        if state.status.is_empty() {
+        let first_dispatch = state.status.is_empty();
+        if first_dispatch {
             state = Step {
                 kind: "agent".into(),
                 status: "dispatching".into(),
@@ -724,10 +725,25 @@ impl Engine {
                 ..Step::default()
             };
             state.command_id = format!("{}:{}:{}", run.run_id, run.step, state.attempt);
-            run.steps.insert(run.step.clone(), state.clone());
-            run.status = RUNNING.into();
-            run = self.commit(run, "mission.run.step_started", None).await?;
         }
+        // Reserve this run before awaiting the node. The scheduler may tick
+        // while run.start is in flight; without a future run_at it would send
+        // the same command concurrently and race the revision commit.
+        run.steps.insert(run.step.clone(), state.clone());
+        run.status = RUNNING.into();
+        run.error.clear();
+        run.run_at = Some(now + Duration::seconds(RECONCILE_AFTER));
+        run = self
+            .commit(
+                run,
+                if first_dispatch {
+                    "mission.run.step_started"
+                } else {
+                    "mission.run.step_retrying"
+                },
+                None,
+            )
+            .await?;
         let mut params = Map::new();
         for (key, value) in [
             ("commandId", state.command_id.clone()),
