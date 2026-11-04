@@ -29,7 +29,10 @@ class FixtureHandler(BaseHTTPRequestHandler):
             type(self).authorizations[self.path] = self.headers.get("Authorization")
         time.sleep(0.015)
         try:
-            self.send_response(503 if self.path == "/fail" else 200)
+            status = 503 if self.path == "/fail" else 302 if self.path == "/redirect" else 200
+            self.send_response(status)
+            if status == 302:
+                self.send_header("Location", "/ok")
             self.end_headers()
             self.wfile.write(b"ok")
         except OSError:
@@ -84,6 +87,11 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(failed["errors"], 3)
         self.assertEqual(failed["successes"], 0)
+        redirected = bench.run_scenario(
+            self.base, {**scenario, "path": "/redirect"}, requests=1, concurrency=1, timeout=2
+        )
+        self.assertEqual(redirected["errors"], 1)
+        self.assertEqual(redirected["http_status_counts"], {"302": 1})
         timed_out = bench.run_scenario(
             self.base, scenario, requests=1, concurrency=1, timeout=0.001
         )

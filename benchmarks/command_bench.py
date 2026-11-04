@@ -18,6 +18,14 @@ import urllib.request
 from pathlib import Path
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, response, code, message, headers, new_url):
+        return None
+
+
+HTTP_OPENER = urllib.request.build_opener(NoRedirectHandler)
+
+
 def validate_config(config):
     if not isinstance(config, dict):
         raise ValueError("configuration root must be a JSON object")
@@ -117,7 +125,7 @@ def _request(base_url, scenario, index, lane, lane_sequence, timeout):
     request = urllib.request.Request(base_url.rstrip("/") + path, data=data, headers=headers, method=method)
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with HTTP_OPENER.open(request, timeout=timeout) as response:
             response.read(1 if scenario.get("read_first_byte") else None)
             code = response.status
         ok = 200 <= code < 400
