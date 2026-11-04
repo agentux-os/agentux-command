@@ -108,8 +108,12 @@ pub async fn migrate(client: &mut Client) -> Result<(), Error> {
         .map_err(|e| Error::Storage(format!("create migration table: {e}")))?;
     for item in migrations {
         let fail = |what: &str, e: tokio_postgres::Error| {
+            let diagnostic = e
+                .as_db_error()
+                .map(|db| format!("{}: {}", db.code().code(), db.message()))
+                .unwrap_or_else(|| e.to_string());
             Error::Storage(format!(
-                "{what} migration {} ({}): {e}",
+                "{what} migration {} ({}): {diagnostic}",
                 item.version, item.name
             ))
         };

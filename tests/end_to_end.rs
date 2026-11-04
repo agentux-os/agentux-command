@@ -454,6 +454,8 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
         .await
         .unwrap()
         .with_demo_tokens(true);
+    let acme_reader = organization_reader(&handler, "acme").await;
+    let beta_reader = organization_reader(&handler, "beta").await;
     let robot = handler
         .service_tokens()
         .issue(
@@ -716,8 +718,6 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
 
     // A real ACP tool call must arrive over Core's gateway and be available
     // from Command's run-scoped replay API.
-    let acme_reader = organization_reader(&handler, "acme").await;
-    let beta_reader = organization_reader(&handler, "beta").await;
     let activity_path = format!("/v1/organizations/acme/runs/{run_id}/activity");
     let (status, activity_page) = call(&app, "GET", &activity_path, &acme_reader, None).await;
     assert_eq!(status, StatusCode::OK, "{activity_page}");
