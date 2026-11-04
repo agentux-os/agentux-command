@@ -154,7 +154,9 @@ async fn authorized_metrics_scrape_exposes_process_and_service_metrics_without_s
         .parse::<u64>()
         .unwrap();
     assert!(wait_age >= 1200);
-    assert!(output.contains("command_nodes{presence=\"online\"} 1"));
+    // The shared fixture hello timestamp is 2026-10-21, so this node is
+    // correctly offline when the metrics test runs on 2026-11-04.
+    assert!(output.contains("command_nodes{presence=\"offline\"} 1"));
     assert!(output.contains("command_node_connections{state=\"disconnected\"} 1"));
     assert!(output.contains(
         "command_http_requests_total{method=\"GET\",route=\"health\",status_class=\"2xx\"} 1"
