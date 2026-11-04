@@ -1005,6 +1005,52 @@ async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Respons
                     "execution.activity.v1 was not negotiated for this node",
                 );
             }
+            if message.method == "execution.activity" {
+                let activity = match serde_json::from_slice::<Value>(&body)
+                    .ok()
+                    .and_then(|message| message.pointer("/params/activity").cloned())
+                {
+                    Some(activity) => activity,
+                    None => return error(StatusCode::BAD_REQUEST, "invalid execution activity"),
+                };
+                let run_id = activity
+                    .get("runId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let mission_id = activity
+                    .get("missionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let run = match s.runs.get(&p.organization_id, run_id).await {
+                    Ok(run) => run,
+                    Err(missions::Error::NotFound) => {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "execution activity does not belong to this run and node",
+                        );
+                    }
+                    Err(missions::Error::Storage(_)) => {
+                        return error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "could not verify execution activity scope",
+                        );
+                    }
+                    Err(_) => {
+                        return error(
+                            StatusCode::BAD_REQUEST,
+                            "execution activity does not belong to this run and node",
+                        );
+                    }
+                };
+                if run.mission_id != mission_id
+                    || !run.steps.values().any(|step| step.node_id == p.node_id)
+                {
+                    return error(
+                        StatusCode::BAD_REQUEST,
+                        "execution activity does not belong to this run and node",
+                    );
+                }
+            }
             s.apply(&body, accepted_capabilities.clone());
             s.project(&message.method, &body).await;
         }

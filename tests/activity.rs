@@ -3,14 +3,51 @@
 mod common;
 
 use agentux_command::auth::{ORGANIZATION_READ, TokenRequest};
-use agentux_command::office;
+use agentux_command::missions::Store as _;
 use agentux_command::server::Handler;
+use agentux_command::{definitions::Actor, missions, office};
 use axum::http::StatusCode;
 use chrono::Utc;
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use common::{call, hello, params};
+
+async fn seed_run(store: &missions::Memory, run_id: &str, node_id: &str) {
+    let mission_id = "mission-1".to_string();
+    store
+        .insert(&missions::Run {
+            run_id: run_id.into(),
+            organization_id: "acme".into(),
+            definition_version: 1,
+            mission_id: mission_id.clone(),
+            workflow_id: "workflow-1".into(),
+            status: missions::RUNNING.into(),
+            step: "agent".into(),
+            input: missions::Input {
+                mission_id,
+                ..missions::Input::default()
+            },
+            schedule_id: None,
+            scheduled_for: None,
+            steps: BTreeMap::from([(
+                "agent".into(),
+                missions::Step {
+                    kind: "agent".into(),
+                    node_id: node_id.into(),
+                    ..missions::Step::default()
+                },
+            )]),
+            error: String::new(),
+            run_at: None,
+            created_by: Actor::of("operator:test"),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            revision: 1,
+        })
+        .await
+        .unwrap();
+}
 
 fn activity_message(org: &str, node: &str, event_id: &str, sequence: i64, run_id: &str) -> Value {
     json!({
@@ -71,7 +108,10 @@ async fn negotiate_activity(app: &axum::Router, org: &str, node: &str) {
 #[tokio::test]
 async fn accepts_typed_activity_once_and_replays_it_by_run_cursor() {
     let store = Arc::new(office::Store::new());
-    let handler = Handler::with_office(store.clone());
+    let runs = Arc::new(missions::Memory::default());
+    seed_run(&runs, "run-1", "node-1").await;
+    seed_run(&runs, "run-2", "node-1").await;
+    let handler = Handler::with_office(store.clone()).with_runs(runs);
     let reader = reader(&handler, "acme").await;
     let app = handler.router();
     negotiate_activity(&app, "acme", "node-1").await;
@@ -140,7 +180,9 @@ async fn accepts_typed_activity_once_and_replays_it_by_run_cursor() {
 
 #[tokio::test]
 async fn activity_replay_is_tenant_scoped_and_schema_invalid_payloads_are_refused() {
-    let handler = Handler::with_office(Arc::new(office::Store::new()));
+    let runs = Arc::new(missions::Memory::default());
+    seed_run(&runs, "run-shared", "node-1").await;
+    let handler = Handler::with_office(Arc::new(office::Store::new())).with_runs(runs);
     let acme = reader(&handler, "acme").await;
     let beta = reader(&handler, "beta").await;
     let app = handler.router();
@@ -173,6 +215,27 @@ async fn activity_replay_is_tenant_scoped_and_schema_invalid_payloads_are_refuse
     invalid["params"]["activity"]["privateReasoning"] = json!("do not persist");
     let (status, _) = call(&app, "POST", "/v1/protocol/messages", "", Some(invalid)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn execution_activity_rejects_unknown_runs_mission_mismatch_and_wrong_node() {
+    let runs = Arc::new(missions::Memory::default());
+    seed_run(&runs, "run-1", "node-1").await;
+    let handler = Handler::with_office(Arc::new(office::Store::new())).with_runs(runs);
+    let app = handler.router();
+    negotiate_activity(&app, "acme", "node-1").await;
+    negotiate_activity(&app, "acme", "node-2").await;
+
+    for (node, event, run, mission) in [
+        ("node-1", "unknown", "missing-run", "mission-1"),
+        ("node-1", "wrong-mission", "run-1", "another-mission"),
+        ("node-2", "wrong-node", "run-1", "mission-1"),
+    ] {
+        let mut message = activity_message("acme", node, event, 1, run);
+        message["params"]["activity"]["missionId"] = json!(mission);
+        let (status, _) = call(&app, "POST", "/v1/protocol/messages", "", Some(message)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{event}");
+    }
 }
 
 #[tokio::test]

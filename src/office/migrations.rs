@@ -172,7 +172,12 @@ mod tests {
             .filter(|statement| !statement.is_empty())
             .collect::<Vec<_>>();
         assert_eq!(statements.len(), 1, "migration runner splits on semicolons");
-        assert!(statements[0].starts_with("CREATE INDEX"));
+        let sql = statements[0]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(sql.trim_start().starts_with("CREATE INDEX"));
     }
 
     #[test]
