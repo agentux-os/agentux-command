@@ -665,7 +665,10 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     // ...the node's own approvals (its plan) are decided from Office and go
     // back to the node; then its agents finish, and the gate asks a person.
     let mut decided = std::collections::HashSet::new();
-    loop {
+    let mut reached_review = false;
+    let mut last_run = Value::Null;
+    let mut last_projection = Value::Null;
+    for _ in 0..600 {
         let (_, run) = call(
             &app,
             "GET",
@@ -675,8 +678,10 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
         )
         .await;
         if run["step"] == "review" {
+            reached_review = true;
             break;
         }
+        last_run = run.clone();
         let (_, projection) = call(
             &app,
             "GET",
@@ -685,6 +690,7 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
             None,
         )
         .await;
+        last_projection = projection.clone();
         for approval in projection["approvals"].as_array().unwrap() {
             let id = approval["id"].as_str().unwrap().to_string();
             if approval["status"] == "pending"
@@ -709,6 +715,10 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
         assert!(decided.len() < 20, "the node keeps asking: {run:#}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    assert!(
+        reached_review,
+        "timed out waiting for the review gate; last run: {last_run:#}; last projection: {last_projection:#}"
+    );
     assert!(!decided.is_empty(), "the node asked to approve its plan");
     let run = wait_for_run(&app, &run_id, "the human gate", |r| r["step"] == "review").await;
     assert_eq!(run["status"], "waiting");
