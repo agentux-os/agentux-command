@@ -151,7 +151,7 @@ async fn a_real_node_enrolls_reports_and_takes_commands() {
         Arc::new(FakeExecutor::default()),
     );
     let (stop_daemon, daemon_stopped) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn({
+    let mut daemon = tokio::spawn({
         let socket = socket.clone();
         async move {
             agentuxd::server::serve(engine, &socket, async {
@@ -160,8 +160,14 @@ async fn a_real_node_enrolls_reports_and_takes_commands() {
             .await
         }
     });
-    while !socket.exists() {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    tokio::select! {
+        _ = async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        } => {}
+        result = &mut daemon => panic!("agentuxd stopped before creating its socket: {result:?}"),
+        _ = tokio::time::sleep(Duration::from_secs(10)) => panic!("timed out waiting for agentuxd socket"),
     }
 
     // A token from another Command never leaves the node: the gateway sees
@@ -962,4 +968,5 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     let _ = stop_command_after_restart.send(());
     let _ = tokio::time::timeout(Duration::from_secs(10), command_server_after_restart).await;
     let _ = stop_daemon.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(10), daemon).await;
 }
