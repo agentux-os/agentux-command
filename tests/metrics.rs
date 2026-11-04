@@ -168,3 +168,4 @@ async fn authorized_metrics_scrape_exposes_process_and_service_metrics_without_s
     assert!(!output.contains("private-node-id"));
     assert!(!output.contains("private-actor"));
 }
+
