@@ -160,15 +160,91 @@ deploy/scripts/backup.sh /var/lib/agentux/command/backups
 # /var/lib/agentux/command/backups/agentux-command-20261022T120000Z.dump (+ .sha256)
 ```
 
-- **When:** at least daily, and always before an upgrade, from a systemd
-  timer or cron. The interval is your recovery point objective: what an
-  incident can lose.
-- **Keep:** for example 7 daily, 4 weekly and 3 monthly dumps, plus the one
-  taken before each upgrade until the next upgrade has proven itself.
-- **Encrypt** before a dump leaves the host. It holds tenant data and token
-  hashes. For example: `age -r <recipient> -o dump.age dump`, with the
-  identity kept away from the backup storage.
-- **Test** restores (below) on a schedule, not only when needed.
+For scheduled off-host backups, install Restic on the host and use the
+provided user-systemd services. Restic encrypts repository contents before
+upload; use a dedicated repository for Command so `latest` always refers to a
+Command database snapshot. Run the timers as the same OS account that owns the
+rootless Command Podman containers (`agentux` in the examples).
+
+1. Create an operator-managed Restic password file and environment file. Make
+   the environment file `root:agentux` mode `0640`; make the password file
+   readable by `agentux` but not other users. Do not put credentials in shell
+   history, unit files, or this repository. Start from
+   [`config/command-backup.env.example`](config/command-backup.env.example).
+   Add the chosen backend's credentials there (for example, the S3 access
+   key variables). Keep the Restic password recovery key outside the backup
+   destination.
+2. Enable lingering so the rootless user manager and timers run when the
+   account is logged out, then initialize the repository as that account:
+
+   ```sh
+   sudo loginctl enable-linger agentux
+   sudo -iu agentux systemd-run --user --wait --pipe \
+     --property=EnvironmentFile=/etc/agentux/command-backup.env /usr/bin/restic init
+   ```
+
+3. Install `backup-status.sh`, `backup-offsite.sh`,
+   `backup-lock.sh`, `verify-offsite-backup.sh`, `backup.sh`, and `restore.sh` under
+   `/usr/libexec/agentux-command/`, and the four units from `systemd/user/` in
+   the account's `~/.config/systemd/user/`. Install the scripts as executable.
+   Ensure the account can write `/var/lib/agentux/command` and the configured
+   node_exporter textfile collector directory.
+4. Configure node_exporter with
+   `--collector.textfile.directory=/var/lib/node_exporter/textfile_collector`.
+   The generated file contains only timestamps and counters; it has no labels
+   or credential values. Scrape node_exporter for these host-job metrics;
+   Command's `/metrics` endpoint itself runs inside the Command container.
+5. Enable both timers:
+
+   ```sh
+   systemctl --user daemon-reload
+   systemctl --user enable --now agentux-command-backup.timer
+   systemctl --user enable --now agentux-command-backup-verify.timer
+   ```
+
+The backup timer runs daily by default. `BACKUP_KEEP_DAILY`,
+`BACKUP_KEEP_WEEKLY`, and `BACKUP_KEEP_MONTHLY` default to 7, 4, and 3
+snapshots. Keep `BACKUP_STAGING_DIR` the same across runs so Restic applies
+retention to one stable source path. Override `OnCalendar=` with a timer
+drop-in to change the interval; choose it from the deployment's recovery point
+objective. The verification
+timer runs monthly, checks the full Restic repository data, restores the
+latest dump into a temporary PostgreSQL container, and runs
+`agentux-command check` from the currently deployed Command image. It needs
+network access to the Restic backend and the local Podman images. It does not
+stop or write to production Command or PostgreSQL. The temporary database
+uses trust authentication on a newly created internal-only Podman network
+shared only with the one-shot check container; both the container and network
+are removed when the job exits.
+
+Inspect timer runs and logs with:
+
+```sh
+systemctl --user list-timers 'agentux-command-backup*'
+journalctl --user -u agentux-command-backup.service -u agentux-command-backup-verify.service
+```
+
+Metrics published in the textfile collector:
+
+| Metric | Meaning |
+|---|---|
+| `agentux_command_backup_last_success_timestamp_seconds` | Unix time of the last successful remote backup |
+| `agentux_command_backup_failures_total` | Failed backup or retention attempts |
+| `agentux_command_restore_verification_last_success_timestamp_seconds` | Unix time of the last successful full restore verification |
+| `agentux_command_restore_verification_failures_total` | Failed repository, checksum, restore, or `check` attempts |
+
+Example alerts (adjust for the configured backup and verification schedule):
+
+```promql
+agentux_command_backup_last_success_timestamp_seconds == 0 or time() - agentux_command_backup_last_success_timestamp_seconds > 36 * 3600
+increase(agentux_command_backup_failures_total[1h]) > 0
+agentux_command_restore_verification_last_success_timestamp_seconds == 0 or time() - agentux_command_restore_verification_last_success_timestamp_seconds > 45 * 86400
+increase(agentux_command_restore_verification_failures_total[1d]) > 0
+```
+
+The systemd service's failed state and journal are also authoritative signals;
+the metric file is refreshed on each attempt. Keep one manual pre-upgrade
+backup with the existing `backup.sh` workflow as well.
 
 ### Restore
 
@@ -183,9 +259,16 @@ The restore runs in one transaction (all or nothing) after checking the
 dump's sha256. `agentux-command check` rebuilds every organization's Office
 projection from its event log, compares it with the stored one, and prints
 what the database holds (migration, organizations, events, definitions,
-runs, nodes, tokens). It exits non-zero on a mismatch. To restore onto a new
-host, bootstrap the bundle as above, start PostgreSQL only, restore, then
-start Command.
+runs, nodes, tokens). It exits non-zero on a mismatch. To restore onto a
+replacement host, install Restic and the operator-managed password/backend
+credentials, then restore the latest snapshot to a temporary directory with
+`restic restore latest --target <directory>`. Find the
+`agentux-command-*.dump` and `.sha256` files there, bootstrap the Command
+bundle, start PostgreSQL only, and run `deploy/scripts/restore.sh --yes
+<restored-dump>`. Start Command and run `podman exec agentux-command
+agentux-command check` before reconnecting operators and nodes. Keep the
+Restic password recovery key separate from the remote repository; without it,
+encrypted snapshots cannot be recovered.
 
 Nodes reconnect by themselves, and events they sent after the backup are
 deduplicated when they replay them. Operators' sessions and tokens are those

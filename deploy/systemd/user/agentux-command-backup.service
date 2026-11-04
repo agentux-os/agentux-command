@@ -1,0 +1,9 @@
+[Unit]
+Description=Encrypted off-host backup of AgentUX Command
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/agentux/command-backup.env
+ExecStart=/usr/libexec/agentux-command/backup-offsite.sh
+UMask=0077
+ProtectSystem=full
+PrivateTmp=true
