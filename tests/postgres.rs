@@ -8,6 +8,7 @@ use agentux_command::office::{
     self, Event, NodeEvent, OfficeRepository, PostgresStore, ResolutionRequest,
 };
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 async fn store() -> Option<(
     PostgresStore,
@@ -113,7 +114,7 @@ async fn node_event_ledger_survives_restart_and_rejects_sequence_gaps_and_identi
         method: "run.updated".into(),
         event_id: event_id.into(),
         sequence,
-        payload_digest: format!("sha256-{sequence}-{event_id}"),
+        payload_digest: hex::encode(Sha256::digest(format!("{sequence}-{event_id}").as_bytes())),
     };
     let first = node_event(1, "ledger-1");
     assert_eq!(
