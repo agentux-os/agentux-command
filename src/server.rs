@@ -1553,7 +1553,7 @@ async fn resolve_approval(
             if let Some(approval) = node_approval
                 && !response.idempotent_replay
             {
-                body["delivery"] = deliver(&s, &approval, &decision, &reason, &key).await;
+                body["delivery"] = deliver(&s, &org, &approval, &decision, &reason, &key).await;
             }
             reply(StatusCode::OK, body)
         }
@@ -2186,6 +2186,13 @@ const ENGINE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[async_trait::async_trait]
 impl missions::Nodes for NodesVia<'_> {
+    fn belongs_to(&self, organization_id: &str, node_id: &str) -> bool {
+        self.0
+            .registry
+            .get(node_id)
+            .is_some_and(|node| node.organization_id == organization_id)
+    }
+
     fn pick(&self, organization_id: &str) -> Option<String> {
         let mut nodes: Vec<String> = self
             .0
@@ -2202,17 +2209,24 @@ impl missions::Nodes for NodesVia<'_> {
 
     async fn command(
         &self,
+        organization_id: &str,
         node_id: &str,
         method: &str,
         mut params: Map<String, Value>,
     ) -> Result<Value, missions::NodeError> {
         use missions::NodeError;
         let s = self.0;
-        let organization = s
-            .registry
-            .get(node_id)
-            .map(|n| n.organization_id)
-            .unwrap_or_default();
+        let Some(node) = s.registry.get(node_id) else {
+            return Err(NodeError::Refused(
+                "node is not available in the run organization".into(),
+            ));
+        };
+        if node.organization_id != organization_id {
+            return Err(NodeError::Refused(
+                "node is not available in the run organization".into(),
+            ));
+        }
+        let organization = node.organization_id;
         let command_id = params
             .get("commandId")
             .and_then(Value::as_str)
@@ -2914,6 +2928,7 @@ async fn review_definition(
 /// what the delivery came to, for the decider.
 async fn deliver(
     s: &Inner,
+    organization_id: &str,
     approval: &Map<String, Value>,
     decision: &str,
     reason: &str,
@@ -2948,7 +2963,10 @@ async fn deliver(
     if !reason.is_empty() {
         params.insert("answer".into(), Value::String(reason.into()));
     }
-    match NodesVia(s).command(&node, "request.resolve", params).await {
+    match NodesVia(s)
+        .command(organization_id, &node, "request.resolve", params)
+        .await
+    {
         Ok(_) => json!({"nodeId": node, "delivered": true}),
         Err(NodeError::Unreachable(e) | NodeError::Held(e) | NodeError::Refused(e)) => {
             json!({"nodeId": node, "delivered": false, "error": e})
