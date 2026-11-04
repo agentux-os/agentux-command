@@ -473,7 +473,8 @@ impl Store for Postgres {
     ) -> Result<Vec<Occurrence>, Error> {
         let mut client = self.pool.get().await?;
         let tx = client.transaction().await?;
-        let rows = tx.query("SELECT o.doc FROM mission_schedule_occurrences o WHERE (o.status='pending' OR (o.status='dispatching' AND o.claimed_at < $1 - interval '5 minutes')) AND NOT EXISTS (SELECT 1 FROM mission_schedule_occurrences d WHERE d.schedule_id=o.schedule_id AND d.run_id<>o.run_id AND d.status='dispatching' AND d.claimed_at >= $1 - interval '5 minutes') ORDER BY o.scheduled_for LIMIT $2 FOR UPDATE OF o SKIP LOCKED", &[&now, &limit]).await?;
+        let expired_before = now - chrono::Duration::minutes(5);
+        let rows = tx.query("SELECT o.doc FROM mission_schedule_occurrences o WHERE (o.status='pending' OR (o.status='dispatching' AND o.claimed_at < $1)) AND NOT EXISTS (SELECT 1 FROM mission_schedule_occurrences d WHERE d.schedule_id=o.schedule_id AND d.run_id<>o.run_id AND d.status='dispatching' AND d.claimed_at >= $1) ORDER BY o.scheduled_for LIMIT $2 FOR UPDATE OF o SKIP LOCKED", &[&expired_before, &limit]).await?;
         let mut claimed = Vec::new();
         let mut schedules = std::collections::BTreeSet::new();
         for row in rows {
