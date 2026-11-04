@@ -130,11 +130,9 @@ pub async fn migrate(client: &mut Client) -> Result<(), Error> {
             .map_err(|e| fail("read", e))?
             .get(0);
         if !applied {
-            for statement in item.sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                tx.execute(statement, &[])
-                    .await
-                    .map_err(|e| fail("execute", e))?;
-            }
+            tx.batch_execute(item.sql)
+                .await
+                .map_err(|e| fail("execute", e))?;
             tx.execute(
                 "INSERT INTO command_schema_migrations (version, name) VALUES ($1, $2)",
                 &[&item.version, &item.name],
