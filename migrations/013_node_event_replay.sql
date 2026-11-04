@@ -1,5 +1,5 @@
 -- Durable receiver ledger for AUXP node notifications. The cursor is the
--- highest contiguous sequence; old deployments seed it from their existing
+-- highest contiguous sequence. Old deployments seed it from their existing
 -- durable node and Office cursors before replay is negotiated.
 CREATE TABLE IF NOT EXISTS command_node_event_cursors (
     organization_id text NOT NULL,

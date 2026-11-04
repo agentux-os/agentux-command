@@ -200,6 +200,13 @@ mod tests {
                 .sql
                 .contains("UNIQUE (organization_id, node_id, event_id)")
         );
+        assert!(
+            replay
+                .sql
+                .lines()
+                .all(|line| { !line.trim_start().starts_with("--") || !line.contains(';') }),
+            "migration runner splits SQL on semicolons, including comment text"
+        );
     }
 
     #[test]
