@@ -696,7 +696,7 @@ impl Inner {
         let moved = if method == "command.completed" {
             engine
                 .command_completed(
-                    org,
+                    &org,
                     data["commandId"].as_str().unwrap_or_default(),
                     data["ok"].as_bool().unwrap_or(false),
                     &data["result"],
@@ -706,7 +706,7 @@ impl Inner {
                 .await
         } else {
             engine
-                .node_event(org, &node_run, &correlation, method, &error, &nodes)
+                .node_event(&org, &node_run, &correlation, method, &error, &nodes)
                 .await
         };
         if let Err(e) = moved {
@@ -1174,7 +1174,10 @@ fn schedule_node_resume(state: Arc<Inner>, organization_id: String, node_id: Str
             eprintln!("agentux-command: node {node_id} returned no event replay result");
             return;
         };
-        let replay: auxp::replay::ReplayResult = match serde_json::from_value(result) {
+        let replay: auxp::replay::ReplayResult = match serde_json::from_value::<
+            auxp::replay::ReplayResult,
+        >(result)
+        {
             Ok(replay) if replay.validate().is_ok() => replay,
             _ => {
                 eprintln!("agentux-command: node {node_id} returned invalid event replay metadata");

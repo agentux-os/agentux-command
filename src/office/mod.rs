@@ -661,7 +661,7 @@ impl OfficeRepository for Store {
                 ),
             ));
         }
-        if let Some(mut projection) = projection {
+        if let Some(projection) = projection {
             let projection_cursor = state
                 .sequences
                 .get(&(event.organization_id.clone(), event.node_id.clone()))
