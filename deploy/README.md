@@ -71,6 +71,78 @@ Command `Requires=` PostgreSQL only. NATS and the object store come with the
 bundle for what is next ([ADR 0020](https://github.com/agentux-os/agentux/blob/main/docs/adr/0020-command-workflows-without-temporal.md));
 Command keeps nothing in them today, and their failure does not stop it.
 
+### Metrics and alerting
+
+Command exposes Prometheus text metrics at `/metrics` only when
+`AGENTUX_COMMAND_METRICS_TOKEN` is configured. Supply a dedicated bearer token
+of at least 32 random bytes through the operator's secret mechanism; do not
+reuse an operator, node, OIDC, webhook, or database credential. Keep the
+endpoint on a trusted monitoring network, restrict it at the firewall or
+reverse proxy, and use TLS when the scrape crosses a host boundary. Without a
+token, `/metrics` returns 404; a missing or incorrect bearer token receives
+401. The token is never included in metric output or labels.
+
+Example scrape from a monitoring host, with the token injected from its secret
+store into the process environment:
+
+```sh
+curl --fail --silent -H "Authorization: Bearer ${AGENTUX_COMMAND_METRICS_TOKEN}" \
+  https://command.example.invalid/metrics
+```
+
+Metrics use fixed label values only. They do not include organization, user,
+node, run, URL, prompt, event payload, or credential values. HTTP `method` is
+one of GET/POST/PUT/PATCH/DELETE/HEAD/OPTIONS/OTHER; `route` is a fixed route
+group; `status_class` is 1xx–5xx/other. Run state, node presence, and
+connection state use fixed enumerations. There are no tenant or resource ID
+labels. Histograms use seconds and fixed buckets from 5 ms through 5 s plus
+infinity.
+
+| Metric | Type / unit | Labels | Meaning |
+|---|---|---|---|
+| `command_http_requests_total` | counter / requests | method, route, status_class | Requests handled by this process |
+| `command_http_errors_total` | counter / responses | method, route, status_class | 4xx and 5xx responses |
+| `command_http_request_duration_seconds` | histogram / seconds | method, route | Request latency |
+| `command_database_configured` | gauge / boolean | none | PostgreSQL is configured |
+| `command_database_ready` | gauge / boolean | none | PostgreSQL answered the scrape query |
+| `command_event_sink_configured` | gauge / boolean | none | Optional webhook delivery sink is configured |
+| `command_event_outbox_pending_events` | gauge / events | none | Undelivered database outbox rows |
+| `command_event_outbox_failed_events` | gauge / events | none | Pending rows with a previous delivery failure |
+| `command_event_outbox_oldest_age_seconds` | gauge / seconds | none | Age of the oldest pending event |
+| `command_office_events_estimated_rows` | gauge / estimated rows | none | PostgreSQL statistics estimate of rows retained in the Office event log |
+| `command_event_retention_enabled` | gauge / boolean | none | Archive-before-prune job is enabled |
+| `command_database_size_bytes` | gauge / bytes | none | Current PostgreSQL database size |
+| `command_mission_runs` | gauge / runs | state | Active runs in running or waiting state |
+| `command_mission_waiting_oldest_age_seconds` | gauge / seconds | none | Age of the oldest waiting run |
+| `command_nodes` | gauge / nodes | presence | Nodes grouped by heartbeat-derived online/degraded/offline state |
+| `command_node_connections` | gauge / nodes | state | Connected or disconnected node protocol channels |
+| `command_node_heartbeat_max_age_seconds` | gauge / seconds | none | Maximum age of a known node heartbeat |
+
+Example Prometheus alert expressions (choose windows and thresholds to match
+your measured workload and support objectives):
+
+```promql
+command_database_ready == 0
+increase(command_http_errors_total{status_class="5xx"}[5m]) > 0
+command_event_outbox_oldest_age_seconds > 300
+command_mission_waiting_oldest_age_seconds > 1800
+command_nodes{presence="offline"} > 0
+node_filesystem_avail_bytes{mountpoint="/path/to/postgresql-volume"} / node_filesystem_size_bytes{mountpoint="/path/to/postgresql-volume"} < 0.15
+```
+
+Replace `/path/to/postgresql-volume` with the actual PostgreSQL volume
+mountpoint reported by the host's filesystem exporter. Use the offline-node
+alert only when every registered node is expected to be online. Gate outbox
+backlog alerts on `command_event_sink_configured == 1`; an unconfigured sink
+is an intentional operating mode. Set the outbox and waiting-run thresholds
+from the deployment's delivery and workflow objectives; no universal
+threshold is assumed. Compare database size with free space on the actual
+PostgreSQL volume using host metrics. The scrape remains useful when the
+optional event sink is not configured or unavailable: HTTP, database, outbox,
+mission, and node metrics are local to Command and PostgreSQL. NATS and the
+object store are not required for this scrape. Database query failures set
+`command_database_ready` to 0 while process and in-memory metrics continue.
+
 ### Backups
 
 All of Command's state is in PostgreSQL: event log, projections,

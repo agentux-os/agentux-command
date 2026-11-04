@@ -26,6 +26,7 @@ use auxp::enrollment;
 use auxp::provision::{CommandJoin, Provision};
 
 use crate::enroll::{self, TokenRequest};
+use crate::metrics::Metrics;
 use crate::missions;
 use crate::nodes::{self, Registry};
 use crate::office::{self, OfficeRepository, ResolutionRequest};
@@ -75,6 +76,12 @@ struct Inner {
     changed: tokio::sync::Notify,
     /// Missions' runs.
     runs: Arc<dyn missions::Store>,
+    /// Process-local low-cardinality HTTP metrics.
+    metrics: Arc<Metrics>,
+    /// Dedicated scrape bearer token; absent means the endpoint is disabled.
+    metrics_token: Option<String>,
+    event_sink_configured: bool,
+    event_retention_enabled: bool,
 }
 
 /// A Command server, configured with the `with_*` methods, served by
@@ -131,6 +138,10 @@ impl Handler {
                 database: None,
                 changed: tokio::sync::Notify::new(),
                 runs: Arc::new(missions::Memory::default()),
+                metrics: Arc::new(Metrics::default()),
+                metrics_token: None,
+                event_sink_configured: false,
+                event_retention_enabled: false,
             },
         }
     }
@@ -168,10 +179,17 @@ impl Handler {
     /// Delivers the events Command takes to `sink`, from the database's
     /// outbox ([`outbox`](crate::outbox)); without a sink the outbox is only
     /// kept bounded. Nothing to do without a database.
-    pub fn deliver_events(self, sink: Option<Arc<dyn crate::outbox::Sink>>) -> Self {
+    pub fn deliver_events(mut self, sink: Option<Arc<dyn crate::outbox::Sink>>) -> Self {
+        self.inner.event_sink_configured = sink.is_some();
         if let Some(pool) = &self.inner.database {
             crate::outbox::Delivery::new(pool.clone(), sink).spawn(Duration::from_secs(2));
         }
+        self
+    }
+
+    /// Reports whether the optional event archive/prune job is enabled.
+    pub fn with_event_retention_enabled(mut self, enabled: bool) -> Self {
+        self.inner.event_retention_enabled = enabled;
         self
     }
 
@@ -179,6 +197,16 @@ impl Handler {
     pub fn with_runs(mut self, store: Arc<dyn missions::Store>) -> Self {
         self.inner.runs = store;
         self
+    }
+
+    /// Enables `/metrics` for holders of a dedicated bearer token.
+    pub fn with_metrics_token(mut self, token: &str) -> Result<Self, String> {
+        let token = token.trim();
+        if !token.is_empty() && token.as_bytes().len() < 32 {
+            return Err("AGENTUX_COMMAND_METRICS_TOKEN must contain at least 32 bytes".into());
+        }
+        self.inner.metrics_token = (!token.is_empty()).then(|| token.to_string());
+        Ok(self)
     }
 
     /// Keeps organization definitions and their audit log in `store`.
@@ -292,6 +320,7 @@ impl Handler {
             .route("/console/{file}", get(console_file))
             .route("/livez", get(livez))
             .route("/readyz", get(healthz))
+            .route("/metrics", get(metrics_endpoint))
             .route("/v1/instance", get(instance))
             .route("/v1/nodes", get(list_nodes))
             .route("/v1/enroll", post(redeem))
@@ -349,6 +378,10 @@ impl Handler {
             .method_not_allowed_fallback(not_found)
             .layer(axum::extract::DefaultBodyLimit::max(MESSAGE_LIMIT))
             .layer(axum::middleware::from_fn_with_state(
+                state.metrics.clone(),
+                track_request,
+            ))
+            .layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 same_origin,
             ))
@@ -357,6 +390,24 @@ impl Handler {
 }
 
 type AppState = State<Arc<Inner>>;
+
+async fn track_request(
+    State(metrics): State<Arc<Metrics>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let method = request.method().as_str().to_owned();
+    let path = request.uri().path().to_owned();
+    let started = std::time::Instant::now();
+    let response = next.run(request).await;
+    metrics.record_request(
+        &method,
+        &path,
+        response.status().as_u16(),
+        started.elapsed(),
+    );
+    response
+}
 
 fn reply(status: StatusCode, body: Value) -> Response {
     (status, axum::Json(body)).into_response()
@@ -693,6 +744,131 @@ async fn healthz(State(s): AppState) -> Response {
 /// manager restarts Command when this fails, not when its database is down.
 async fn livez() -> Response {
     reply(StatusCode::OK, json!({"status": "alive"}))
+}
+
+async fn metrics_endpoint(State(s): AppState, headers: HeaderMap) -> Response {
+    let Some(expected) = s.metrics_token.as_deref() else {
+        return not_found().await;
+    };
+    let supplied = bearer(&headers);
+    if supplied.len() != expected.len()
+        || !bool::from(supplied.as_bytes().ct_eq(expected.as_bytes()))
+    {
+        return error(StatusCode::UNAUTHORIZED, "metrics bearer token required");
+    }
+
+    let mut output = s.metrics.render_http();
+    output.push_str("# HELP command_database_configured Whether PostgreSQL is configured.\n# TYPE command_database_configured gauge\n");
+    output.push_str(&format!(
+        "command_database_configured {}\n",
+        u8::from(s.database.is_some())
+    ));
+    output.push_str("# HELP command_event_sink_configured Whether the optional event delivery sink is configured.\n# TYPE command_event_sink_configured gauge\n");
+    output.push_str(&format!(
+        "command_event_sink_configured {}\n",
+        u8::from(s.event_sink_configured)
+    ));
+    output.push_str("# HELP command_event_retention_enabled Whether the optional archive-before-prune job is enabled.\n# TYPE command_event_retention_enabled gauge\n");
+    output.push_str(&format!(
+        "command_event_retention_enabled {}\n",
+        u8::from(s.event_retention_enabled)
+    ));
+    let db_ready = if let Some(pool) = &s.database {
+        match pool.get().await {
+            Ok(client) => match client.query_one(
+                "SELECT (SELECT count(*) FROM office_outbox WHERE delivered_at IS NULL)::bigint,\n                        (SELECT count(*) FROM office_outbox WHERE delivered_at IS NULL AND last_error IS NOT NULL)::bigint,\n                        COALESCE((SELECT EXTRACT(EPOCH FROM (now() - min(created_at))) FROM office_outbox WHERE delivered_at IS NULL), 0)::double precision,\n                        (SELECT COALESCE(sum(n_live_tup), 0)::bigint FROM pg_stat_user_tables WHERE relname LIKE 'office_events_p%')::bigint,\n                        pg_database_size(current_database())::bigint",
+                &[],
+            ).await {
+                Ok(row) => {
+                    output.push_str("# HELP command_event_outbox_pending_events Undelivered events currently in the database outbox.\n# TYPE command_event_outbox_pending_events gauge\n");
+                    output.push_str(&format!("command_event_outbox_pending_events {}\n", row.get::<_, i64>(0)));
+                    output.push_str("# HELP command_event_outbox_failed_events Undelivered outbox events with at least one failed delivery attempt.\n# TYPE command_event_outbox_failed_events gauge\n");
+                    output.push_str(&format!("command_event_outbox_failed_events {}\n", row.get::<_, i64>(1)));
+                    output.push_str("# HELP command_event_outbox_oldest_age_seconds Age of the oldest undelivered event.\n# TYPE command_event_outbox_oldest_age_seconds gauge\n");
+                    output.push_str(&format!("command_event_outbox_oldest_age_seconds {}\n", row.get::<_, f64>(2)));
+                    output.push_str("# HELP command_office_events_estimated_rows Estimated event rows retained in the Office event log (PostgreSQL statistics).\n# TYPE command_office_events_estimated_rows gauge\n");
+                    output.push_str(&format!("command_office_events_estimated_rows {}\n", row.get::<_, i64>(3)));
+                    output.push_str("# HELP command_database_size_bytes PostgreSQL database size in bytes.\n# TYPE command_database_size_bytes gauge\n");
+                    output.push_str(&format!("command_database_size_bytes {}\n", row.get::<_, i64>(4)));
+                    1
+                }
+                Err(_) => 0,
+            },
+            Err(_) => 0,
+        }
+    } else {
+        0
+    };
+    output.push_str("# HELP command_database_ready Whether PostgreSQL answered the metrics scrape query.\n# TYPE command_database_ready gauge\n");
+    output.push_str(&format!("command_database_ready {db_ready}\n"));
+
+    let mut running = 0usize;
+    let mut waiting = 0usize;
+    let mut oldest_waiting_age = 0i64;
+    if let Ok(runs) = s.runs.active(None).await {
+        for run in runs {
+            match run.status.as_str() {
+                missions::RUNNING => running += 1,
+                missions::WAITING => {
+                    waiting += 1;
+                    oldest_waiting_age = oldest_waiting_age
+                        .max((chrono::Utc::now() - run.updated_at).num_seconds().max(0));
+                }
+                _ => {}
+            }
+        }
+    }
+    output.push_str("# HELP command_mission_runs Current active mission runs by fixed lifecycle state.\n# TYPE command_mission_runs gauge\n");
+    output.push_str(&format!("command_mission_runs{{state=\"running\"}} {running}\ncommand_mission_runs{{state=\"waiting\"}} {waiting}\n"));
+    output.push_str("# HELP command_mission_waiting_oldest_age_seconds Age of the oldest currently waiting mission.\n# TYPE command_mission_waiting_oldest_age_seconds gauge\n");
+    output.push_str(&format!(
+        "command_mission_waiting_oldest_age_seconds {oldest_waiting_age}\n"
+    ));
+
+    let nodes = s.registry.list();
+    let mut presence = [0usize; 3];
+    let mut connected = [0usize; 2];
+    let mut max_age = 0i64;
+    for node in nodes {
+        match node.presence.as_str() {
+            "online" => presence[0] += 1,
+            "degraded" => presence[1] += 1,
+            _ => presence[2] += 1,
+        }
+        if s.hub.connected(&node.id) {
+            connected[0] += 1;
+        } else {
+            connected[1] += 1;
+        }
+        if let Ok(seen) = chrono::DateTime::parse_from_rfc3339(&node.last_seen_at) {
+            max_age = max_age.max(
+                (chrono::Utc::now() - seen.with_timezone(&chrono::Utc))
+                    .num_seconds()
+                    .max(0),
+            );
+        }
+    }
+    output.push_str(
+        "# HELP command_nodes Nodes by heartbeat-derived presence.\n# TYPE command_nodes gauge\n",
+    );
+    for (state, count) in ["online", "degraded", "offline"].into_iter().zip(presence) {
+        output.push_str(&format!("command_nodes{{presence=\"{state}\"}} {count}\n"));
+    }
+    output.push_str("# HELP command_node_connections Node protocol connections by fixed state.\n# TYPE command_node_connections gauge\n");
+    output.push_str(&format!("command_node_connections{{state=\"connected\"}} {}\ncommand_node_connections{{state=\"disconnected\"}} {}\n", connected[0], connected[1]));
+    output.push_str("# HELP command_node_heartbeat_max_age_seconds Maximum age of a known node heartbeat in seconds.\n# TYPE command_node_heartbeat_max_age_seconds gauge\n");
+    output.push_str(&format!(
+        "command_node_heartbeat_max_age_seconds {max_age}\n"
+    ));
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(axum::body::Body::from(output))
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
 async fn instance(State(s): AppState) -> Response {
