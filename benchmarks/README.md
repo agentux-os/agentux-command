@@ -20,7 +20,7 @@ Before running the full file, seed the isolated organization with:
 - one distinct active, pausable mission run per request, named `bench-active-run-1` through `bench-active-run-N`, using a definition that can be paused;
 - an event stream cursor that can deliver at least one event (the runner records time to first byte and closes that stream).
 
-The example uses a deterministic occurred-at timestamp for reproducibility; use a current timestamp if the deployment enforces freshness. Each fixed worker uses its own node ID and sequential cursor while `{index}` keeps event IDs and mission IDs unique across lanes. For another invocation, use a fresh event/run prefix or disposable organization and a fresh set of active mission runs. The example order ingests events and heartbeats before replay/projection/stream reads and mission transitions.
+The heartbeat `capacity: {"benchmark": true}` value is a schema-compatible marker, not a claim about node resources. The example uses a deterministic occurred-at timestamp for reproducibility; use a current timestamp if the deployment enforces freshness. Each fixed worker uses its own node ID and sequential cursor while `{index}` keeps event IDs and mission IDs unique across lanes. For another invocation, use a fresh event/run prefix or disposable organization and a fresh set of active mission runs. The example order ingests events and heartbeats before replay/projection/stream reads and mission transitions.
 
 ## Run and retain evidence
 

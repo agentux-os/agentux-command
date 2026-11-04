@@ -40,7 +40,10 @@
           "nodeId": "bench-node-{lane}",
           "messageId": "heartbeat-{index}",
           "occurredAt": "2026-11-04T12:00:00Z",
-          "status": "ready"
+          "status": "ready",
+          "capacity": {
+            "benchmark": true
+          }
         }
       }
     },

@@ -64,6 +64,15 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bench.validate_config([])
 
+    def test_example_heartbeat_matches_the_protocol_contract(self):
+        example_path = Path(__file__).with_name("scenarios.example.json")
+        example = json.loads(example_path.read_text(encoding="utf-8"))
+        heartbeat = next(item for item in example["scenarios"] if item["name"] == "heartbeats")
+        self.assertEqual(heartbeat["json"]["method"], "node.heartbeat")
+        self.assertEqual(heartbeat["json"]["params"]["status"], "ready")
+        self.assertIsInstance(heartbeat["json"]["params"]["capacity"], dict)
+        self.assertTrue(heartbeat["json"]["params"]["capacity"])
+
     def test_worker_pool_is_bounded_and_http_errors_are_counted(self):
         FixtureHandler.peak = 0
         scenario = {"name": "bounded", "method": "GET", "path": "/ok"}
@@ -93,6 +102,9 @@ class BenchmarkTests(unittest.TestCase):
     def test_config_loads_checked_in_scenarios(self):
         data = json.loads((Path(__file__).with_name("scenarios.example.json")).read_text())
         checked = {"base_url": self.base, "requests": 10, "concurrency": 2, "scenarios": data["scenarios"]}
+        heartbeat = next(item for item in checked["scenarios"] if item["name"] == "heartbeats")
+        self.assertIsInstance(heartbeat["json"]["params"].get("capacity"), dict)
+        self.assertTrue(heartbeat["json"]["params"]["capacity"])
         original = dict(os.environ)
         try:
             os.environ.update({"BENCH_NODE_TOKEN": "fixture", "BENCH_OPERATOR_TOKEN": "fixture"})
@@ -100,6 +112,18 @@ class BenchmarkTests(unittest.TestCase):
         finally:
             os.environ.clear()
             os.environ.update(original)
+
+    def test_example_scenarios_use_declared_server_routes(self):
+        routes = (Path(__file__).parents[1] / "src" / "server.rs").read_text(encoding="utf-8")
+        for route in (
+            '.route("/v1/protocol/messages", post(message))',
+            '.route("/v1/office/projection", get(projection))',
+            '.route("/v1/organizations/{org}/events", get(organization_events))',
+            '.route("/v1/organizations/{org}/events/stream", get(stream_events))',
+            '"/v1/organizations/{org}/runs/{run}/{action}"',
+            "post(control_run)",
+        ):
+            self.assertIn(route, routes, route)
 
     def test_missing_optional_collectors_are_reported_unavailable(self):
         stop = threading.Event()
