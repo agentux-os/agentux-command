@@ -33,10 +33,14 @@ The OS profile manager creates `/var/lib/agentux/command`. An operator then:
      --capabilities auth.admin,organization.read,node.enroll,node.command,approval.decide
    ```
 
-   Further tokens come from `POST /v1/service-tokens`. The demo tokens are
-   refused unless `AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1` (development only).
+   Further tokens come from `POST /v1/service-tokens`. The PostgreSQL server
+   refuses demo tokens and open-node mode by default. Their insecure switches
+   are accepted only with `AGENTUX_COMMAND_DEVELOPMENT_MODE=1`, a literal
+   loopback bind, and no configured public URL or OIDC provider; do not set
+   these development options in a deployment.
 
-For interactive web access, configure the OIDC issuer, client, and role map in
+For interactive web access, configure the canonical HTTPS
+`AGENTUX_COMMAND_PUBLIC_URL`, OIDC issuer, client, and role map in
 `command.env.example`. The published image includes the version-pinned Office
 and Console bundles and serves them at `/office/` and `/console/` on the same
 origin. Console 0.1.1 is pinned with its SHA-256 in the Command `Containerfile`.

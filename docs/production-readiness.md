@@ -33,8 +33,11 @@ An operator using this profile is responsible for all of the following:
 
 - **Network and TLS:** expose Command only through an operator-managed TLS
   terminator or an equivalent secure ingress. Use HTTPS for browser, node,
-  and identity-provider traffic. Restrict direct access to the container port;
-  configure forwarded headers only where the proxy is trusted.
+  and identity-provider traffic. Set `AGENTUX_COMMAND_PUBLIC_URL` to the
+  canonical HTTPS origin; Command does not trust client-supplied
+  `X-Forwarded-Host` or `X-Forwarded-Proto` for its CSRF origin check. Restrict
+  direct access to the container port and have the proxy overwrite forwarded
+  headers before passing requests upstream.
 - **Persistent storage:** keep PostgreSQL on persistent storage with free-space
   monitoring and a tested recovery path. Protect the host and volume from
   unauthorized access. The current event log is retained indefinitely by
@@ -49,6 +52,10 @@ An operator using this profile is responsible for all of the following:
   role map for people. Keep database, OIDC, and node credentials in an
   operator-managed secret store, rotate them, and restrict access. Do not use
   demo tokens or unauthenticated node protocol mode.
+- **Development switches:** never enable demo operator tokens or open-node
+  mode on a deployed instance. The process rejects those switches unless it
+  is explicitly marked for development, bound to loopback, and has no public
+  URL or OIDC provider configured.
 - **Operations:** monitor `/readyz` from outside the host, retain service and
   database logs, alert on failed checks and storage pressure, and apply pinned
   image upgrades in a maintenance window after a verified backup. Rollback of

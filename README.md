@@ -90,7 +90,7 @@ So two Command servers in one institution never take each other's nodes: tokens 
 
 **Fleets of VMs.** Add `"provision": { "profile": "node", "user": "dev", "policy"?, "preferences"? }` to the token request, and each token comes with a ready provision file (`version`, `profile`, `user`, `command.url`, `command.enrollmentToken`, ...) for `aux provision` (agentux-core `docs/provision.md`): give each VM its file through QEMU fw_cfg, an `AGENTUX` disk or the kernel command line, and it comes up enrolled. The URL in it is `AGENTUX_COMMAND_PUBLIC_URL`, or the address the request came to.
 
-Static tokens (`AGENTUX_COMMAND_NODE_TOKENS`) still work. Nodes that are neither enrolled nor listed are refused, except on the in-memory demo server or with `AGENTUX_COMMAND_INSECURE_OPEN_NODES=1`.
+Static tokens (`AGENTUX_COMMAND_NODE_TOKENS`) still work. Nodes that are neither enrolled nor listed are refused, except on the in-memory demo server or in the explicitly constrained local development mode described below.
 
 ## Node commands
 
@@ -158,7 +158,10 @@ AGENTUX_COMMAND_OIDC_SCOPES="openid profile email groups"  # default
 ```
 The demo tokens (`demo-leader`: every capability but `auth.admin` in every
 organization; `demo-observer`: `organization.read`) work on the in-memory demo
-server, and on a real one only with `AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1`.
+server. The PostgreSQL server refuses the insecure demo switches unless
+`AGENTUX_COMMAND_DEVELOPMENT_MODE=1` is also set, it binds to a literal
+loopback address, and neither a public URL nor OIDC is configured. Never use
+that development mode in a deployed server.
 
 ## Organization definitions
 
@@ -228,7 +231,8 @@ cargo test --test end_to_end
 To try it by hand, run Command with demo tokens and Office against it:
 
 ```sh
-AGENTUX_COMMAND_DATABASE_URL=postgres://... AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1 cargo run
+AGENTUX_COMMAND_DATABASE_URL=postgres://... AGENTUX_COMMAND_ADDR=127.0.0.1:8080 \
+  AGENTUX_COMMAND_DEVELOPMENT_MODE=1 AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1 cargo run
 # in agentux-apps:
 COMMAND_URL=http://127.0.0.1:8080 COMMAND_TOKEN=demo-leader COMMAND_ORGANIZATION=acme npm run serve
 ```
