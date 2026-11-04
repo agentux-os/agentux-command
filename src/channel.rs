@@ -99,7 +99,7 @@ impl Hub {
     /// that is not an answer to a command.
     pub async fn serve(&self, ws: WebSocket, node_id: &str, on_message: impl Fn(&str, &[u8])) {
         self.serve_async(ws, node_id, move |node, raw| {
-            on_message(node, raw);
+            on_message(&node, &raw);
             Box::pin(async {})
         })
         .await;
@@ -109,7 +109,7 @@ impl Hub {
     /// events before the connection reads its next frame.
     pub async fn serve_async<F>(&self, ws: WebSocket, node_id: &str, on_message: F)
     where
-        F: for<'a> Fn(&'a str, &'a [u8]) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>,
+        F: Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     {
         let (mut sink, mut stream) = ws.split();
         let (out, mut outgoing) = mpsc::unbounded_channel::<Outgoing>();
@@ -178,7 +178,7 @@ impl Hub {
                 }
                 continue;
             }
-            on_message(node_id, &data).await;
+            on_message(node_id.to_string(), data).await;
         }
 
         {

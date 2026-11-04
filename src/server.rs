@@ -1119,7 +1119,7 @@ async fn connect(
         .on_upgrade(move |ws| async move {
             let message_state = state.clone();
             let connection_organization = organization_id;
-            let on_message = move |node: &str, raw: &[u8]| {
+            let on_message = move |node: String, raw: Vec<u8>| {
                 websocket_node_message(
                     message_state.clone(),
                     connection_organization.clone(),
@@ -1136,23 +1136,23 @@ async fn connect(
     response
 }
 
-fn websocket_node_message<'a>(
+fn websocket_node_message(
     state: Arc<Inner>,
     connection_organization: String,
-    node: &'a str,
-    raw: &'a [u8],
-) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    node: String,
+    raw: Vec<u8>,
+) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
     Box::pin(async move {
         // A node's own connection only speaks for that node.
-        let speaks_for = serde_json::from_slice::<Value>(raw).ok().and_then(|v| {
+        let speaks_for = serde_json::from_slice::<Value>(&raw).ok().and_then(|v| {
             v.pointer("/params/nodeId")
                 .and_then(Value::as_str)
                 .map(str::to_string)
         });
-        if speaks_for.as_deref() != Some(node) {
+        if speaks_for.as_deref() != Some(node.as_str()) {
             return;
         }
-        let Ok(message) = protocol::read(raw) else {
+        let Ok(message) = protocol::read(&raw) else {
             return;
         };
         // Identity and capability negotiation are established over the
@@ -1164,7 +1164,7 @@ fn websocket_node_message<'a>(
         }
         if message.method == "execution.activity" {
             let params = &message.params;
-            let negotiated = state.registry.get(node).is_some_and(|registered| {
+            let negotiated = state.registry.get(&node).is_some_and(|registered| {
                 registered.organization_id == params.organization_id
                     && registered
                         .accepted_capabilities
@@ -1174,22 +1174,22 @@ fn websocket_node_message<'a>(
             if !negotiated {
                 return;
             }
-            let activity = serde_json::from_slice::<Value>(raw)
+            let activity = serde_json::from_slice::<Value>(&raw)
                 .ok()
                 .and_then(|message| message.pointer("/params/activity").cloned());
             let Some(activity) = activity else {
                 return;
             };
-            if validate_activity_scope(&state, &params.organization_id, node, &activity)
+            if validate_activity_scope(&state, &params.organization_id, &node, &activity)
                 .await
                 .is_err()
             {
                 return;
             }
-            state.apply(raw, None);
-            state.project(&message.method, raw).await;
+            state.apply(&raw, None);
+            state.project(&message.method, &raw).await;
         } else {
-            state.apply(raw, None);
+            state.apply(&raw, None);
         }
     })
 }
