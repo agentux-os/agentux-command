@@ -58,6 +58,10 @@ const FILES: &[(&str, &str)] = &[
         "013_node_event_replay.sql",
         include_str!("../../migrations/013_node_event_replay.sql"),
     ),
+    (
+        "014_safe_legacy_node_event_cursor.sql",
+        include_str!("../../migrations/014_safe_legacy_node_event_cursor.sql"),
+    ),
 ];
 
 pub(crate) struct Migration {
@@ -147,8 +151,19 @@ mod tests {
     fn versions_are_ordered_and_start_at_one() {
         assert_eq!(
             migration_versions(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         );
+    }
+
+    #[test]
+    fn legacy_replay_cursors_are_not_seeded_from_high_water_marks() {
+        let migrations = load().unwrap();
+        let cursor_safety = migrations
+            .iter()
+            .find(|migration| migration.version == 14)
+            .unwrap();
+        assert!(cursor_safety.sql.contains("SET contiguous_sequence = 0"));
+        assert!(cursor_safety.sql.contains("NOT EXISTS"));
     }
 
     #[test]

@@ -160,6 +160,43 @@ async fn node_event_ledger_survives_restart_and_rejects_sequence_gaps_and_identi
 }
 
 #[tokio::test]
+async fn safe_cursor_migration_resets_unverified_high_water_and_preserves_ledger_cursor() {
+    let Some((_, pool, _, _)) = store().await else {
+        return;
+    };
+    let client = pool.get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO command_node_event_cursors (organization_id,node_id,contiguous_sequence) VALUES ('legacy-org','legacy-node',19),('ledger-org','ledger-node',2)",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "INSERT INTO command_node_events (organization_id,node_id,sequence,event_id,method,payload_sha256) VALUES ('ledger-org','ledger-node',1,'known-1','run.updated',repeat('a',64)),('ledger-org','ledger-node',2,'known-2','run.updated',repeat('b',64))",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .batch_execute(include_str!(
+            "../migrations/014_safe_legacy_node_event_cursor.sql"
+        ))
+        .await
+        .unwrap();
+    let cursors = client
+        .query(
+            "SELECT node_id,contiguous_sequence FROM command_node_event_cursors WHERE organization_id IN ('legacy-org','ledger-org') ORDER BY node_id",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(cursors[0].get::<_, i64>(1), 2);
+    assert_eq!(cursors[1].get::<_, i64>(1), 0);
+}
+
+#[tokio::test]
 async fn accepted_node_capabilities_survive_a_command_restart() {
     let Some((_, pool, config, _)) = store().await else {
         return;
