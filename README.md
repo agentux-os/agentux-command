@@ -62,6 +62,16 @@ That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/age
 
 The repository is under active integration development. The current gateway surface is always represented by `main`; versioned remote compatibility belongs to [AgentUX Protocol](https://github.com/agentux-os/agentux-protocol), so this README does not carry release-specific version numbers.
 
+## Production profile
+
+The initial production-readiness target is a single host running one Command
+process and one PostgreSQL instance with the Podman bundle. It is not highly
+available. Availability, recovery objectives, and numeric capacity ranges are
+qualification targets; unmeasured values remain unqualified. See the versioned
+[production readiness profile](docs/production-readiness.md) and its
+[deployment runbook](deploy/README.md). This repository makes no broader
+production availability or capacity claim.
+
 ## Node telemetry
 
 AgentUX nodes report themselves with the AgentUX node gateway (`aux node enroll`, then `aux node gateway`, in agentux-core). They POST AUXP messages to `/v1/protocol/messages`: `node.hello`, `node.heartbeat`, and events (`harness.status`, `harness.limits_changed`, `approval.requested`, `run.updated`, `run.completed`, `run.failed`, ...). `GET /v1/nodes` (operators with `organization.read`) lists each node with its version, last heartbeat and capacity, its agent CLIs (installed, signed in, version, spend, plan usage), its usage limits, its latest run states and its pending approvals.
@@ -424,7 +434,7 @@ independent of the storage implementation. Live updates depend on authenticated
 organization sessions; Office keeps current by loading the projection once
 and then following [the live stream](#events) from its `lastEventId`'s cursor.
 
-Production startup requires `AGENTUX_COMMAND_DATABASE_URL`, connects to the
+The PostgreSQL-backed service requires `AGENTUX_COMMAND_DATABASE_URL`, connects to the
 database, applies versioned migrations and only then listens for requests.
 `/healthz` checks database connectivity. The command-server Quadlet receives
 the PostgreSQL password through the Podman secret; the database URL does not
