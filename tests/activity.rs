@@ -10,7 +10,7 @@ use chrono::Utc;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use common::{call, params};
+use common::{call, hello, params};
 
 fn activity_message(org: &str, node: &str, event_id: &str, sequence: i64, run_id: &str) -> Value {
     json!({
@@ -57,12 +57,24 @@ async fn reader(handler: &Handler, org: &str) -> String {
         .secret
 }
 
+async fn negotiate_activity(app: &axum::Router, org: &str, node: &str) {
+    let mut hello = hello(org, node);
+    hello["params"]["capabilities"] = json!(["harness.list", "execution.activity.v1"]);
+    let (status, result) = call(app, "POST", "/v1/protocol/messages", "", Some(hello)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{result}");
+    assert_eq!(
+        result["result"]["acceptedCapabilities"],
+        json!(["execution.activity.v1"])
+    );
+}
+
 #[tokio::test]
 async fn accepts_typed_activity_once_and_replays_it_by_run_cursor() {
     let store = Arc::new(office::Store::new());
     let handler = Handler::with_office(store.clone());
     let reader = reader(&handler, "acme").await;
     let app = handler.router();
+    negotiate_activity(&app, "acme", "node-1").await;
     let message = activity_message("acme", "node-1", "event-1", 7, "run-1");
 
     for _ in 0..2 {
@@ -132,6 +144,7 @@ async fn activity_replay_is_tenant_scoped_and_schema_invalid_payloads_are_refuse
     let acme = reader(&handler, "acme").await;
     let beta = reader(&handler, "beta").await;
     let app = handler.router();
+    negotiate_activity(&app, "acme", "node-1").await;
     let event = activity_message("acme", "node-1", "event-1", 1, "run-shared");
     let (status, _) = call(&app, "POST", "/v1/protocol/messages", "", Some(event)).await;
     assert_eq!(status, StatusCode::ACCEPTED);
@@ -160,4 +173,42 @@ async fn activity_replay_is_tenant_scoped_and_schema_invalid_payloads_are_refuse
     invalid["params"]["activity"]["privateReasoning"] = json!("do not persist");
     let (status, _) = call(&app, "POST", "/v1/protocol/messages", "", Some(invalid)).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn execution_activity_is_refused_until_the_node_negotiates_its_capability() {
+    let handler = Handler::with_office(Arc::new(office::Store::new()));
+    let reader = reader(&handler, "acme").await;
+    let app = handler.router();
+    let (status, result) = call(
+        &app,
+        "POST",
+        "/v1/protocol/messages",
+        "",
+        Some(hello("acme", "node-1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{result}");
+    assert_eq!(result["result"]["acceptedCapabilities"], json!([]));
+
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/protocol/messages",
+        "",
+        Some(activity_message("acme", "node-1", "event-1", 1, "run-1")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, page) = call(
+        &app,
+        "GET",
+        "/v1/organizations/acme/runs/run-1/activity",
+        &reader,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert!(page["activities"].as_array().unwrap().is_empty());
 }
