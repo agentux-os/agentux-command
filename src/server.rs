@@ -957,6 +957,50 @@ async fn list_nodes(State(s): AppState, headers: HeaderMap) -> Response {
     )
 }
 
+async fn validate_activity_scope(
+    s: &Inner,
+    organization_id: &str,
+    node_id: &str,
+    activity: &Value,
+) -> Result<(), Response> {
+    let run_id = activity
+        .get("runId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let mission_id = activity
+        .get("missionId")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let run = match s.runs.get(organization_id, run_id).await {
+        Ok(run) => run,
+        Err(missions::Error::NotFound) => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "execution activity does not belong to this run and node",
+            ));
+        }
+        Err(missions::Error::Storage(_)) => {
+            return Err(error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "could not verify execution activity scope",
+            ));
+        }
+        Err(_) => {
+            return Err(error(
+                StatusCode::BAD_REQUEST,
+                "execution activity does not belong to this run and node",
+            ));
+        }
+    };
+    if run.mission_id != mission_id || !run.steps.values().any(|step| step.node_id == node_id) {
+        return Err(error(
+            StatusCode::BAD_REQUEST,
+            "execution activity does not belong to this run and node",
+        ));
+    }
+    Ok(())
+}
+
 async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Response {
     if body.len() > MESSAGE_LIMIT {
         return error(StatusCode::BAD_REQUEST, "the message is too large");
@@ -1013,42 +1057,10 @@ async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Respons
                     Some(activity) => activity,
                     None => return error(StatusCode::BAD_REQUEST, "invalid execution activity"),
                 };
-                let run_id = activity
-                    .get("runId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let mission_id = activity
-                    .get("missionId")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let run = match s.runs.get(&p.organization_id, run_id).await {
-                    Ok(run) => run,
-                    Err(missions::Error::NotFound) => {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "execution activity does not belong to this run and node",
-                        );
-                    }
-                    Err(missions::Error::Storage(_)) => {
-                        return error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "could not verify execution activity scope",
-                        );
-                    }
-                    Err(_) => {
-                        return error(
-                            StatusCode::BAD_REQUEST,
-                            "execution activity does not belong to this run and node",
-                        );
-                    }
-                };
-                if run.mission_id != mission_id
-                    || !run.steps.values().any(|step| step.node_id == p.node_id)
+                if let Err(response) =
+                    validate_activity_scope(&s, &p.organization_id, &p.node_id, &activity).await
                 {
-                    return error(
-                        StatusCode::BAD_REQUEST,
-                        "execution activity does not belong to this run and node",
-                    );
+                    return response;
                 }
             }
             s.apply(&body, accepted_capabilities.clone());
@@ -1100,18 +1112,61 @@ async fn connect(
     let mut response = upgrade
         .max_message_size(MESSAGE_LIMIT)
         .on_upgrade(move |ws| async move {
-            let on_message = |node: &str, raw: &[u8]| {
-                // A node's own connection only speaks for that node.
-                let speaks_for = serde_json::from_slice::<Value>(raw).ok().and_then(|v| {
-                    v.pointer("/params/nodeId")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                });
-                if speaks_for.as_deref() == Some(node) {
-                    state.apply(raw, None);
+            let on_message = {
+                let state = state.clone();
+                move |node: &str, raw: &[u8]| {
+                    let state = state.clone();
+                    Box::pin(async move {
+                        // A node's own connection only speaks for that node.
+                        let speaks_for = serde_json::from_slice::<Value>(raw).ok().and_then(|v| {
+                            v.pointer("/params/nodeId")
+                                .and_then(Value::as_str)
+                                .map(str::to_string)
+                        });
+                        if speaks_for.as_deref() != Some(node) {
+                            return;
+                        }
+                        let Ok(message) = protocol::read(raw) else {
+                            return;
+                        };
+                        if message.method == "execution.activity" {
+                            let params = &message.params;
+                            let negotiated = state.registry.get(node).is_some_and(|registered| {
+                                registered.organization_id == params.organization_id
+                                    && registered
+                                        .accepted_capabilities
+                                        .iter()
+                                        .any(|capability| capability == "execution.activity.v1")
+                            });
+                            if !negotiated {
+                                return;
+                            }
+                            let activity = serde_json::from_slice::<Value>(raw)
+                                .ok()
+                                .and_then(|message| message.pointer("/params/activity").cloned());
+                            let Some(activity) = activity else {
+                                return;
+                            };
+                            if validate_activity_scope(
+                                &state,
+                                &params.organization_id,
+                                node,
+                                &activity,
+                            )
+                            .await
+                            .is_err()
+                            {
+                                return;
+                            }
+                            state.apply(raw, None);
+                            state.project(&message.method, raw).await;
+                        } else {
+                            state.apply(raw, None);
+                        }
+                    })
                 }
             };
-            state.hub.serve(ws, &node_id, on_message).await;
+            state.hub.serve_async(ws, &node_id, on_message).await;
         });
     // Nodes check they reached the Command server they enrolled with.
     if let Ok(value) = HeaderValue::from_str(&s.instance) {

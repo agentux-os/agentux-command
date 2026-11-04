@@ -8,8 +8,10 @@ use agentux_command::server::Handler;
 use agentux_command::{definitions::Actor, missions, office};
 use axum::http::StatusCode;
 use chrono::Utc;
+use futures_util::SinkExt;
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, sync::Arc};
+use tokio_tungstenite::tungstenite::{Message as WebSocketMessage, client::IntoClientRequest};
 
 use common::{call, hello, params};
 
@@ -236,6 +238,58 @@ async fn execution_activity_rejects_unknown_runs_mission_mismatch_and_wrong_node
         let (status, _) = call(&app, "POST", "/v1/protocol/messages", "", Some(message)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{event}");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn websocket_execution_activity_is_authorized_and_projected_for_replay() {
+    let runs = Arc::new(missions::Memory::default());
+    seed_run(&runs, "run-1", "node-1").await;
+    let handler = Handler::with_office(Arc::new(office::Store::new())).with_runs(runs);
+    let reader = reader(&handler, "acme").await;
+    let app = handler.router();
+    negotiate_activity(&app, "acme", "node-1").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(axum::serve(listener, app.clone()).into_future());
+    let request = format!("ws://{address}/v1/protocol/connect?nodeId=node-1")
+        .into_client_request()
+        .unwrap();
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let mut forged = activity_message("acme", "node-1", "ws-forged", 3, "run-1");
+    forged["params"]["activity"]["missionId"] = json!("another-mission");
+    socket
+        .send(WebSocketMessage::Text(forged.to_string().into()))
+        .await
+        .unwrap();
+    socket
+        .send(WebSocketMessage::Text(
+            activity_message("acme", "node-1", "ws-event-1", 4, "run-1")
+                .to_string()
+                .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut page = Value::Null;
+    for _ in 0..50 {
+        let (status, response) = call(
+            &app,
+            "GET",
+            "/v1/organizations/acme/runs/run-1/activity",
+            &reader,
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        page = response;
+        if !page["activities"].as_array().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(page["activities"][0]["eventId"], "ws-event-1");
+    assert_eq!(page["activities"][0]["sequence"], 4);
+    assert_eq!(page["activities"].as_array().unwrap().len(), 1);
 }
 
 #[tokio::test]
