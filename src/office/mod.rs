@@ -89,6 +89,10 @@ pub struct Replay {
     pub since: Option<chrono::DateTime<chrono::Utc>>,
     pub until: Option<chrono::DateTime<chrono::Utc>>,
     pub limit: i64,
+    /// Optional mission-workspace filters. Both are applied before the page
+    /// limit so `after` remains a resumable event-log cursor.
+    pub run_id: Option<String>,
+    pub event_type: Option<String>,
 }
 
 impl Replay {
@@ -97,6 +101,11 @@ impl Replay {
         cursor > self.after
             && self.since.is_none_or(|s| at.is_some_and(|at| at >= s))
             && self.until.is_none_or(|u| at.is_some_and(|at| at < u))
+            && self.run_id.as_deref().is_none_or(|id| event.run_id == id)
+            && self
+                .event_type
+                .as_deref()
+                .is_none_or(|kind| event.event_type == kind)
     }
 }
 
@@ -162,6 +171,7 @@ const NODE_EVENTS: &[&str] = &[
     "approval.requested",
     "gate.completed",
     "artifact.available",
+    "execution.activity",
     "command.denied",
     "command.completed",
 ];
@@ -203,7 +213,16 @@ pub fn from_node_event(method: &str, params: &Value) -> Option<Event> {
         event_type: method.into(),
         organization_id: text("organizationId"),
         node_id: text("nodeId"),
-        run_id: text("runId"),
+        run_id: if method == "execution.activity" {
+            params
+                .get("activity")
+                .and_then(|activity| activity.get("runId"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            text("runId")
+        },
         occurred_at: text("occurredAt"),
         sequence: params.get("sequence").and_then(Value::as_i64).unwrap_or(0),
         correlation_id: text("correlationId"),
@@ -1043,6 +1062,85 @@ mod tests {
             assert_eq!(projection.organization_id, org);
             assert_eq!(projection.last_event_id, "evt-shared");
         }
+    }
+
+    #[test]
+    fn execution_activity_maps_only_contract_fields_and_uses_nested_run_id() {
+        let params = json!({
+            "organizationId": "acme",
+            "nodeId": "node-1",
+            "eventId": "event-1",
+            "sequence": 7,
+            "activity": {
+                "schemaVersion": "v1",
+                "activityId": "activity-1",
+                "missionId": "mission-1",
+                "runId": "run-1",
+                "agentId": "agent-a",
+                "roleId": "worker",
+                "type": "task_created",
+                "taskId": "task-1",
+                "taskName": "Review",
+                "status": "pending",
+                "summary": "Review requested.",
+            }
+        });
+        let event = from_node_event("execution.activity", &params).unwrap();
+        assert_eq!(event.run_id, "run-1");
+        assert_eq!(event.event_type, "execution.activity");
+        assert_eq!(event.sequence, 7);
+        assert_eq!(event.data.as_ref().unwrap()["activity"]["taskId"], "task-1");
+        assert!(event.data.as_ref().unwrap().get("organizationId").is_none());
+    }
+
+    #[tokio::test]
+    async fn activity_replay_filters_by_run_without_advancing_on_other_runs() {
+        let store = Store::new();
+        for (id, run, sequence) in [("e1", "run-a", 1), ("e2", "run-b", 2), ("e3", "run-a", 3)] {
+            let mut event = event(id, "acme", "node-1", sequence);
+            event.event_type = "execution.activity".into();
+            event.run_id = run.into();
+            event.data = Some(json!({"activity": {"runId": run}}));
+            store.apply_event(event).await.unwrap();
+        }
+        let page = store
+            .events(
+                "acme",
+                &Replay {
+                    run_id: Some("run-a".into()),
+                    event_type: Some("execution.activity".into()),
+                    limit: 1,
+                    ..Replay::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|e| e.event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["e1"]
+        );
+        let next = page[0].cursor;
+        let page = store
+            .events(
+                "acme",
+                &Replay {
+                    after: next,
+                    run_id: Some("run-a".into()),
+                    event_type: Some("execution.activity".into()),
+                    limit: 1,
+                    ..Replay::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|e| e.event.event_id.as_str())
+                .collect::<Vec<_>>(),
+            ["e3"]
+        );
     }
 
     #[tokio::test]

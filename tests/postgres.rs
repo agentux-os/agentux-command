@@ -51,6 +51,55 @@ async fn recovers_and_deduplicates_events_across_connections() {
 }
 
 #[tokio::test]
+async fn typed_activity_replays_by_tenant_run_and_cursor_after_store_restart() {
+    let Some((store, _, config, _)) = store().await else {
+        return;
+    };
+    let mut activity = event("activity-1", "org-a", 7);
+    activity.event_type = "execution.activity".into();
+    activity.run_id = "run-1".into();
+    activity.data = Some(json!({
+        "activity": {
+            "schemaVersion": "v1",
+            "activityId": "activity-1",
+            "missionId": "mission-1",
+            "runId": "run-1",
+            "agentId": "agent-1",
+            "roleId": "worker",
+            "type": "delegated",
+            "delegationId": "delegation-1",
+            "toAgentId": "agent-2",
+            "toRoleId": "reviewer",
+            "summary": "Review delegated.",
+        }
+    }));
+    store.apply_event(activity.clone()).await.unwrap();
+    store.apply_event(activity).await.unwrap();
+
+    let restarted = PostgresStore::new(office::pool(config));
+    let filter = office::Replay {
+        run_id: Some("run-1".into()),
+        event_type: Some("execution.activity".into()),
+        limit: 10,
+        ..office::Replay::default()
+    };
+    let page = restarted.events("org-a", &filter).await.unwrap();
+    assert_eq!(page.len(), 1, "replayed event ID is idempotent");
+    assert_eq!(page[0].event.sequence, 7, "forward gaps are retained");
+    assert_eq!(
+        page[0].event.data.as_ref().unwrap()["activity"]["delegationId"],
+        "delegation-1"
+    );
+    assert!(restarted.events("org-b", &filter).await.unwrap().is_empty());
+    let after = office::Replay {
+        after: page[0].cursor,
+        ..filter
+    };
+    assert!(restarted.events("org-a", &after).await.unwrap().is_empty());
+    restarted.verify_projection("org-a").await.unwrap();
+}
+
+#[tokio::test]
 async fn refuses_out_of_order_node_events() {
     let Some((store, ..)) = store().await else {
         return;

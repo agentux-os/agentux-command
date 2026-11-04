@@ -50,6 +50,10 @@ const FILES: &[(&str, &str)] = &[
         "011_mission_schedules.sql",
         include_str!("../../migrations/011_mission_schedules.sql"),
     ),
+    (
+        "012_execution_activity_replay.sql",
+        include_str!("../../migrations/012_execution_activity_replay.sql"),
+    ),
 ];
 
 pub(crate) struct Migration {
@@ -139,7 +143,27 @@ mod tests {
     fn versions_are_ordered_and_start_at_one() {
         assert_eq!(
             migration_versions(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+        );
+    }
+
+    #[test]
+    fn activity_replay_has_a_tenant_run_cursor_index() {
+        let migrations = load().unwrap();
+        let activity = migrations
+            .iter()
+            .find(|migration| migration.version == 12)
+            .unwrap();
+        assert!(activity.sql.contains("office_events_activity_run_idx"));
+        assert!(
+            activity
+                .sql
+                .contains("organization_id, (payload->>'runId'), ingest_id")
+        );
+        assert!(
+            activity
+                .sql
+                .contains("payload->>'eventType' = 'execution.activity'")
         );
     }
 

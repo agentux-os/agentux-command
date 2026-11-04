@@ -38,6 +38,16 @@ use crate::schedules;
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(150);
 /// The largest node message and command connection message.
 const MESSAGE_LIMIT: usize = 4 << 20;
+/// Optional node capabilities this Command implements.
+const SUPPORTED_NODE_CAPABILITIES: &[&str] = &["execution.activity.v1"];
+
+fn negotiate_node_capabilities(offered: &[String]) -> Vec<String> {
+    SUPPORTED_NODE_CAPABILITIES
+        .iter()
+        .filter(|supported| offered.iter().any(|capability| capability == **supported))
+        .map(|capability| (*capability).to_string())
+        .collect()
+}
 
 struct Inner {
     registry: Registry,
@@ -371,6 +381,10 @@ impl Handler {
             .route("/v1/organizations/{org}/audit/export", get(export_audit))
             .route("/v1/organizations/{org}/events", get(organization_events))
             .route(
+                "/v1/organizations/{org}/runs/{run}/activity",
+                get(run_activity),
+            )
+            .route(
                 "/v1/organizations/{org}/runs",
                 get(list_runs).post(start_run),
             )
@@ -597,7 +611,7 @@ impl Inner {
     }
 
     /// Records a valid node message in the registry.
-    fn apply(&self, body: &[u8]) {
+    fn apply(&self, body: &[u8], accepted_capabilities: Option<Vec<String>>) {
         let Ok(message) = protocol::read(body) else {
             return;
         };
@@ -609,6 +623,8 @@ impl Inner {
             "node.hello" => self.registry.hello(nodes::Node {
                 id: p.node_id,
                 organization_id: p.organization_id,
+                accepted_capabilities: accepted_capabilities
+                    .unwrap_or_else(|| negotiate_node_capabilities(&p.capabilities)),
                 capabilities: Some(p.capabilities),
                 agentux_version: p.agentux_version,
                 last_seen_at: p.occurred_at,
@@ -950,6 +966,7 @@ async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Respons
         Err(e) => return error(StatusCode::BAD_REQUEST, &e),
     };
     let p = &message.params;
+    let mut accepted_capabilities = None;
     match s
         .node_access(&headers, &p.node_id, &p.organization_id)
         .await
@@ -963,18 +980,42 @@ async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Respons
                     json!({"error": "the node waits for an operator's approval", "instanceId": s.instance}),
                 );
             }
-            s.apply(&body);
+            if message.method == "node.hello" {
+                accepted_capabilities = Some(Vec::new());
+            }
+            s.apply(&body, accepted_capabilities.clone());
             s.registry
                 .heartbeat_with(&p.node_id, "pending_approval", None, &p.occurred_at);
         }
         Access::Full => {
-            s.apply(&body);
+            if message.method == "node.hello" {
+                accepted_capabilities = Some(negotiate_node_capabilities(&p.capabilities));
+            }
+            if message.method == "execution.activity"
+                && !s.registry.get(&p.node_id).is_some_and(|node| {
+                    node.organization_id == p.organization_id
+                        && node
+                            .accepted_capabilities
+                            .iter()
+                            .any(|capability| capability == "execution.activity.v1")
+                })
+            {
+                return error(
+                    StatusCode::BAD_REQUEST,
+                    "execution.activity.v1 was not negotiated for this node",
+                );
+            }
+            s.apply(&body, accepted_capabilities.clone());
             s.project(&message.method, &body).await;
         }
     }
+    let mut result = json!({"accepted": "true", "instanceId": s.instance});
+    if let Some(accepted) = accepted_capabilities {
+        result["acceptedCapabilities"] = json!(accepted);
+    }
     reply(
         StatusCode::ACCEPTED,
-        json!({"jsonrpc": "2.0", "id": message.id, "result": {"accepted": "true", "instanceId": s.instance}}),
+        json!({"jsonrpc": "2.0", "id": message.id, "result": result}),
     )
 }
 
@@ -1021,7 +1062,7 @@ async fn connect(
                         .map(str::to_string)
                 });
                 if speaks_for.as_deref() == Some(node) {
-                    state.apply(raw);
+                    state.apply(raw, None);
                 }
             };
             state.hub.serve(ws, &node_id, on_message).await;
@@ -2064,6 +2105,7 @@ async fn organization_events(
         since,
         until,
         limit: query.limit.unwrap_or(100).clamp(1, 1000),
+        ..office::Replay::default()
     };
     match s.office.events(&org, &replay).await {
         Ok(events) => {
@@ -2080,6 +2122,109 @@ async fn organization_events(
         }
         Err(_) => error(StatusCode::SERVICE_UNAVAILABLE, "event log unavailable"),
     }
+}
+
+#[derive(Deserialize)]
+struct ActivityQuery {
+    #[serde(default)]
+    after: Option<i64>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// A bounded, tenant-authorized activity stream for one run. The cursor is
+/// the durable Office event-log cursor, so clients can reconnect with
+/// `after` without skipping activities from this run.
+async fn run_activity(
+    State(s): AppState,
+    Path((org, run)): Path<(String, String)>,
+    Query(query): Query<ActivityQuery>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = operator_in(&s, &headers, &org, auth::ORGANIZATION_READ).await {
+        return *denied;
+    }
+    let replay = office::Replay {
+        after: query.after.unwrap_or(0).max(0),
+        limit: query.limit.unwrap_or(100).clamp(1, 1000),
+        run_id: Some(run.clone()),
+        event_type: Some("execution.activity".into()),
+        ..office::Replay::default()
+    };
+    let events = match s.office.events(&org, &replay).await {
+        Ok(events) => events,
+        Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "activity_log_unavailable"),
+    };
+    let next = events.last().map_or(replay.after, |logged| logged.cursor);
+    let mut activities = Vec::with_capacity(events.len());
+    for logged in &events {
+        let Some(activity) = logged
+            .event
+            .data
+            .as_ref()
+            .and_then(|data| data.get("activity"))
+        else {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "activity_projection_unavailable",
+            );
+        };
+        activities.push(json!({
+            "cursor": logged.cursor,
+            "eventId": logged.event.event_id,
+            "sequence": logged.event.sequence,
+            "nodeId": logged.event.node_id,
+            "occurredAt": logged.event.occurred_at,
+            "activity": activity,
+        }));
+    }
+
+    let projection = match s.office.get_projection(&org).await {
+        Ok(projection) => projection,
+        Err(_) => {
+            return error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "activity_projection_unavailable",
+            );
+        }
+    };
+    let projected_node = projection
+        .as_ref()
+        .and_then(|projection| {
+            projection
+                .runs
+                .iter()
+                .find(|item| item.get("id").and_then(Value::as_str) == Some(run.as_str()))
+        })
+        .and_then(|item| item.get("nodeId"))
+        .and_then(Value::as_str);
+    let node_id =
+        projected_node.or_else(|| events.first().map(|logged| logged.event.node_id.as_str()));
+    let node = node_id
+        .and_then(|id| s.registry.get(id))
+        .filter(|node| node.organization_id == org);
+    let presence = node
+        .as_ref()
+        .map(|node| node.presence_at(Utc::now()))
+        .unwrap_or("unknown");
+    let freshness = match presence {
+        "online" => "fresh",
+        "degraded" => "degraded",
+        "offline" => "stale",
+        _ => "unknown",
+    };
+    let mut body = json!({
+        "organizationId": org,
+        "runId": run,
+        "activities": activities,
+        "next": next,
+        "nodePresence": presence,
+        "freshness": freshness,
+    });
+    if let Some(node) = node {
+        body["nodeId"] = json!(node.id);
+    }
+    reply(StatusCode::OK, body)
 }
 
 #[derive(Deserialize)]

@@ -415,8 +415,19 @@ access; service tokens remain available for automation and CLI use.
 
 ```text
 GET  /v1/office/projection?organizationId=<org>      organization.read in <org>
+GET  /v1/organizations/<org>/runs/<run>/activity     organization.read in <org>
 POST /v1/approvals/{approvalId}/resolve               approval.decide in the body's organization
 ```
+
+`execution.activity` messages follow the typed activity and privacy bounds in
+[AUXP Protocol](https://github.com/agentux-os/agentux-protocol). Command keeps
+the node `eventId` and sequence in the durable organization event log and
+exposes the nested typed activity from the run endpoint above. Use its `next`
+cursor as `after` when reconnecting; duplicate event IDs are idempotent, and
+events from other runs do not consume a page. The response reports the node's
+current `nodePresence` and corresponding `freshness` (`fresh`, `degraded`,
+`stale`, or `unknown`). Activity is returned only when a node sends it; Command
+does not synthesize task, tool, delegation, or artifact events from run status.
 
 The projection is `office-projection.v1` from
 [agentux-protocol](https://github.com/agentux-os/agentux-protocol), and
