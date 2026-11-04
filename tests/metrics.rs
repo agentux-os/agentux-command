@@ -102,6 +102,7 @@ async fn authorized_metrics_scrape_exposes_process_and_service_metrics_without_s
     }
     let app = Handler::new()
         .with_metrics_token("0123456789abcdef0123456789abcdef")
+        .unwrap()
         .with_runs(runs)
         .router();
     let (status, _) = common::call(&app, "GET", "/healthz", "", None).await;
