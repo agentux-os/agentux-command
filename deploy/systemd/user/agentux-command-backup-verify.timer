@@ -1,0 +1,11 @@
+[Unit]
+Description=Monthly restore verification for AgentUX Command off-host backups
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+RandomizedDelaySec=1h
+Unit=agentux-command-backup-verify.service
+
+[Install]
+WantedBy=timers.target

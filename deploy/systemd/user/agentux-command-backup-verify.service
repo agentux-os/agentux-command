@@ -1,0 +1,9 @@
+[Unit]
+Description=Verify the latest AgentUX Command off-host backup
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/agentux/command-backup.env
+ExecStart=/usr/libexec/agentux-command/verify-offsite-backup.sh
+UMask=0077
+ProtectSystem=full
+PrivateTmp=true

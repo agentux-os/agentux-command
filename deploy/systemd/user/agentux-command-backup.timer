@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily encrypted off-host AgentUX Command backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=30m
+Unit=agentux-command-backup.service
+
+[Install]
+WantedBy=timers.target

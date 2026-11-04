@@ -42,9 +42,9 @@ An operator using this profile is responsible for all of the following:
 - **Backups:** schedule consistent database backups at least daily and before
   upgrades; encrypt them and copy them to a separately recoverable off-host
   destination. Include event archives if event retention is enabled. The
-  repository currently supplies manual backup/restore scripts and a CI drill;
-  a production-grade scheduled off-host workflow and recurring restore
-  verification are not yet qualified ([#51](https://github.com/agentux-os/agentux-command/issues/51)).
+  repository supplies a Restic/systemd workflow and recurring restore
+  verification, but these remain unqualified until configured and measured in
+  the operator's environment ([#51](https://github.com/agentux-os/agentux-command/issues/51)).
 - **Identity and secrets:** configure an operator-managed OIDC provider and
   role map for people. Keep database, OIDC, and node credentials in an
   operator-managed secret store, rotate them, and restrict access. Do not use
@@ -55,9 +55,10 @@ An operator using this profile is responsible for all of the following:
   a migrated database requires restoring the pre-upgrade backup.
 
 These are prerequisites, not capabilities supplied by Command. In particular,
-the present bundle does not provide external TLS termination, off-host backup
-storage, backup scheduling, a metrics/alerting service, an identity provider,
-or host/database failover.
+the present bundle does not provide external TLS termination, an off-host
+backup destination, a metrics/alerting service, an identity provider, or
+host/database failover. The host workflow emits backup metrics for an
+operator-provided node_exporter textfile collector.
 
 ## Command and operator responsibilities
 
@@ -67,7 +68,7 @@ or host/database failover.
 | Process health | `/livez` for process liveness; `/readyz` and `/healthz` report PostgreSQL readiness; the supplied Quadlet restarts an unhealthy Command process. | External probes, alert routing, host/systemd/Podman availability, PostgreSQL health and recovery, and response to alerts. Readiness endpoints are not an availability SLO. |
 | Authentication | OIDC callback/session handling and capability checks when configured; hashed service-token/session storage. | OIDC provider availability and policy, TLS, secret distribution/rotation, account lifecycle, and safe initial administrator bootstrap. |
 | Events | Durable event log and replay; delivery to a configured event webhook is at least once. | Consumer idempotency, webhook availability, monitoring/alerting (metrics work is #50), storage sizing, and any retention/archive policy. |
-| Backup and recovery | Manual `backup.sh`, `restore.sh`, integrity checksum, projection check command, and a CI restore drill. | Schedule, off-host and encrypted copies, retention, restore drills against production-sized data, replacement-host readiness, and achieved RPO/RTO. |
+| Backup and recovery | Manual dump/restore, a Restic/systemd off-host workflow, integrity checksum, projection check command, and CI restore drill. | Remote destination and credentials, host scheduling/monitoring, retention choice, production-sized restore drills, replacement-host readiness, and achieved RPO/RTO. |
 | Capacity and availability | No measured production capacity or availability claim in this profile. | Select workloads within subsequently qualified limits; provide host, network, storage, database, and operational resilience. |
 
 ## Objectives and qualification status
@@ -80,7 +81,7 @@ verification work has produced evidence for the target workload, each remains
 |---|---|---|---|
 | Deployment topology | One host, one Command process, one PostgreSQL instance. No automatic failover. | Defined by the bundle; end-to-end production behavior **UNQUALIFIED**. | Command team verifies the Quadlet dependency and storage configuration; staging deployment and failure scenarios in [#54](https://github.com/agentux-os/agentux-command/issues/54). Topology decision follow-up: [#55](https://github.com/agentux-os/agentux-command/issues/55). |
 | Availability | At least **99.5% successful readiness** in each calendar month, measured by an external probe once per minute with a 5-second timeout. Success means `/readyz` returns HTTP 200 within that timeout. Planned downtime counts as unavailable. | **UNQUALIFIED**; no production observation history or alerting surface is established. | Shared: Command team defines probe semantics; operator runs an external monitor and retains monthly results. Metrics/alerting follow-up: [#50](https://github.com/agentux-os/agentux-command/issues/50). Validate service and dependency failure behavior in [#54](https://github.com/agentux-os/agentux-command/issues/54). |
-| Recovery point (RPO) | At most **24 hours** of committed database state lost, conditional on successful backups at intervals no longer than 24 hours and a recoverable off-host copy. | **UNQUALIFIED**; the repository does not schedule or copy production backups off-host. | Operator schedules and monitors backups; Command team supplies the backup/restore interface. Verify copy age and restore integrity through [#51](https://github.com/agentux-os/agentux-command/issues/51). |
+| Recovery point (RPO) | At most **24 hours** of committed database state lost, conditional on successful backups at intervals no longer than 24 hours and a recoverable off-host copy. | **UNQUALIFIED** until the operator configures the workflow and measures copy age in its environment. | Operator configures and monitors the off-host workflow; Command team supplies the backup/restore interface. Verify copy age and restore integrity through [#51](https://github.com/agentux-os/agentux-command/issues/51). |
 | Recovery time (RTO) | Restore service to `/readyz` 200 and pass `agentux-command check` within **8 hours** of declaring a host/database recovery incident. | **UNQUALIFIED**; no production-sized or replacement-host duration has been measured. | Operator owns infrastructure and incident timing; shared restore procedure. Repeated recovery and fault scenarios in [#51](https://github.com/agentux-os/agentux-command/issues/51) and [#54](https://github.com/agentux-os/agentux-command/issues/54). |
 | Single-process restart | The supplied liveness check detects a nonresponsive process and asks systemd to restart it. No end-to-end recovery duration is claimed. | Mechanism present; end-to-end target **UNQUALIFIED**. | Command team verifies liveness behavior; staging restart scenario in [#54](https://github.com/agentux-os/agentux-command/issues/54). |
 
