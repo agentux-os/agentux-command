@@ -3,7 +3,10 @@
 
 mod common;
 
-use agentux_command::office::{self, Event, OfficeRepository, PostgresStore, ResolutionRequest};
+use agentux_command::nodes::{self, Node};
+use agentux_command::office::{
+    self, Event, NodeEvent, OfficeRepository, PostgresStore, ResolutionRequest,
+};
 use serde_json::json;
 
 async fn store() -> Option<(
@@ -97,6 +100,97 @@ async fn typed_activity_replays_by_tenant_run_and_cursor_after_store_restart() {
     };
     assert!(restarted.events("org-a", &after).await.unwrap().is_empty());
     restarted.verify_projection("org-a").await.unwrap();
+}
+
+#[tokio::test]
+async fn node_event_ledger_survives_restart_and_rejects_sequence_gaps_and_identity_reuse() {
+    let Some((store, _, config, _)) = store().await else {
+        return;
+    };
+    let node_event = |sequence, event_id: &str| NodeEvent {
+        organization_id: "ledger-org".into(),
+        node_id: "ledger-node".into(),
+        method: "run.updated".into(),
+        event_id: event_id.into(),
+        sequence,
+        payload_digest: format!("sha256-{sequence}-{event_id}"),
+    };
+    let first = node_event(1, "ledger-1");
+    assert_eq!(
+        store
+            .record_node_event(first.clone(), None, true)
+            .await
+            .unwrap()
+            .contiguous_sequence,
+        1
+    );
+    let restarted = PostgresStore::new(office::pool(config));
+    let duplicate = restarted
+        .record_node_event(first, None, true)
+        .await
+        .unwrap();
+    assert!(duplicate.duplicate);
+    assert_eq!(duplicate.contiguous_sequence, 1);
+    assert!(
+        restarted
+            .record_node_event(node_event(3, "ledger-3"), None, true)
+            .await
+            .is_err()
+    );
+    assert!(
+        restarted
+            .record_node_event(node_event(1, "conflicting-id"), None, true)
+            .await
+            .is_err()
+    );
+    assert!(
+        restarted
+            .record_node_event(node_event(2, "ledger-1"), None, true)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        restarted
+            .node_event_cursor("ledger-org", "ledger-node")
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn accepted_node_capabilities_survive_a_command_restart() {
+    let Some((_, pool, config, _)) = store().await else {
+        return;
+    };
+    let node = Node {
+        id: "capability-node".into(),
+        organization_id: "capability-org".into(),
+        ..Node::default()
+    };
+    pool.get()
+        .await
+        .unwrap()
+        .execute(
+            "INSERT INTO node_state (node_id, organization_id, payload) VALUES ($1,$2,$3)",
+            &[
+                &node.id,
+                &node.organization_id,
+                &tokio_postgres::types::Json(&node),
+            ],
+        )
+        .await
+        .unwrap();
+    nodes::persist::store_capabilities(
+        &pool,
+        &node.id,
+        &node.organization_id,
+        &["node.event_replay.v1".into()],
+    )
+    .await
+    .unwrap();
+    let loaded = nodes::persist::load(&office::pool(config)).await.unwrap();
+    assert_eq!(loaded[0].accepted_capabilities, ["node.event_replay.v1"]);
 }
 
 #[tokio::test]

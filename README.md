@@ -429,6 +429,9 @@ current `nodePresence` and corresponding `freshness` (`fresh`, `degraded`,
 `stale`, or `unknown`). Activity is returned only when a node sends it; Command
 does not synthesize task, tool, delegation, or artifact events from run status.
 
+For reconnect replay, durable cursors, ACK rules, legacy behavior and expired
+cursor recovery limits, see [AUXP node event replay](docs/node-event-replay.md).
+
 The projection is `office-projection.v1` from
 [agentux-protocol](https://github.com/agentux-os/agentux-protocol), and
 `tests/contract.rs` checks what Command serves against that schema (through

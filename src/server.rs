@@ -41,7 +41,7 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(150);
 /// The largest node message and command connection message.
 const MESSAGE_LIMIT: usize = 4 << 20;
 /// Optional node capabilities this Command implements.
-const SUPPORTED_NODE_CAPABILITIES: &[&str] = &["execution.activity.v1"];
+const SUPPORTED_NODE_CAPABILITIES: &[&str] = &["execution.activity.v1", "node.event_replay.v1"];
 
 fn negotiate_node_capabilities(offered: &[String]) -> Vec<String> {
     SUPPORTED_NODE_CAPABILITIES
@@ -599,14 +599,27 @@ impl Inner {
             };
         }
         if let Some(want) = self.node_tokens.get(node_id) {
-            return if bool::from(got.as_bytes().ct_eq(want.as_bytes())) {
+            return if bool::from(got.as_bytes().ct_eq(want.as_bytes()))
+                && self
+                    .registry
+                    .get(node_id)
+                    .is_none_or(|node| node.organization_id == organization_id)
+            {
                 Access::Full
             } else {
                 Access::None
             };
         }
         if self.open_nodes && self.node_tokens.is_empty() {
-            Access::Full
+            if self
+                .registry
+                .get(node_id)
+                .is_some_and(|node| node.organization_id != organization_id)
+            {
+                Access::None
+            } else {
+                Access::Full
+            }
         } else {
             Access::None
         }
@@ -655,10 +668,8 @@ impl Inner {
         }
     }
 
-    /// Takes a node's event into the Office log, when the Office shows that
-    /// kind. A replayed event is a no-op (by event id); one the log refuses
-    /// (out of order, malformed) is reported, and the node's message still
-    /// counts as received: the registry has it.
+    /// Advances mission coordination after the authenticated event and its
+    /// Office projection have committed in the node event ledger transaction.
     async fn project(&self, method: &str, body: &[u8]) {
         let Some(params) = serde_json::from_slice::<Value>(body)
             .ok()
@@ -669,49 +680,37 @@ impl Inner {
         let Some(event) = office::from_node_event(method, &params) else {
             return;
         };
-        let (org, node, sequence) = (
-            event.organization_id.clone(),
-            event.node_id.clone(),
-            event.sequence,
-        );
-        let data = event.data.clone().unwrap_or(Value::Null);
-        let correlation = event.correlation_id.clone();
-        let (node_run, error) = (
-            event.run_id.clone(),
-            data["error"]
-                .as_str()
-                .or_else(|| data["error"]["message"].as_str())
-                .unwrap_or_default()
-                .to_string(),
-        );
-        match self.office.apply_event(event).await {
-            Ok(()) => {
-                self.changed.notify_waiters();
-                let engine = self.engine();
-                let nodes = NodesVia(self);
-                let moved = if method == "command.completed" {
-                    engine
-                        .command_completed(
-                            &org,
-                            data["commandId"].as_str().unwrap_or_default(),
-                            data["ok"].as_bool().unwrap_or(false),
-                            &data["result"],
-                            &error,
-                            &nodes,
-                        )
-                        .await
-                } else {
-                    engine
-                        .node_event(&org, &node_run, &correlation, method, &error, &nodes)
-                        .await
-                };
-                if let Err(e) = moved {
-                    eprintln!("agentux-command: missions: {e}");
-                }
-            }
-            Err(e) => eprintln!(
-                "agentux-command: the Office did not take {method} {sequence} from {node} in {org}: {e}"
-            ),
+        let org = event.organization_id;
+        let node = event.node_id;
+        let node_run = event.run_id;
+        let correlation = event.correlation_id;
+        let data = event.data.unwrap_or(Value::Null);
+        let error = data["error"]
+            .as_str()
+            .or_else(|| data["error"]["message"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        self.changed.notify_waiters();
+        let engine = self.engine();
+        let nodes = NodesVia(self);
+        let moved = if method == "command.completed" {
+            engine
+                .command_completed(
+                    org,
+                    data["commandId"].as_str().unwrap_or_default(),
+                    data["ok"].as_bool().unwrap_or(false),
+                    &data["result"],
+                    &error,
+                    &nodes,
+                )
+                .await
+        } else {
+            engine
+                .node_event(org, &node_run, &correlation, method, &error, &nodes)
+                .await
+        };
+        if let Err(e) = moved {
+            eprintln!("agentux-command: missions: event {method} from {node} in {org}: {e}");
         }
     }
 
@@ -985,6 +984,274 @@ async fn validate_activity_scope(
     Ok(())
 }
 
+async fn accept_node_event(
+    state: Arc<Inner>,
+    raw: &[u8],
+    message: &protocol::Message,
+    organization_id: &str,
+    node_id: &str,
+) -> Result<i64, StatusCode> {
+    let negotiated = state
+        .registry
+        .get(node_id)
+        .filter(|node| node.organization_id == organization_id);
+    if message.method == "execution.activity"
+        && !negotiated.as_ref().is_some_and(|node| {
+            node.accepted_capabilities
+                .iter()
+                .any(|capability| capability == "execution.activity.v1")
+        })
+    {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let require_contiguous = negotiated.as_ref().is_some_and(|node| {
+        node.accepted_capabilities
+            .iter()
+            .any(|capability| capability == "node.event_replay.v1")
+    });
+    let mut envelope: Value = serde_json::from_slice(raw).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let params = envelope
+        .get_mut("params")
+        .and_then(Value::as_object_mut)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    // These values come from the authenticated HTTP credential or the
+    // already-authenticated WebSocket, never from the event payload.
+    params.insert(
+        "organizationId".into(),
+        Value::String(organization_id.into()),
+    );
+    params.insert("nodeId".into(), Value::String(node_id.into()));
+    let params_value = Value::Object(params.clone());
+    if message.method == "execution.activity" {
+        let activity = params_value
+            .get("activity")
+            .ok_or(StatusCode::BAD_REQUEST)?;
+        validate_activity_scope(&state, organization_id, node_id, activity).await?;
+    }
+    let event_id = params_value
+        .get("eventId")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let sequence = params_value
+        .get("sequence")
+        .and_then(Value::as_i64)
+        .filter(|sequence| *sequence > 0)
+        .ok_or(StatusCode::BAD_REQUEST)?;
+    let mut identity_params = params_value.clone();
+    identity_params
+        .as_object_mut()
+        .expect("protocol params are an object")
+        .remove("messageId");
+    let serialized_params =
+        serde_json::to_vec(&identity_params).map_err(|_| StatusCode::BAD_REQUEST)?;
+    let payload_digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(serialized_params))
+    };
+    let ledger_event = office::NodeEvent {
+        organization_id: organization_id.into(),
+        node_id: node_id.into(),
+        method: message.method.clone(),
+        event_id: event_id.into(),
+        sequence,
+        payload_digest,
+    };
+    let projection = office::from_node_event(&message.method, &params_value);
+    let receipt = state
+        .office
+        .record_node_event(ledger_event, projection, require_contiguous)
+        .await
+        .map_err(|e| match e {
+            office::Error::Storage(_) => StatusCode::SERVICE_UNAVAILABLE,
+            office::Error::Conflict(_) => StatusCode::CONFLICT,
+            office::Error::Invalid(_) => StatusCode::BAD_REQUEST,
+        })?;
+    if !receipt.duplicate {
+        let body = serde_json::to_vec(&envelope).map_err(|_| StatusCode::BAD_REQUEST)?;
+        state.apply(&body, None);
+        state.project(&message.method, &body).await;
+    }
+    if require_contiguous && receipt.contiguous_sequence > 0 && state.hub.connected(node_id) {
+        schedule_event_ack(
+            state,
+            organization_id.to_string(),
+            node_id.to_string(),
+            receipt.contiguous_sequence,
+        );
+    }
+    Ok(receipt.contiguous_sequence)
+}
+
+fn schedule_event_ack(state: Arc<Inner>, organization_id: String, node_id: String, through: i64) {
+    tokio::spawn(async move {
+        let command_id = format!("ack-{}", random_hex(12));
+        let params = node_command_params(&state, &organization_id, &node_id, &command_id);
+        let mut params = params;
+        params.insert("throughSequence".into(), json!(through));
+        if let Err(error) = tokio::time::timeout(
+            Duration::from_secs(10),
+            state.hub.send(&node_id, "node.events.ack", params),
+        )
+        .await
+        {
+            eprintln!(
+                "agentux-command: node event acknowledgement timed out for {node_id}: {error}"
+            );
+        }
+    });
+}
+
+fn node_command_params(
+    state: &Inner,
+    organization_id: &str,
+    node_id: &str,
+    command_id: &str,
+) -> Map<String, Value> {
+    Map::from_iter([
+        ("protocolVersion".into(), json!("v1")),
+        ("organizationId".into(), json!(organization_id)),
+        ("nodeId".into(), json!(node_id)),
+        ("messageId".into(), json!(command_id)),
+        ("commandId".into(), json!(command_id)),
+        ("occurredAt".into(), json!(crate::now_rfc3339())),
+        ("commandInstanceId".into(), json!(state.instance)),
+    ])
+}
+
+fn schedule_node_resume(state: Arc<Inner>, organization_id: String, node_id: String) {
+    tokio::spawn(async move {
+        let replay_capability = state.registry.get(&node_id).is_some_and(|node| {
+            node.organization_id == organization_id
+                && node
+                    .accepted_capabilities
+                    .iter()
+                    .any(|capability| capability == "node.event_replay.v1")
+        });
+        if !replay_capability {
+            return;
+        }
+        let cursor = match state
+            .office
+            .node_event_cursor(&organization_id, &node_id)
+            .await
+        {
+            Ok(cursor) => cursor,
+            Err(error) => {
+                eprintln!("agentux-command: cannot read replay cursor for {node_id}: {error}");
+                return;
+            }
+        };
+        let command_id = format!("resume-{}", random_hex(12));
+        let mut params = node_command_params(&state, &organization_id, &node_id, &command_id);
+        params.insert("lastAcknowledgedSequence".into(), json!(cursor));
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            state.hub.send(&node_id, "node.resume", params),
+        )
+        .await;
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) => {
+                eprintln!(
+                    "agentux-command: cannot resume node event stream for {node_id}: {error}"
+                );
+                return;
+            }
+            Err(_) => {
+                eprintln!("agentux-command: node event replay timed out for {node_id}");
+                return;
+            }
+        };
+        if let Some(error) = response.error {
+            eprintln!(
+                "agentux-command: node {node_id} refused event replay: {}",
+                error.message
+            );
+            return;
+        }
+        let Some(result) = response.result else {
+            eprintln!("agentux-command: node {node_id} returned no event replay result");
+            return;
+        };
+        let replay: auxp::replay::ReplayResult = match serde_json::from_value(result) {
+            Ok(replay) if replay.validate().is_ok() => replay,
+            _ => {
+                eprintln!("agentux-command: node {node_id} returned invalid event replay metadata");
+                return;
+            }
+        };
+        if replay.node_id != node_id || replay.requested_after_sequence != cursor {
+            eprintln!(
+                "agentux-command: node {node_id} replay metadata does not match the authenticated request"
+            );
+            return;
+        }
+        if replay.status == auxp::replay::ReplayStatus::Replay {
+            let committed = match state
+                .office
+                .node_event_cursor(&organization_id, &node_id)
+                .await
+            {
+                Ok(committed) => committed,
+                Err(error) => {
+                    eprintln!(
+                        "agentux-command: cannot verify replay cursor for {node_id}: {error}"
+                    );
+                    return;
+                }
+            };
+            if committed < replay.high_water_sequence {
+                eprintln!(
+                    "agentux-command: node {node_id} reported replay complete through {}, but Command committed only through {committed}",
+                    replay.high_water_sequence
+                );
+                return;
+            }
+        }
+        if replay.status == auxp::replay::ReplayStatus::CursorExpired {
+            recover_node_run_snapshots(state, organization_id, node_id).await;
+        }
+    });
+}
+
+async fn recover_node_run_snapshots(state: Arc<Inner>, organization_id: String, node_id: String) {
+    let run_ids = state
+        .registry
+        .get(&node_id)
+        .filter(|node| node.organization_id == organization_id)
+        .map(|node| node.runs.keys().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    for run_id in run_ids {
+        let command_id = format!("snapshot-{}", random_hex(12));
+        let mut params = node_command_params(&state, &organization_id, &node_id, &command_id);
+        params.insert("runId".into(), json!(run_id));
+        let response = tokio::time::timeout(
+            Duration::from_secs(30),
+            state.hub.send(&node_id, "run.snapshot", params),
+        )
+        .await;
+        let Ok(Ok(response)) = response else {
+            eprintln!(
+                "agentux-command: cannot refresh run {run_id} after node {node_id} replay expiry"
+            );
+            continue;
+        };
+        if response.error.is_some() {
+            eprintln!("agentux-command: node {node_id} refused snapshot for run {run_id}");
+            continue;
+        }
+        if let Some(snapshot) = response.result {
+            state
+                .registry
+                .snapshot(&node_id, &organization_id, &run_id, snapshot);
+        }
+    }
+    eprintln!(
+        "agentux-command: node {node_id} replay cursor expired; run snapshots refresh current node state, but do not recreate the missing Office timeline events"
+    );
+}
+
 async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Response {
     if body.len() > MESSAGE_LIMIT {
         return error(StatusCode::BAD_REQUEST, "the message is too large");
@@ -1010,52 +1277,76 @@ async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Respons
             }
             if message.method == "node.hello" {
                 accepted_capabilities = Some(Vec::new());
+                if let Some(pool) = &s.database
+                    && nodes::persist::store_capabilities(pool, &p.node_id, &p.organization_id, &[])
+                        .await
+                        .is_err()
+                {
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "could not persist node capabilities",
+                    );
+                }
             }
             s.apply(&body, accepted_capabilities.clone());
             s.registry
                 .heartbeat_with(&p.node_id, "pending_approval", None, &p.occurred_at);
         }
         Access::Full => {
+            let authenticated_organization = s.node_organization(&p.node_id).await;
+            if authenticated_organization.is_none()
+                && !s.open_nodes
+                && message.method != "node.hello"
+            {
+                return error(
+                    StatusCode::UNAUTHORIZED,
+                    "node must authenticate with node.hello first",
+                );
+            }
+            let organization_id =
+                authenticated_organization.unwrap_or_else(|| p.organization_id.clone());
             if message.method == "node.hello" {
                 accepted_capabilities = Some(negotiate_node_capabilities(&p.capabilities));
             }
-            if message.method == "execution.activity"
-                && !s.registry.get(&p.node_id).is_some_and(|node| {
-                    node.organization_id == p.organization_id
-                        && node
-                            .accepted_capabilities
-                            .iter()
-                            .any(|capability| capability == "execution.activity.v1")
-                })
-            {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    "execution.activity.v1 was not negotiated for this node",
-                );
-            }
-            if message.method == "execution.activity" {
-                let activity = match serde_json::from_slice::<Value>(&body)
-                    .ok()
-                    .and_then(|message| message.pointer("/params/activity").cloned())
+            if message.method == "node.hello" {
+                // A static per-node token authenticates the first hello; its
+                // organization becomes the node's stored binding. Thereafter
+                // requests use that binding, not the claimed organization.
+                if let Some(pool) = &s.database
+                    && nodes::persist::store_capabilities(
+                        pool,
+                        &p.node_id,
+                        &organization_id,
+                        accepted_capabilities.as_deref().unwrap_or_default(),
+                    )
+                    .await
+                    .is_err()
                 {
-                    Some(activity) => activity,
-                    None => return error(StatusCode::BAD_REQUEST, "invalid execution activity"),
-                };
-                if let Err(status) =
-                    validate_activity_scope(&s, &p.organization_id, &p.node_id, &activity).await
-                {
-                    return if status == StatusCode::SERVICE_UNAVAILABLE {
-                        error(status, "could not verify execution activity scope")
-                    } else {
-                        error(
-                            status,
-                            "execution activity does not belong to this run and node",
-                        )
-                    };
+                    return error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "could not persist node capabilities",
+                    );
                 }
+                s.apply(&body, accepted_capabilities.clone());
+            } else if protocol::is_event(&message.method) {
+                match accept_node_event(s.clone(), &body, &message, &organization_id, &p.node_id)
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(status) => {
+                        let explanation = match status {
+                            StatusCode::CONFLICT => {
+                                "node event sequence or identity conflicts with the durable ledger"
+                            }
+                            StatusCode::SERVICE_UNAVAILABLE => "node event ledger is unavailable",
+                            _ => "node event is invalid or its capability was not negotiated",
+                        };
+                        return error(status, explanation);
+                    }
+                }
+            } else {
+                s.apply(&body, accepted_capabilities.clone());
             }
-            s.apply(&body, accepted_capabilities.clone());
-            s.project(&message.method, &body).await;
         }
     }
     let mut result = json!({"accepted": "true", "instanceId": s.instance});
@@ -1103,6 +1394,8 @@ async fn connect(
         Err(rejection) => return rejection.into_response(),
     };
     let state = s.clone();
+    let resume_organization = organization_id.clone();
+    let resume_node = node_id.clone();
     let mut response = upgrade
         .max_message_size(MESSAGE_LIMIT)
         .on_upgrade(move |ws| async move {
@@ -1116,7 +1409,14 @@ async fn connect(
                     raw,
                 )
             };
-            state.hub.serve_async(ws, &node_id, on_message).await;
+            let resume_state = state.clone();
+            let on_connected = move || {
+                schedule_node_resume(resume_state, resume_organization, resume_node);
+            };
+            state
+                .hub
+                .serve_async_with(ws, &node_id, on_message, on_connected)
+                .await;
         });
     // Nodes check they reached the Command server they enrolled with.
     if let Ok(value) = HeaderValue::from_str(&s.instance) {
@@ -1151,32 +1451,8 @@ fn websocket_node_message(
         {
             return;
         }
-        if message.method == "execution.activity" {
-            let params = &message.params;
-            let negotiated = state.registry.get(&node).is_some_and(|registered| {
-                registered.organization_id == params.organization_id
-                    && registered
-                        .accepted_capabilities
-                        .iter()
-                        .any(|capability| capability == "execution.activity.v1")
-            });
-            if !negotiated {
-                return;
-            }
-            let activity = serde_json::from_slice::<Value>(&raw)
-                .ok()
-                .and_then(|message| message.pointer("/params/activity").cloned());
-            let Some(activity) = activity else {
-                return;
-            };
-            if validate_activity_scope(&state, &params.organization_id, &node, &activity)
-                .await
-                .is_err()
-            {
-                return;
-            }
-            state.apply(&raw, None);
-            state.project(&message.method, &raw).await;
+        if protocol::is_event(&message.method) {
+            let _ = accept_node_event(state, &raw, &message, &connection_organization, &node).await;
         } else {
             state.apply(&raw, None);
         }

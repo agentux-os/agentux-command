@@ -29,6 +29,26 @@ pub trait OfficeRepository: Send + Sync {
     async fn ping(&self) -> Result<(), Error>;
     async fn get_projection(&self, organization_id: &str) -> Result<Option<Projection>, Error>;
     async fn apply_event(&self, event: Event) -> Result<(), Error>;
+    /// Durably records one authenticated node notification and, when present,
+    /// applies its Office projection in the same transaction.
+    async fn record_node_event(
+        &self,
+        _event: NodeEvent,
+        _projection: Option<Event>,
+        _require_contiguous: bool,
+    ) -> Result<NodeEventReceipt, Error> {
+        Err(Error::Storage(
+            "node event ledger is not implemented by this store".into(),
+        ))
+    }
+    /// Highest contiguous node sequence durably recorded by Command.
+    async fn node_event_cursor(
+        &self,
+        _organization_id: &str,
+        _node_id: &str,
+    ) -> Result<i64, Error> {
+        Ok(0)
+    }
     /// Part of an organization's event log, oldest first.
     async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error>;
     async fn resolve_approval(
@@ -36,6 +56,25 @@ pub trait OfficeRepository: Send + Sync {
         approval_id: &str,
         request: ResolutionRequest,
     ) -> Result<ResolutionResponse, Error>;
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NodeEvent {
+    pub organization_id: String,
+    pub node_id: String,
+    pub method: String,
+    pub event_id: String,
+    pub sequence: i64,
+    /// SHA-256 of the normalized params; raw unprojected payloads are not
+    /// retained in the replay ledger.
+    pub payload_digest: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeEventReceipt {
+    pub contiguous_sequence: i64,
+    pub duplicate: bool,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -377,6 +416,9 @@ struct MemoryState {
     sequences: HashMap<(String, String), i64>,
     /// Every event taken, in order, with its cursor.
     log: Vec<Logged>,
+    node_events: HashMap<(String, String, i64), NodeEvent>,
+    node_event_ids: HashMap<(String, String, String), i64>,
+    node_event_cursors: HashMap<(String, String), i64>,
 }
 
 fn objects(value: Value) -> Vec<Object> {
@@ -450,6 +492,9 @@ impl Store {
                 events: HashSet::from([("org-demo".into(), "evt-107".into())]),
                 sequences: HashMap::from([(("org-demo".into(), "node-01".into()), 7)]),
                 log: Vec::new(),
+                node_events: HashMap::new(),
+                node_event_ids: HashMap::new(),
+                node_event_cursors: HashMap::new(),
             }),
         }
     }
@@ -532,61 +577,128 @@ impl OfficeRepository for Store {
         validate_event(&event)?;
         prepare(&mut event);
         let mut state = self.lock();
-        let event_key = (event.organization_id.clone(), event.event_id.clone());
-        if state.events.contains(&event_key) {
-            return Ok(());
+        apply_memory_event(&mut state, event)
+    }
+
+    async fn record_node_event(
+        &self,
+        event: NodeEvent,
+        projection: Option<Event>,
+        require_contiguous: bool,
+    ) -> Result<NodeEventReceipt, Error> {
+        if event.organization_id.is_empty()
+            || event.node_id.is_empty()
+            || event.event_id.is_empty()
+            || event.sequence < 1
+        {
+            return Err(Error::Invalid(
+                "node event requires authenticated identity, eventId and positive sequence".into(),
+            ));
         }
+        let mut state = self.lock();
         let stream = (event.organization_id.clone(), event.node_id.clone());
-        let last = state.sequences.get(&stream).copied().unwrap_or(0);
-        if event.sequence == 0 {
-            event.sequence = last + 1;
+        let id_key = (
+            event.organization_id.clone(),
+            event.node_id.clone(),
+            event.event_id.clone(),
+        );
+        let cursor = state.node_event_cursors.get(&stream).copied().unwrap_or(0);
+        let sequence_key = (
+            event.organization_id.clone(),
+            event.node_id.clone(),
+            event.sequence,
+        );
+        if let Some(previous) = state.node_events.get(&sequence_key) {
+            if previous.organization_id == event.organization_id
+                && previous.event_id == event.event_id
+                && previous.method == event.method
+                && previous.payload_digest == event.payload_digest
+            {
+                let mut contiguous = cursor;
+                loop {
+                    let next = (
+                        event.organization_id.clone(),
+                        event.node_id.clone(),
+                        contiguous.saturating_add(1),
+                    );
+                    if !state.node_events.contains_key(&next) {
+                        break;
+                    }
+                    contiguous += 1;
+                }
+                state.node_event_cursors.insert(stream, contiguous);
+                return Ok(NodeEventReceipt {
+                    contiguous_sequence: contiguous,
+                    duplicate: true,
+                });
+            }
+            return Err(Error::conflict(
+                "event_identity_conflict",
+                "node event sequence was reused with different content",
+            ));
         }
-        if event.sequence <= last {
-            return Err(Error::Invalid(format!(
-                "event sequence {} is not after {last} for {}/{}",
-                event.sequence, stream.0, stream.1
-            )));
+        if state.node_event_ids.contains_key(&id_key) {
+            return Err(Error::conflict(
+                "event_identity_conflict",
+                "node event ID was reused at a different sequence",
+            ));
         }
-        let mut projection = state
-            .projections
-            .get(&event.organization_id)
-            .cloned()
-            .unwrap_or_else(|| Projection {
-                source: "command-memory".into(),
-                ..empty_projection(&event.organization_id)
+        // Rows that predate the ledger are represented by the migrated cursor;
+        // their payloads are no longer available for identity verification.
+        if event.sequence <= cursor {
+            return Ok(NodeEventReceipt {
+                contiguous_sequence: cursor,
+                duplicate: true,
             });
-        stamp_definition(&mut event, &projection);
-        apply_projection_event(&mut projection, &event)?;
-        state.events.insert(event_key);
-        state.sequences.insert(stream, event.sequence);
-        let data = event.data.as_ref();
-        if event.event_type == "approval.requested" {
-            let id = data
-                .and_then(|d| d.get("id"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            state
-                .approvals
-                .insert((event.organization_id.clone(), id.into()), "pending".into());
-        } else if event.event_type == "approval.resolved" {
-            let id = data
-                .and_then(|d| d.get("approvalId"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let decision = data
-                .and_then(|d| d.get("decision"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            state
-                .approvals
-                .insert((event.organization_id.clone(), id.into()), decision.into());
         }
-        state
-            .projections
-            .insert(event.organization_id.clone(), projection);
-        let cursor = state.log.len() as i64 + 1;
-        state.log.push(Logged { cursor, event });
-        Ok(())
+        if require_contiguous && event.sequence != cursor.saturating_add(1) {
+            return Err(Error::conflict(
+                "event_sequence_gap",
+                format!(
+                    "expected node event sequence {}, received {}",
+                    cursor + 1,
+                    event.sequence
+                ),
+            ));
+        }
+        if let Some(mut projection) = projection {
+            let projection_cursor = state
+                .sequences
+                .get(&(event.organization_id.clone(), event.node_id.clone()))
+                .copied()
+                .unwrap_or(0);
+            if projection.sequence > projection_cursor {
+                apply_memory_event(&mut state, projection)?;
+            }
+        }
+        state.node_events.insert(sequence_key, event.clone());
+        state.node_event_ids.insert(id_key, event.sequence);
+        let mut contiguous = cursor;
+        loop {
+            let next = (
+                event.organization_id.clone(),
+                event.node_id.clone(),
+                contiguous.saturating_add(1),
+            );
+            if !state.node_events.contains_key(&next) {
+                break;
+            }
+            contiguous += 1;
+        }
+        state.node_event_cursors.insert(stream, contiguous);
+        Ok(NodeEventReceipt {
+            contiguous_sequence: contiguous,
+            duplicate: false,
+        })
+    }
+
+    async fn node_event_cursor(&self, organization_id: &str, node_id: &str) -> Result<i64, Error> {
+        Ok(self
+            .lock()
+            .node_event_cursors
+            .get(&(organization_id.to_string(), node_id.to_string()))
+            .copied()
+            .unwrap_or(0))
     }
 
     async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error> {
@@ -642,6 +754,66 @@ impl OfficeRepository for Store {
         self.apply_event(resolution).await?;
         Ok(response)
     }
+}
+
+fn apply_memory_event(state: &mut MemoryState, mut event: Event) -> Result<(), Error> {
+    validate_event(&event)?;
+    prepare(&mut event);
+    let event_key = (event.organization_id.clone(), event.event_id.clone());
+    if state.events.contains(&event_key) {
+        return Ok(());
+    }
+    let stream = (event.organization_id.clone(), event.node_id.clone());
+    let last = state.sequences.get(&stream).copied().unwrap_or(0);
+    if event.sequence == 0 {
+        event.sequence = last + 1;
+    }
+    if event.sequence <= last {
+        return Err(Error::Invalid(format!(
+            "event sequence {} is not after {last} for {}/{}",
+            event.sequence, stream.0, stream.1
+        )));
+    }
+    let mut projection = state
+        .projections
+        .get(&event.organization_id)
+        .cloned()
+        .unwrap_or_else(|| Projection {
+            source: "command-memory".into(),
+            ..empty_projection(&event.organization_id)
+        });
+    stamp_definition(&mut event, &projection);
+    apply_projection_event(&mut projection, &event)?;
+    state.events.insert(event_key);
+    state.sequences.insert(stream, event.sequence);
+    let data = event.data.as_ref();
+    if event.event_type == "approval.requested" {
+        let id = data
+            .and_then(|d| d.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        state
+            .approvals
+            .insert((event.organization_id.clone(), id.into()), "pending".into());
+    } else if event.event_type == "approval.resolved" {
+        let id = data
+            .and_then(|d| d.get("approvalId"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let decision = data
+            .and_then(|d| d.get("decision"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        state
+            .approvals
+            .insert((event.organization_id.clone(), id.into()), decision.into());
+    }
+    state
+        .projections
+        .insert(event.organization_id.clone(), projection);
+    let cursor = state.log.len() as i64 + 1;
+    state.log.push(Logged { cursor, event });
+    Ok(())
 }
 
 pub(crate) fn validate_event(event: &Event) -> Result<(), Error> {
@@ -920,6 +1092,90 @@ mod tests {
         let projection = store.get_projection("org-demo").await.unwrap().unwrap();
         assert_eq!(projection.last_event_id, "evt-1");
         assert_eq!(projection.last_sequence, 8);
+    }
+
+    fn raw_node_event(sequence: i64, event_id: &str, payload: Value) -> NodeEvent {
+        NodeEvent {
+            organization_id: "org-a".into(),
+            node_id: "node-a".into(),
+            method: "run.updated".into(),
+            event_id: event_id.into(),
+            sequence,
+            payload_digest: payload.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn node_event_ledger_deduplicates_exact_retries_and_rejects_conflicts_and_gaps() {
+        let store = Store::new();
+        let first = raw_node_event(1, "evt-1", json!({"state": "running"}));
+        let receipt = store
+            .record_node_event(first.clone(), None, true)
+            .await
+            .unwrap();
+        assert_eq!(receipt.contiguous_sequence, 1);
+        assert!(!receipt.duplicate);
+
+        let retry = store.record_node_event(first, None, true).await.unwrap();
+        assert_eq!(retry.contiguous_sequence, 1);
+        assert!(retry.duplicate);
+
+        assert!(
+            store
+                .record_node_event(
+                    raw_node_event(1, "different-id", json!({"state": "running"})),
+                    None,
+                    true,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .record_node_event(
+                    raw_node_event(1, "evt-1", json!({"state": "failed"})),
+                    None,
+                    true,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .record_node_event(
+                    raw_node_event(2, "evt-1", json!({"state": "running"})),
+                    None,
+                    true,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            store
+                .record_node_event(
+                    raw_node_event(3, "evt-3", json!({"state": "running"})),
+                    None,
+                    true,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(store.node_event_cursor("org-a", "node-a").await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn legacy_node_gaps_are_staged_without_advancing_the_contiguous_ack() {
+        let store = Store::new();
+        let later = store
+            .record_node_event(raw_node_event(2, "evt-2", json!({})), None, false)
+            .await
+            .unwrap();
+        assert_eq!(later.contiguous_sequence, 0);
+        let earlier = store
+            .record_node_event(raw_node_event(1, "evt-1", json!({})), None, false)
+            .await
+            .unwrap();
+        assert_eq!(earlier.contiguous_sequence, 2);
     }
 
     #[test]

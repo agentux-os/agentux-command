@@ -111,6 +111,21 @@ impl Hub {
     where
         F: Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
     {
+        self.serve_async_with(ws, node_id, on_message, || {}).await;
+    }
+
+    /// Async message handler with a hook that runs after the authenticated
+    /// connection is registered and before its reader begins.
+    pub async fn serve_async_with<F, C>(
+        &self,
+        ws: WebSocket,
+        node_id: &str,
+        on_message: F,
+        on_connected: C,
+    ) where
+        F: Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+        C: FnOnce(),
+    {
         let (mut sink, mut stream) = ws.split();
         let (out, mut outgoing) = mpsc::unbounded_channel::<Outgoing>();
         let conn = Arc::new(Conn {
@@ -146,6 +161,7 @@ impl Hub {
             }
         });
 
+        on_connected();
         let mut writer = writer;
         loop {
             let message = tokio::select! {
