@@ -46,6 +46,8 @@ fn definition(org: &str) -> Value {
 #[derive(Default)]
 struct Scripted {
     online: Mutex<bool>,
+    foreign: Mutex<bool>,
+    pick_calls: Mutex<usize>,
     /// The node's policy holds run.start for someone there.
     hold: Mutex<bool>,
     refuse: Mutex<Option<String>>,
@@ -73,12 +75,18 @@ impl Scripted {
 
 #[async_trait]
 impl Nodes for Scripted {
+    fn belongs_to(&self, organization_id: &str, node_id: &str) -> bool {
+        !*self.foreign.lock().unwrap() && organization_id == "acme" && node_id == "node-1"
+    }
+
     fn pick(&self, _: &str) -> Option<String> {
+        *self.pick_calls.lock().unwrap() += 1;
         self.online.lock().unwrap().then(|| "node-1".to_string())
     }
 
     async fn command(
         &self,
+        _: &str,
         _: &str,
         method: &str,
         params: Map<String, Value>,
@@ -434,6 +442,76 @@ async fn without_a_published_definition_nothing_starts() {
     }
 }
 
+#[tokio::test]
+async fn an_explicit_node_outside_the_run_organization_is_rejected_before_persistence() {
+    let w = world().await;
+    let node = Scripted::online();
+    let selected = Input {
+        node_id: "node-from-another-org".into(),
+        ..input()
+    };
+
+    let result = w.engine.start("acme", selected, &ana(), &node).await;
+
+    assert!(matches!(result, Err(missions::Error::Invalid(_))));
+    assert!(w.runs.active(Some("acme")).await.unwrap().is_empty());
+    assert!(node.sent.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn an_explicit_disconnected_node_stays_pinned_without_auto_fallback() {
+    let w = world().await;
+    let node = Scripted::default();
+    let selected = Input {
+        node_id: "node-1".into(),
+        ..input()
+    };
+
+    let run = w
+        .engine
+        .start("acme", selected, &ana(), &node)
+        .await
+        .unwrap();
+
+    assert_eq!(run.status, "waiting");
+    assert_eq!(run.steps["implement"].node_id, "node-1");
+    assert_eq!(*node.pick_calls.lock().unwrap(), 0);
+}
+
+#[tokio::test]
+async fn a_pinned_node_reassigned_to_another_org_is_never_reconciled() {
+    let w = world().await;
+    let node = Scripted::online();
+    let run = w
+        .engine
+        .start(
+            "acme",
+            Input {
+                node_id: "node-1".into(),
+                ..input()
+            },
+            &ana(),
+            &node,
+        )
+        .await
+        .unwrap();
+    *node.foreign.lock().unwrap() = true;
+    let mut due = run;
+    due.run_at = Some(Utc::now() - chrono::Duration::seconds(1));
+    due.revision += 1;
+    w.runs.save(&due).await.unwrap();
+
+    assert_eq!(w.engine.tick(&node).await, 1);
+    let failed = w.runs.get("acme", &due.run_id).await.unwrap();
+    assert_eq!(failed.status, "failed");
+    assert!(
+        failed
+            .error
+            .contains("not available in the run organization")
+    );
+    assert!(node.sent("run.snapshot").is_empty());
+}
+
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -607,6 +685,79 @@ async fn a_mission_completes_through_the_api_with_a_node_and_a_human() {
         .cloned()
         .unwrap();
     assert_eq!(shown["status"], "completed");
+}
+
+#[tokio::test]
+async fn mission_start_does_not_disclose_or_dispatch_a_foreign_node_id() {
+    let app = Handler::new().router();
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/organizations/acme/definitions",
+        "demo-leader",
+        Some(definition("acme")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/organizations/acme/definitions/1/publish",
+        "demo-leader",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let foreign_hello = json!({
+        "jsonrpc": "2.0", "id": "foreign-node", "method": "node.hello",
+        "params": common::params("other-org", "node-foreign", json!({
+            "capabilities": ["run.start"],
+            "agentuxVersion": "0.5.0",
+            "supportedProtocolVersions": ["v1"]
+        }))
+    });
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/protocol/messages",
+        "",
+        Some(foreign_hello),
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+
+    let start = |node_id: &str| {
+        json!({
+            "missionId": "ship",
+            "repository": "https://github.com/acme/app",
+            "prompt": "Ship it",
+            "nodeId": node_id,
+        })
+    };
+    let (foreign_status, foreign_body) = call(
+        &app,
+        "POST",
+        "/v1/organizations/acme/runs",
+        "demo-leader",
+        Some(start("node-foreign")),
+    )
+    .await;
+    let (unknown_status, unknown_body) = call(
+        &app,
+        "POST",
+        "/v1/organizations/acme/runs",
+        "demo-leader",
+        Some(start("node-unknown")),
+    )
+    .await;
+
+    assert_eq!(foreign_status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(unknown_status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        foreign_body, unknown_body,
+        "do not reveal whether a node exists in another organization"
+    );
 }
 
 #[tokio::test]

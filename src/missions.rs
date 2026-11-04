@@ -341,11 +341,16 @@ pub enum NodeError {
 /// The nodes the engine talks to: the server's command channel.
 #[async_trait]
 pub trait Nodes: Send + Sync {
+    /// Whether the registered node belongs to this organization. This check
+    /// is independent of connection state so an explicitly selected offline
+    /// node can remain pinned while the run waits for it to reconnect.
+    fn belongs_to(&self, organization_id: &str, node_id: &str) -> bool;
     /// A node of the organization that can take a run now.
     fn pick(&self, organization_id: &str) -> Option<String>;
     /// Sends a command (its `params` carry `commandId`); the node's result.
     async fn command(
         &self,
+        organization_id: &str,
         node_id: &str,
         method: &str,
         params: Map<String, Value>,
@@ -447,6 +452,11 @@ impl Engine {
     ) -> Result<Run, Error> {
         if input.repository.trim().is_empty() || input.prompt.trim().is_empty() {
             return Err(Error::Invalid("repository and prompt are required".into()));
+        }
+        if !input.node_id.is_empty() && !nodes.belongs_to(org, &input.node_id) {
+            return Err(Error::Invalid(
+                "nodeId is not available in this organization".into(),
+            ));
         }
         let published = self
             .definitions
@@ -661,7 +671,13 @@ impl Engine {
                 )),
             );
             params.insert("runId".into(), Value::String(state.node_run_id.clone()));
-            return match nodes.command(&state.node_id, "run.snapshot", params).await {
+            if !nodes.belongs_to(&run.organization_id, &state.node_id) {
+                return self.fail_node_scope(run, state).await;
+            }
+            return match nodes
+                .command(&run.organization_id, &state.node_id, "run.snapshot", params)
+                .await
+            {
                 Ok(snapshot) => match snapshot["status"].as_str() {
                     Some("done" | "completed") => self.finish_agent(run, "run.completed", "").await,
                     Some("failed" | "cancelled") => {
@@ -695,6 +711,9 @@ impl Engine {
                 .wait_for_node(run, "no node of the organization is connected")
                 .await;
         };
+        if !nodes.belongs_to(&run.organization_id, &node) {
+            return self.fail_node_scope(run, state).await;
+        }
         if state.status.is_empty() {
             state = Step {
                 kind: "agent".into(),
@@ -725,7 +744,10 @@ impl Engine {
         ] {
             params.insert(key.into(), Value::String(value));
         }
-        match nodes.command(&node, "run.start", params).await {
+        match nodes
+            .command(&run.organization_id, &node, "run.start", params)
+            .await
+        {
             Ok(result) => {
                 state.status = "waiting".into();
                 state.node_id = node;
@@ -755,6 +777,18 @@ impl Engine {
                 self.commit(run, "mission.run.step_failed", None).await
             }
         }
+    }
+
+    async fn fail_node_scope(&self, mut run: Run, mut state: Step) -> Result<Run, Error> {
+        let message = "selected node is not available in the run organization";
+        state.status = "failed".into();
+        state.error = message.into();
+        state.finished_at = Some(Utc::now());
+        run.error = message.into();
+        run.status = FAILED.into();
+        run.steps.insert(run.step.clone(), state);
+        run.run_at = None;
+        self.commit(run, "mission.run.step_failed", None).await
     }
 
     async fn wait_for_node(&self, mut run: Run, why: &str) -> Result<Run, Error> {
@@ -1073,7 +1107,9 @@ impl Engine {
                     );
                     params.insert("runId".into(), Value::String(state.node_run_id.clone()));
                     // Best effort: the node may be gone; the run ends here either way.
-                    let _ = nodes.command(&state.node_id, "run.cancel", params).await;
+                    let _ = nodes
+                        .command(&run.organization_id, &state.node_id, "run.cancel", params)
+                        .await;
                 }
                 run.status = CANCELLED.into();
                 run.run_at = None;

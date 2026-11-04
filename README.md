@@ -235,6 +235,12 @@ cargo test --test end_to_end
    shows the mission run and the node's run as completed, with the pull
    request the node opened as the run's artifact.
 
+When a run request includes `nodeId`, Command validates that the node is
+registered to the same organization before persisting the run. The node stays
+pinned while offline: the run waits for that node and never silently falls
+back to another one. If the node is removed or reassigned before a retry,
+Command fails the step before sending another command.
+
 To try it by hand, run Command with demo tokens and Office against it:
 
 ```sh
