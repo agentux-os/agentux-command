@@ -75,7 +75,7 @@ dependencies = [
  "agentux-store",
  "agentuxd",
  "async-trait",
- "auxp 0.1.0 (git+https://github.com/agentux-os/agentux-protocol?rev=9155e4e6e661f7e1080428bda991fffb4ed54f9c)",
+ "auxp 0.1.0 (git+https://github.com/agentux-os/agentux-protocol?rev=a44991dfeb5eba0d25e97d87c22c8d21495f521d)",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -311,7 +311,7 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 [[package]]
 name = "auxp"
 version = "0.1.0"
-source = "git+https://github.com/agentux-os/agentux-protocol?rev=9155e4e6e661f7e1080428bda991fffb4ed54f9c#9155e4e6e661f7e1080428bda991fffb4ed54f9c"
+source = "git+https://github.com/agentux-os/agentux-protocol?rev=a44991dfeb5eba0d25e97d87c22c8d21495f521d#a44991dfeb5eba0d25e97d87c22c8d21495f521d"
 dependencies = [
  "jiff",
  "serde",
