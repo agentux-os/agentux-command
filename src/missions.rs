@@ -97,6 +97,10 @@ pub struct Run {
     /// The current step; empty once the run is over.
     pub step: String,
     pub input: Input,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schedule_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheduled_for: Option<DateTime<Utc>>,
     pub steps: BTreeMap<String, Step>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error: String,
@@ -108,6 +112,14 @@ pub struct Run {
     pub updated_at: DateTime<Utc>,
     /// Bumped by every save; also the sequence of the run's events.
     pub revision: i64,
+}
+
+/// Stable identity and schedule metadata for idempotent run starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunIdentity {
+    pub run_id: String,
+    pub schedule_id: Option<String>,
+    pub scheduled_for: Option<DateTime<Utc>>,
 }
 
 impl Run {
@@ -153,7 +165,7 @@ impl From<deadpool_postgres::PoolError> for Error {
 /// Where runs are kept.
 #[async_trait]
 pub trait Store: Send + Sync {
-    async fn insert(&self, run: &Run) -> Result<(), Error>;
+    async fn insert(&self, run: &Run) -> Result<bool, Error>;
     async fn get(&self, organization_id: &str, run_id: &str) -> Result<Run, Error>;
     /// The organization's runs, newest first.
     async fn list(&self, organization_id: &str) -> Result<Vec<Run>, Error>;
@@ -178,9 +190,13 @@ impl Memory {
 
 #[async_trait]
 impl Store for Memory {
-    async fn insert(&self, run: &Run) -> Result<(), Error> {
-        self.lock().insert(run.run_id.clone(), run.clone());
-        Ok(())
+    async fn insert(&self, run: &Run) -> Result<bool, Error> {
+        let mut runs = self.lock();
+        if runs.contains_key(&run.run_id) {
+            return Ok(false);
+        }
+        runs.insert(run.run_id.clone(), run.clone());
+        Ok(true)
     }
 
     async fn get(&self, org: &str, run_id: &str) -> Result<Run, Error> {
@@ -240,15 +256,15 @@ use tokio_postgres::types::Json;
 
 #[async_trait]
 impl Store for Postgres {
-    async fn insert(&self, run: &Run) -> Result<(), Error> {
+    async fn insert(&self, run: &Run) -> Result<bool, Error> {
         let client = self.pool.get().await?;
-        client
+        let inserted = client
             .execute(
-                "INSERT INTO mission_runs (run_id, organization_id, status, run_at, revision, doc, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                "INSERT INTO mission_runs (run_id, organization_id, status, run_at, revision, doc, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (run_id) DO NOTHING",
                 &[&run.run_id, &run.organization_id, &run.status, &run.run_at, &run.revision, &Json(run), &run.created_at],
             )
             .await?;
-        Ok(())
+        Ok(inserted == 1)
     }
 
     async fn get(&self, org: &str, run_id: &str) -> Result<Run, Error> {
@@ -405,6 +421,30 @@ impl Engine {
         actor: &Actor,
         nodes: &dyn Nodes,
     ) -> Result<Run, Error> {
+        self.start_with_id(
+            org,
+            input,
+            actor,
+            nodes,
+            RunIdentity {
+                run_id: format!("run-{}", crate::random_hex(8)),
+                schedule_id: None,
+                scheduled_for: None,
+            },
+        )
+        .await
+    }
+
+    /// Starts a mission with a caller-supplied idempotency key. Scheduled
+    /// occurrences use their stable id so a retry after a crash reuses a run.
+    pub async fn start_with_id(
+        &self,
+        org: &str,
+        input: Input,
+        actor: &Actor,
+        nodes: &dyn Nodes,
+        identity: RunIdentity,
+    ) -> Result<Run, Error> {
         if input.repository.trim().is_empty() || input.prompt.trim().is_empty() {
             return Err(Error::Invalid("repository and prompt are required".into()));
         }
@@ -439,7 +479,7 @@ impl Engine {
             .ok_or_else(|| Error::Invalid("the mission's workflow has no steps".into()))?;
         let now = Utc::now();
         let run = Run {
-            run_id: format!("run-{}", crate::random_hex(8)),
+            run_id: identity.run_id,
             organization_id: org.into(),
             definition_version: published.definition_version,
             mission_id: input.mission_id.clone(),
@@ -447,6 +487,8 @@ impl Engine {
             status: RUNNING.into(),
             step: first.into(),
             input,
+            schedule_id: identity.schedule_id,
+            scheduled_for: identity.scheduled_for,
             steps: BTreeMap::new(),
             error: String::new(),
             run_at: None,
@@ -455,7 +497,9 @@ impl Engine {
             updated_at: now,
             revision: 1,
         };
-        self.store.insert(&run).await?;
+        if !self.store.insert(&run).await? {
+            return self.store.get(org, &run.run_id).await;
+        }
         let actor = serde_json::to_value(actor).ok();
         self.announce(&run, "mission.run.started", actor).await;
         self.advance(run, nodes).await

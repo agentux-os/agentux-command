@@ -46,6 +46,10 @@ const FILES: &[(&str, &str)] = &[
         "010_event_retention.sql",
         include_str!("../../migrations/010_event_retention.sql"),
     ),
+    (
+        "011_mission_schedules.sql",
+        include_str!("../../migrations/011_mission_schedules.sql"),
+    ),
 ];
 
 pub(crate) struct Migration {
@@ -133,7 +137,10 @@ mod tests {
 
     #[test]
     fn versions_are_ordered_and_start_at_one() {
-        assert_eq!(migration_versions(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(
+            migration_versions(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
     }
 
     #[test]

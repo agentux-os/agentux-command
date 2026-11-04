@@ -17,6 +17,7 @@ pub mod oidc;
 pub mod outbox;
 pub mod protocol;
 pub mod report;
+pub mod schedules;
 pub mod server;
 
 /// Now, as RFC 3339 with the fraction it has (Go's RFC3339Nano).

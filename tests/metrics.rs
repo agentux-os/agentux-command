@@ -89,6 +89,8 @@ async fn authorized_metrics_scrape_exposes_process_and_service_metrics_without_s
             status: state.into(),
             step: String::new(),
             input: Input::default(),
+            schedule_id: None,
+            scheduled_for: None,
             steps: BTreeMap::new(),
             error: String::new(),
             run_at: None,

@@ -706,6 +706,8 @@ async fn mission_runs_live_in_the_database_and_refuse_stale_writes() {
         status: missions::RUNNING.into(),
         step: "implement".into(),
         input: Input::default(),
+        schedule_id: None,
+        scheduled_for: None,
         steps: Default::default(),
         error: String::new(),
         run_at: None,
@@ -737,6 +739,58 @@ async fn mission_runs_live_in_the_database_and_refuse_stale_writes() {
     restarted.save(&run).await.unwrap();
     assert!(restarted.active(Some("acme")).await.unwrap().is_empty());
     assert_eq!(restarted.list("acme").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn concurrent_workers_claim_a_scheduled_occurrence_once() {
+    use agentux_command::missions::Input;
+    use agentux_command::schedules::{self, ConcurrencyPolicy, MissedPolicy, Schedule, Store};
+    let Some((_, pool, _, _)) = store().await else {
+        return;
+    };
+    let schedules = schedules::Postgres::new(pool.clone());
+    let now = chrono::Utc::now();
+    let schedule = Schedule {
+        schedule_id: format!("schedule-{}", now.timestamp_nanos_opt().unwrap()),
+        organization_id: "scheduled-claim-test".into(),
+        name: "once".into(),
+        input: Input {
+            mission_id: "review".into(),
+            repository: "org/repo".into(),
+            prompt: "Review".into(),
+            ..Input::default()
+        },
+        cron: None,
+        timezone: None,
+        run_at: Some(now),
+        missed_policy: MissedPolicy::RunOnce,
+        concurrency_policy: ConcurrencyPolicy::Allow,
+        status: schedules::ACTIVE.into(),
+        next_run_at: Some(now),
+        last_run_at: None,
+        last_run_id: None,
+        created_by: "test".into(),
+        created_at: now,
+        updated_at: now,
+        revision: 1,
+    };
+    schedules.create(&schedule).await.unwrap();
+    let second_worker = schedules::Postgres::new(pool);
+    let (first, second) = tokio::join!(
+        schedules.claim_due(now + chrono::Duration::seconds(1), 10),
+        second_worker.claim_due(now + chrono::Duration::seconds(1), 10),
+    );
+    let firings = first.unwrap().len() + second.unwrap().len();
+    assert_eq!(
+        firings, 1,
+        "row locks and the unique firing key elect one worker"
+    );
+
+    let (first, second) = tokio::join!(
+        schedules.claim_pending(now, 10),
+        second_worker.claim_pending(now, 10),
+    );
+    assert_eq!(first.unwrap().len() + second.unwrap().len(), 1);
 }
 
 #[tokio::test]
