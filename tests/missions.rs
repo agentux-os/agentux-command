@@ -53,6 +53,9 @@ struct Scripted {
     refuse: Mutex<Option<String>>,
     snapshot: Mutex<Value>,
     sent: Mutex<Vec<(String, Map<String, Value>)>>,
+    block_first_start: Mutex<bool>,
+    start_blocked: tokio::sync::Notify,
+    release_start: tokio::sync::Notify,
 }
 
 impl Scripted {
@@ -98,6 +101,16 @@ impl Nodes for Scripted {
             .lock()
             .unwrap()
             .push((method.to_string(), params.clone()));
+        let wait_for_start = if method == "run.start" {
+            let mut block = self.block_first_start.lock().unwrap();
+            std::mem::take(&mut *block)
+        } else {
+            false
+        };
+        if wait_for_start {
+            self.start_blocked.notify_one();
+            self.release_start.notified().await;
+        }
         if let Some(why) = self.refuse.lock().unwrap().clone() {
             return Err(NodeError::Refused(why));
         }
@@ -249,6 +262,34 @@ async fn a_mission_runs_its_agent_step_its_human_gate_and_its_action() {
         .find(|l| l.event.event_type == "mission.run.started")
         .unwrap();
     assert_eq!(started.event.actor.as_ref().unwrap()["id"], "oidc:ana");
+}
+
+#[tokio::test]
+async fn a_pending_run_start_is_reserved_from_concurrent_scheduler_ticks() {
+    let w = world().await;
+    let engine = Arc::new(w.engine);
+    let node = Arc::new(Scripted::online());
+    *node.block_first_start.lock().unwrap() = true;
+    let start_engine = engine.clone();
+    let start_node = node.clone();
+    let starting = tokio::spawn(async move {
+        start_engine
+            .start("acme", input(), &ana(), &*start_node)
+            .await
+    });
+    node.start_blocked.notified().await;
+
+    let advanced = engine.tick(&*node).await;
+    node.release_start.notify_one();
+    let run = starting.await.unwrap().unwrap();
+
+    assert_eq!(advanced, 0, "the in-flight start owns a future retry time");
+    assert_eq!(
+        node.sent("run.start").len(),
+        1,
+        "do not race duplicate dispatches"
+    );
+    assert_eq!(run.steps["implement"].status, "waiting");
 }
 
 #[tokio::test]

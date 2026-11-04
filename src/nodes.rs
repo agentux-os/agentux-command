@@ -25,6 +25,9 @@ pub struct Node {
     pub id: String,
     pub organization_id: String,
     pub capabilities: Option<Vec<String>>,
+    /// Optional protocol extensions Command accepted during the latest hello.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub accepted_capabilities: Vec<String>,
     pub status: String,
     #[serde(rename = "agentuxVersion", skip_serializing_if = "String::is_empty")]
     pub agentux_version: String,

@@ -7,6 +7,8 @@
 //! the message callback, as if it had been POSTed.
 
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -96,6 +98,19 @@ impl Hub {
     /// replaces its previous connection. `on_message` gets every message
     /// that is not an answer to a command.
     pub async fn serve(&self, ws: WebSocket, node_id: &str, on_message: impl Fn(&str, &[u8])) {
+        self.serve_async(ws, node_id, move |node, raw| {
+            on_message(&node, &raw);
+            Box::pin(async {})
+        })
+        .await;
+    }
+
+    /// Async counterpart for message handlers that validate or persist node
+    /// events before the connection reads its next frame.
+    pub async fn serve_async<F>(&self, ws: WebSocket, node_id: &str, on_message: F)
+    where
+        F: Fn(String, Vec<u8>) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>,
+    {
         let (mut sink, mut stream) = ws.split();
         let (out, mut outgoing) = mpsc::unbounded_channel::<Outgoing>();
         let conn = Arc::new(Conn {
@@ -163,7 +178,7 @@ impl Hub {
                 }
                 continue;
             }
-            on_message(node_id, &data);
+            on_message(node_id.to_string(), data).await;
         }
 
         {

@@ -298,6 +298,8 @@ impl OfficeRepository for PostgresStore {
                  WHERE organization_id = $1 AND ingest_id > $2
                    AND ($3::timestamptz IS NULL OR received_at >= $3)
                    AND ($4::timestamptz IS NULL OR received_at < $4)
+                   AND ($6::text IS NULL OR payload->>'runId' = $6)
+                   AND ($7::text IS NULL OR payload->>'eventType' = $7)
                  ORDER BY ingest_id LIMIT $5",
                 &[
                     &organization_id,
@@ -305,6 +307,8 @@ impl OfficeRepository for PostgresStore {
                     &replay.since,
                     &replay.until,
                     &replay.limit,
+                    &replay.run_id,
+                    &replay.event_type,
                 ],
             )
             .await
