@@ -1,5 +1,11 @@
 # AgentUX Command server bundle
 
+For the supported production topology target, assumptions, Command/operator
+responsibility split, unqualified objectives, and release gates, see the
+[production readiness profile v1.0](../docs/production-readiness.md). The
+bundle is a single-host deployment; its existence does not qualify availability
+or capacity.
+
 This directory contains the optional `command-server` profile bundle. It is
 container-only: PostgreSQL, NATS, MinIO and the Command service run
 as rootless Podman Quadlets. No host RPM installation or mutable `/usr` change
@@ -130,17 +136,34 @@ what they still hold. Upgrade PostgreSQL itself (a major version) through a
 dump and restore into a new volume, never in place. The named volumes are
 never removed with a profile.
 
-### Recovery objectives
+### Recovery objectives and qualification
 
-| | Objective | How |
-|---|---|---|
-| Recovery point | your backup interval (daily: up to 24 h of changes) | `backup.sh` on a timer; shorten the interval for a tighter RPO |
-| Recovery time | minutes for a database of a few GiB: the restore drill restores and checks in seconds | `restore.sh` + `check`; measure yours on your data |
-| Process failure | ~1 min | `/livez` + `HealthOnFailure=kill` + `Restart=on-failure` |
+The profile sets an initial target RPO of 24 hours (conditional on a successful
+daily off-host backup) and target RTO of 8 hours to restore `/readyz` and pass
+`agentux-command check`. Both are **UNQUALIFIED** until measured in the
+operator's environment. The repository's current scripts are manual; they do
+not schedule, encrypt, or copy backups off-host. The CI restore drill is not a
+production-sized recovery-time measurement. See the profile's [objectives and
+release qualification checklist](../docs/production-readiness.md#objectives-and-qualification-status).
 
-This bundle is a single host: no high availability. Capacity baseline for
-development: 4 vCPU, 8 GiB RAM, 50 GiB of persistent storage; production
-sizing follows event volume (see the growth report below) and node count.
+The initial topology is one host, one Command process, and one PostgreSQL
+instance, with no automatic failover. The profile's 99.5% monthly readiness
+target is also **UNQUALIFIED**; an external one-minute probe and retained
+monthly results are required. The liveness check/restart is a process
+supervision mechanism, not an availability commitment.
+
+No numeric production capacity is qualified for organizations, nodes,
+concurrent missions/operators, event ingestion, database size, or retention.
+The former development-machine baseline is not production sizing guidance.
+Use the [event growth report](#office-event-growth-report) for observation;
+the measured envelope will be published through
+[#52](https://github.com/agentux-os/agentux-command/issues/52). Follow
+[#50](https://github.com/agentux-os/agentux-command/issues/50) for metrics and
+alerting, [#51](https://github.com/agentux-os/agentux-command/issues/51) for
+scheduled off-host backup and recurring restore verification,
+[#54](https://github.com/agentux-os/agentux-command/issues/54) for staging
+release qualification, and [#55](https://github.com/agentux-os/agentux-command/issues/55)
+for the topology decision.
 
 ### Office event growth report
 
