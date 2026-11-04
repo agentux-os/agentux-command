@@ -68,6 +68,16 @@ impl Launcher for ActivityLauncher {
                         acp::ToolKind::Execute,
                         None,
                     )?;
+                    let permission = turn
+                        .request_permission(
+                            "tool-activity-e2e",
+                            "run the scripted activity test",
+                            acp::ToolKind::Execute,
+                        )
+                        .await?;
+                    if permission != "allow" {
+                        return Err(format!("the activity test was not approved: {permission}"));
+                    }
                     turn.tool_update(
                         "tool-activity-e2e",
                         acp::ToolCallStatus::Completed,
