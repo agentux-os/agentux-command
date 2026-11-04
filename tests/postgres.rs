@@ -160,21 +160,35 @@ async fn node_event_ledger_survives_restart_and_rejects_sequence_gaps_and_identi
 }
 
 #[tokio::test]
-async fn safe_cursor_migration_resets_unverified_high_water_and_preserves_ledger_cursor() {
-    let Some((_, pool, _, _)) = store().await else {
+async fn legacy_cursor_migration_preserves_resume_cursor_and_records_verified_prefix() {
+    let Some((store, pool, _, _)) = store().await else {
         return;
     };
     let client = pool.get().await.unwrap();
     client
         .execute(
-            "INSERT INTO command_node_event_cursors (organization_id,node_id,contiguous_sequence) VALUES ('legacy-org','legacy-node',19),('ledger-org','ledger-node',2)",
+            "INSERT INTO command_node_event_cursors (organization_id,node_id,contiguous_sequence) VALUES ('case-a','node',19),('case-b','node',19),('case-c','node',19),('case-d','node',19),('case-e','node',19),('case-f','node',19)",
             &[],
         )
         .await
         .unwrap();
     client
         .execute(
-            "INSERT INTO command_node_events (organization_id,node_id,sequence,event_id,method,payload_sha256) VALUES ('ledger-org','ledger-node',1,'known-1','run.updated',repeat('a',64)),('ledger-org','ledger-node',2,'known-2','run.updated',repeat('b',64))",
+            "INSERT INTO command_node_events (organization_id,node_id,sequence,event_id,method,payload_sha256) VALUES ('case-a','node',1,'a-1','run.updated',repeat('a',64)),('case-a','node',2,'a-2','run.updated',repeat('b',64)),('case-b','node',1,'b-1','run.updated',repeat('c',64)),('case-b','node',3,'b-3','run.updated',repeat('d',64)),('case-c','node',3,'c-3','run.updated',repeat('e',64)),('case-e','node',20,'e-20','run.updated',repeat('f',64)),('case-e','node',21,'e-21','run.updated',repeat('a',64)),('case-e','node',22,'e-22','run.updated',repeat('b',64)),('case-e','node',23,'e-23','run.updated',repeat('c',64)),('case-e','node',24,'e-24','run.updated',repeat('d',64)),('case-e','node',25,'e-25','run.updated',repeat('e',64))",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "INSERT INTO command_node_capabilities (organization_id,node_id,accepted_capabilities) VALUES ('case-e','node','[\"node.event_replay.v1\"]')",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "INSERT INTO command_node_events (organization_id,node_id,sequence,event_id,method,payload_sha256) SELECT 'case-f','node',sequence,'f-'||sequence,'run.updated',repeat('f',64) FROM generate_series(1,19) sequence",
             &[],
         )
         .await
@@ -187,13 +201,45 @@ async fn safe_cursor_migration_resets_unverified_high_water_and_preserves_ledger
         .unwrap();
     let cursors = client
         .query(
-            "SELECT node_id,contiguous_sequence FROM command_node_event_cursors WHERE organization_id IN ('legacy-org','ledger-org') ORDER BY node_id",
+            "SELECT organization_id,contiguous_sequence,verified_sequence,history_gap_through_sequence FROM command_node_event_cursors WHERE organization_id LIKE 'case-%' ORDER BY organization_id",
             &[],
         )
         .await
         .unwrap();
-    assert_eq!(cursors[0].get::<_, i64>(1), 2);
-    assert_eq!(cursors[1].get::<_, i64>(1), 0);
+    let actual = cursors
+        .iter()
+        .map(|row| {
+            (
+                row.get::<_, String>(0),
+                row.get::<_, i64>(1),
+                row.get::<_, i64>(2),
+                row.get::<_, Option<i64>>(3),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        actual,
+        [
+            ("case-a".into(), 19, 2, Some(19)),
+            ("case-b".into(), 19, 1, Some(19)),
+            ("case-c".into(), 19, 0, Some(19)),
+            ("case-d".into(), 19, 0, Some(19)),
+            ("case-e".into(), 19, 0, Some(19)),
+            ("case-f".into(), 19, 19, None),
+        ]
+    );
+    assert_eq!(
+        store
+            .node_event_history_gap("case-e", "node")
+            .await
+            .unwrap(),
+        Some(19)
+    );
+    assert_eq!(
+        store.node_event_cursor("case-e", "node").await.unwrap(),
+        19,
+        "migration must retain the resume cursor Core may already have received"
+    );
 }
 
 #[tokio::test]

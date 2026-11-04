@@ -156,14 +156,19 @@ mod tests {
     }
 
     #[test]
-    fn legacy_replay_cursors_are_not_seeded_from_high_water_marks() {
+    fn legacy_replay_cursors_preserve_prior_ack_and_record_unverified_history() {
         let migrations = load().unwrap();
         let cursor_safety = migrations
             .iter()
             .find(|migration| migration.version == 14)
             .unwrap();
-        assert!(cursor_safety.sql.contains("SET contiguous_sequence = 0"));
-        assert!(cursor_safety.sql.contains("NOT EXISTS"));
+        assert!(
+            cursor_safety
+                .sql
+                .contains("verified_sequence = prefix.verified_prefix")
+        );
+        assert!(!cursor_safety.sql.contains("SET contiguous_sequence"));
+        assert!(cursor_safety.sql.contains("history_gap_through_sequence"));
     }
 
     #[test]

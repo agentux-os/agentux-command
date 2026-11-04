@@ -1,8 +1,8 @@
 //! Command against the real node side: agentux-core's gateway enrolls with
 //! a token Command issued, reports the node, keeps the command connection
-//! and answers commands from an agentuxd with scripted agents. Nothing on
-//! either side is a stand-in, so a protocol change one side makes and the
-//! other does not fails here.
+//! and a Core `agentuxd` whose harness is an in-process ACP test agent. The
+//! gateway, daemon, HTTP/WebSocket transport and Command are the real crates;
+//! the ACP agent emits actual tool-call lifecycle events without model access.
 #![cfg(unix)]
 
 mod common;
@@ -11,16 +11,106 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agentux_command::server::Handler;
+use agentux_fake_agent::{acp, script};
 use agentux_gateway::channel::CommandOptions;
 use agentux_gateway::policy::Policy;
 use agentux_gateway::{Http, NodeConfig};
+use agentux_harness::{AcpSession, Events, PermissionHandler};
 use agentux_store::Store;
-use agentuxd::{Engine, FakeExecutor};
+use agentuxd::executor::{AgentTask, BoxFuture, PullRequestTask, StepExecutor, StepHost};
+use agentuxd::{AcpExecutor, Engine, FakeExecutor, LaunchSpec, Launcher};
 use axum::Router;
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 
 use common::call;
+
+async fn organization_reader(handler: &Handler, organization_id: &str) -> String {
+    handler
+        .service_tokens()
+        .issue(
+            agentux_command::auth::TokenRequest {
+                name: format!("{organization_id}-activity-reader"),
+                organization_id: organization_id.into(),
+                capabilities: vec!["organization.read".into()],
+                ..Default::default()
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap()
+        .secret
+}
+
+struct ActivityLauncher;
+
+impl Launcher for ActivityLauncher {
+    fn launch<'a>(
+        &'a self,
+        spec: LaunchSpec<'a>,
+        permissions: PermissionHandler,
+    ) -> BoxFuture<'a, Result<(AcpSession, Events), String>> {
+        Box::pin(async move {
+            let agent = match spec.harness {
+                "fake-planner" => script(|turn| async move {
+                    turn.plan(&[(
+                        "Implement the requested change",
+                        acp::PlanEntryStatus::Pending,
+                    )])?;
+                    turn.message("1. Inspect the repository\n")?;
+                    turn.message("2. Implement the change\n")?;
+                    Ok(acp::StopReason::EndTurn)
+                }),
+                "fake-acp" => script(|turn| async move {
+                    turn.tool_call(
+                        "tool-activity-e2e",
+                        "SENSITIVE_ACTIVITY_E2E title",
+                        acp::ToolKind::Execute,
+                        None,
+                    )?;
+                    turn.tool_update(
+                        "tool-activity-e2e",
+                        acp::ToolCallStatus::Completed,
+                        Some("SENSITIVE_ACTIVITY_E2E output"),
+                    )?;
+                    turn.message("SENSITIVE_ACTIVITY_E2E private message")?;
+                    Ok(acp::StopReason::EndTurn)
+                }),
+                _ => return Err(format!("unexpected test harness {}", spec.harness)),
+            };
+            let (transport, _agent) = agentux_fake_agent::spawn(agent);
+            AcpSession::connect(transport, spec.cwd, permissions)
+                .await
+                .map_err(|error| error.to_string())
+        })
+    }
+}
+
+struct ActivityExecutor {
+    acp: AcpExecutor,
+    pull_requests: FakeExecutor,
+}
+
+impl StepExecutor for ActivityExecutor {
+    fn run_agent<'a>(
+        &'a self,
+        task: &'a AgentTask,
+        host: Arc<dyn StepHost>,
+    ) -> BoxFuture<'a, Result<agentuxd::executor::AgentOutcome, String>> {
+        self.acp.run_agent(task, host)
+    }
+
+    fn open_pull_request<'a>(
+        &'a self,
+        task: &'a PullRequestTask,
+    ) -> BoxFuture<'a, Result<agentuxd::executor::PullRequestOutcome, String>> {
+        self.pull_requests.open_pull_request(task)
+    }
+
+    fn release<'a>(&'a self, run_id: &'a str) -> BoxFuture<'a, ()> {
+        self.acp.release(run_id)
+    }
+}
 
 /// Polls the node list until `check` holds for the node.
 async fn wait_for_node(
@@ -254,6 +344,11 @@ fn repository(dir: &std::path::Path) -> std::path::PathBuf {
     let repo = dir.join("app");
     std::fs::create_dir_all(&repo).unwrap();
     std::fs::write(repo.join("README.md"), "# app\n").unwrap();
+    std::fs::write(
+        repo.join("agentux.yaml"),
+        "version: 1\nroles:\n  planner:\n    harness: fake-planner\n  dev:\n    harness: fake-acp\npipeline:\n  - step: plan\n    role: planner\n  - step: implement\n    role: dev\n  - step: pull_request\n",
+    )
+    .unwrap();
     let git = |args: &[&str]| {
         let status = std::process::Command::new("git")
             .args([
@@ -271,7 +366,7 @@ fn repository(dir: &std::path::Path) -> std::path::PathBuf {
         assert!(status.success(), "git {args:?}");
     };
     git(&["init", "--quiet"]);
-    git(&["add", "README.md"]);
+    git(&["add", "README.md", "agentux.yaml"]);
     git(&["commit", "--quiet", "-m", "start"]);
     git(&[
         "remote",
@@ -282,6 +377,14 @@ fn repository(dir: &std::path::Path) -> std::path::PathBuf {
     repo
 }
 
+async fn isolated_database_url(prefix: &str) -> Option<String> {
+    let (_, schema) = common::schema(prefix).await?;
+    let mut url = url::Url::parse(&common::database_url()?).unwrap();
+    url.query_pairs_mut()
+        .append_pair("options", &format!("-c search_path={schema}"));
+    Some(url.to_string())
+}
+
 /// The whole organization workflow, nothing stubbed but the agents (and no
 /// model credentials): a leader drafts, edits and publishes an organization;
 /// a node enrolls and connects; a mission runs its agent step on the node's
@@ -290,7 +393,13 @@ fn repository(dir: &std::path::Path) -> std::path::PathBuf {
 /// projection show every step with the definition version.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
-    let handler = Handler::new().with_open_nodes(false);
+    let Some(database_url) = isolated_database_url("activity_e2e").await else {
+        return;
+    };
+    let handler = Handler::postgres(&database_url)
+        .await
+        .unwrap()
+        .with_demo_tokens(true);
     let robot = handler
         .service_tokens()
         .issue(
@@ -305,10 +414,19 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
         .await
         .unwrap()
         .secret;
-    let app = handler.router();
+    let mut app = handler.router();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let url = format!("http://{}", listener.local_addr().unwrap());
-    tokio::spawn(axum::serve(listener, app.clone()).into_future());
+    let command_address = listener.local_addr().unwrap();
+    let url = format!("http://{command_address}");
+    let (stop_command, command_stopped) = tokio::sync::oneshot::channel::<()>();
+    let command_app = app.clone();
+    let command_server = tokio::spawn(async move {
+        axum::serve(listener, command_app)
+            .with_graceful_shutdown(async {
+                let _ = command_stopped.await;
+            })
+            .await
+    });
 
     // 1. The leader drafts the organization, fixes it, and publishes it.
     let mut definition = json!({
@@ -365,13 +483,16 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     let socket = dir.path().join("agentuxd.sock");
     let engine = Engine::new(
         Store::open(&dir.path().join("agentuxd.db")).unwrap(),
-        Arc::new(FakeExecutor::default()),
+        Arc::new(ActivityExecutor {
+            acp: AcpExecutor::new(ActivityLauncher),
+            pull_requests: FakeExecutor::default(),
+        }),
     );
     engine
         .register_project(repo.to_str().unwrap())
         .await
         .unwrap();
-    let (_stop_daemon, daemon_stopped) = tokio::sync::oneshot::channel::<()>();
+    let (stop_daemon, daemon_stopped) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn({
         let socket = socket.clone();
         async move {
@@ -396,12 +517,14 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     let (config, _) = agentux_gateway::enroll(&url, &token, None, "host")
         .await
         .unwrap();
-    let (_stop_gateway, gateway_stopped) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn({
+    let (stop_gateway, gateway_stopped) = tokio::sync::oneshot::channel::<()>();
+    let gateway_state = dir.path().join("gateway.json");
+    let gateway_pending = dir.path().join("pending.json");
+    let gateway = tokio::spawn({
         let config = config.clone();
         let socket = socket.clone();
-        let state = dir.path().join("gateway.json");
-        let pending = dir.path().join("pending.json");
+        let state = gateway_state.clone();
+        let pending = gateway_pending.clone();
         async move {
             agentux_gateway::run(
                 config.clone(),
@@ -431,6 +554,16 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
             .is_some_and(|c| !c.is_empty()),
         "the node advertises what it can do: {node}"
     );
+    assert!(
+        node["acceptedCapabilities"]
+            .as_array()
+            .is_some_and(|capabilities| {
+                capabilities
+                    .iter()
+                    .any(|capability| capability == "execution.activity.v1")
+            }),
+        "Command and Core must negotiate typed activity: {node}"
+    );
 
     // 3. The mission: its agent step runs on the node.
     let (status, run) = call(
@@ -446,7 +579,10 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     assert_eq!(run["definitionVersion"], 1);
     // Dispatched (a connection that drops meanwhile is retried).
     let run = wait_for_run(&app, &run_id, "the agent step on the node", |r| {
-        r["steps"]["implement"]["status"] == "waiting"
+        matches!(
+            r["steps"]["implement"]["status"].as_str(),
+            Some("waiting" | "done")
+        )
     })
     .await;
     let step = &run["steps"]["implement"];
@@ -523,6 +659,58 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     })
     .await;
     assert_eq!(run["steps"]["announce"]["status"], "done");
+
+    // A real ACP tool call must arrive over Core's gateway and be available
+    // from Command's run-scoped replay API.
+    let acme_reader = organization_reader(&handler, "acme").await;
+    let beta_reader = organization_reader(&handler, "beta").await;
+    let activity_path = format!("/v1/organizations/acme/runs/{run_id}/activity");
+    let (status, activity_page) = call(&app, "GET", &activity_path, &acme_reader, None).await;
+    assert_eq!(status, StatusCode::OK, "{activity_page}");
+    let activities = activity_page["activities"].as_array().unwrap();
+    assert!(
+        activities.iter().all(|item| {
+            item["activity"]["schemaVersion"] == "v1"
+                && item["activity"]["toolName"] == "execute"
+                && item["activity"]["toolCallId"] == "tool-activity-e2e"
+        }),
+        "typed ACP fields must be projected: {activity_page:#}"
+    );
+    assert!(
+        activities
+            .iter()
+            .any(|item| item["activity"]["type"] == "tool_started"),
+        "the ACP ToolCall start must be projected: {activity_page:#}"
+    );
+    assert!(
+        activities
+            .iter()
+            .any(|item| item["activity"]["type"] == "tool_completed"),
+        "the ACP ToolCall completion must be projected: {activity_page:#}"
+    );
+    assert!(
+        !activity_page.to_string().contains("SENSITIVE_ACTIVITY_E2E"),
+        "ACP title, output and message text must be redacted: {activity_page:#}"
+    );
+    let (status, denied) = call(
+        &app,
+        "GET",
+        &format!("/v1/organizations/beta/runs/{run_id}/activity"),
+        &acme_reader,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    let (status, beta_page) = call(
+        &app,
+        "GET",
+        &format!("/v1/organizations/beta/runs/{run_id}/activity"),
+        &beta_reader,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{beta_page}");
+    assert!(beta_page["activities"].as_array().unwrap().is_empty());
 
     // 5. Durable, versioned events, and Office's view of them.
     let (_, log) = call(
@@ -609,4 +797,87 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
         .filter(|a| a["status"] == "pending")
         .collect();
     assert!(pending.is_empty(), "the gate was decided: {pending:?}");
+
+    // Restart both ends of the Command connection against the same durable
+    // database. The gateway resumes its persisted event cursor and Command
+    // must still replay the typed activity from its Office log.
+    let _ = stop_gateway.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(10), gateway).await;
+    let _ = stop_command.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(10), command_server).await;
+
+    let restarted_handler = Handler::postgres(&database_url)
+        .await
+        .unwrap()
+        .with_demo_tokens(true);
+    app = restarted_handler.router();
+    let listener = tokio::net::TcpListener::bind(command_address)
+        .await
+        .unwrap();
+    let (stop_command_after_restart, command_stopped_after_restart) =
+        tokio::sync::oneshot::channel::<()>();
+    let command_app = app.clone();
+    let command_server_after_restart = tokio::spawn(async move {
+        axum::serve(listener, command_app)
+            .with_graceful_shutdown(async {
+                let _ = command_stopped_after_restart.await;
+            })
+            .await
+    });
+
+    let (stop_gateway_after_restart, gateway_stopped_after_restart) =
+        tokio::sync::oneshot::channel::<()>();
+    let gateway_after_restart = tokio::spawn({
+        let config = config.clone();
+        let socket = socket.clone();
+        let state = gateway_state;
+        let pending = gateway_pending;
+        async move {
+            agentux_gateway::run(
+                config.clone(),
+                socket,
+                Http::new(&config).unwrap(),
+                Some(state),
+                "0.0.0-e2e",
+                Some(CommandOptions {
+                    policy: Policy::parse("commands:\n  run.start: allow\n").unwrap(),
+                    pending,
+                }),
+                |_| {},
+                async {
+                    let _ = gateway_stopped_after_restart.await;
+                },
+            )
+            .await
+        }
+    });
+    wait_for_node(
+        &app,
+        "org-node",
+        "the replay-capable node to reconnect",
+        |node| node["connected"] == true,
+    )
+    .await;
+
+    let (status, after_restart) = call(&app, "GET", &activity_path, &acme_reader, None).await;
+    assert_eq!(status, StatusCode::OK, "{after_restart}");
+    assert_eq!(after_restart["activities"], activity_page["activities"]);
+    assert!(after_restart["historyGap"].is_null(), "{after_restart}");
+    let cursor = activity_page["next"].as_i64().unwrap();
+    let (status, replay_tail) = call(
+        &app,
+        "GET",
+        &format!("{activity_path}?after={cursor}"),
+        &acme_reader,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{replay_tail}");
+    assert!(replay_tail["activities"].as_array().unwrap().is_empty());
+
+    let _ = stop_gateway_after_restart.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(10), gateway_after_restart).await;
+    let _ = stop_command_after_restart.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(10), command_server_after_restart).await;
+    let _ = stop_daemon.send(());
 }

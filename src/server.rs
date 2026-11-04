@@ -2588,6 +2588,14 @@ async fn run_activity(
         .and_then(Value::as_str);
     let node_id =
         projected_node.or_else(|| events.first().map(|logged| logged.event.node_id.as_str()));
+    let history_gap = if let Some(node_id) = node_id {
+        match s.office.node_event_history_gap(&org, node_id).await {
+            Ok(gap) => gap,
+            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "activity_log_unavailable"),
+        }
+    } else {
+        None
+    };
     let node = node_id
         .and_then(|id| s.registry.get(id))
         .filter(|node| node.organization_id == org);
@@ -2611,6 +2619,12 @@ async fn run_activity(
     });
     if let Some(node) = node {
         body["nodeId"] = json!(node.id);
+    }
+    if let Some(through_sequence) = history_gap {
+        body["historyGap"] = json!({
+            "kind": "unverified_legacy_prefix",
+            "throughSequence": through_sequence,
+        });
     }
     reply(StatusCode::OK, body)
 }

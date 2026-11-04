@@ -45,8 +45,8 @@ dependencies = [
 
 [[package]]
 name = "agentux-api"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -56,8 +56,8 @@ dependencies = [
 
 [[package]]
 name = "agentux-bus"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "agentux-config",
  "rmcp",
@@ -71,7 +71,9 @@ dependencies = [
 name = "agentux-command"
 version = "0.2.1"
 dependencies = [
+ "agentux-fake-agent",
  "agentux-gateway",
+ "agentux-harness",
  "agentux-store",
  "agentuxd",
  "async-trait",
@@ -105,8 +107,8 @@ dependencies = [
 
 [[package]]
 name = "agentux-config"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "serde",
  "serde-saphyr",
@@ -114,11 +116,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentux-fake-agent"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
+dependencies = [
+ "agent-client-protocol",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "agentux-gateway"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "agentux-api",
+ "agentux-config",
  "auxp 0.1.0 (git+https://github.com/agentux-os/agentux-protocol?rev=aeced51393523ee7cd20c0b163cdb2664c2a038e)",
  "futures-util",
  "jiff",
@@ -132,8 +145,8 @@ dependencies = [
 
 [[package]]
 name = "agentux-harness"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "agent-client-protocol",
  "rustix",
@@ -143,8 +156,8 @@ dependencies = [
 
 [[package]]
 name = "agentux-store"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "agentux-api",
  "rusqlite",
@@ -155,13 +168,13 @@ dependencies = [
 
 [[package]]
 name = "agentux-worktree"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 
 [[package]]
 name = "agentuxd"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "agentux-api",
  "agentux-bus",
@@ -173,6 +186,7 @@ dependencies = [
  "jiff",
  "portable-pty",
  "regex",
+ "reqwest",
  "rustix",
  "serde",
  "serde-saphyr",

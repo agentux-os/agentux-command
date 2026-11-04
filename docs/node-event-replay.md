@@ -36,10 +36,20 @@ summary.
 Command currently retains the receiver ledger indefinitely; there is no Command
 retention or pruning setting for these rows. Migration 013 seeded legacy
 cursors from node and Office high-water marks, which cannot prove that every
-earlier sequence was received. Migration 014 resets cursors without ledger
-rows to zero so the sender can replay and Command can establish a verified
-contiguous prefix. Payloads predating the ledger cannot be verified against an
-old event ID; old Office entries remain protected by their own event identity.
+earlier sequence was received. Migration 014 derives the verified contiguous
+prefix from ledger rows and preserves the old resume cursor. The currently
+stored accepted-capability list is replaced on each hello, so its absence
+cannot prove the node never received a replay ACK in an earlier session. A
+lower cursor could therefore ask Core to replay events it has already pruned.
+If the old cursor exceeds the verified prefix, Command persists
+`history_gap_through_sequence` and includes a `historyGap` marker in the run
+activity response. That marker reports that historical activity may be
+incomplete; it does not invent missing events or advance the resume cursor.
+This conservative migration can leave a stale high cursor on a node that
+never negotiated replay, so automatic recovery of its still-retained older
+events is deferred until Command can establish durable historical ACK
+provenance. Payloads predating the ledger cannot be verified against an old
+event ID; old Office entries remain protected by their own event identity.
 New rows receive full duplicate and conflict checks.
 
 On a WebSocket reconnect, Command sends `node.resume` with its durable cursor and
