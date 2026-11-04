@@ -126,7 +126,11 @@ def _request(base_url, scenario, index, lane, lane_sequence, timeout):
     started = time.perf_counter()
     try:
         with HTTP_OPENER.open(request, timeout=timeout) as response:
-            response.read(1 if scenario.get("read_first_byte") else None)
+            # Ordinary API latency ends when response headers arrive. Reading
+            # arbitrary bodies can defeat the request deadline and allocate
+            # unbounded memory; stream scenarios opt into exactly one byte.
+            if scenario.get("read_first_byte"):
+                response.read(1)
             code = response.status
         ok = 200 <= code < 400
         detail = None if ok else f"HTTP {code}"
@@ -199,6 +203,7 @@ def scenario_metadata(scenario):
         "request_body_bytes": body_bytes,
         "interval_seconds": scenario.get("interval_seconds", 0),
         "read_first_byte": bool(scenario.get("read_first_byte", False)),
+        "latency_measurement": "time_to_first_byte" if scenario.get("read_first_byte") else "time_to_response_headers",
         "authenticated": bool(scenario.get("token_env")),
     }
 
@@ -218,7 +223,7 @@ def hardware_metadata():
         info["total_memory_bytes"] = psutil.virtual_memory().total
         info["cpu_model"] = platform.processor() or None
     except ImportError:
-        info["resource_instrumentation"] = "psutil unavailable; target CPU/memory sampling omitted"
+        info["resource_instrumentation"] = "psutil unavailable; cpu_model and total_memory_bytes omitted"
     return info
 
 

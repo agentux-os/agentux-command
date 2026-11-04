@@ -108,6 +108,19 @@ class BenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(timed_out["errors"], 1)
 
+    def test_response_body_is_not_unboundedly_consumed(self):
+        response = mock.MagicMock()
+        response.status = 200
+        response.__enter__.return_value = response
+        with mock.patch.object(bench.HTTP_OPENER, "open", return_value=response):
+            normal = bench._request(self.base, {"path": "/ok"}, 0, 0, 1, 1)
+            self.assertTrue(normal["ok"])
+            response.read.assert_not_called()
+
+            stream = bench._request(self.base, {"path": "/stream", "read_first_byte": True}, 0, 0, 1, 1)
+            self.assertTrue(stream["ok"])
+            response.read.assert_called_once_with(1)
+
     def test_scenario_interval_paces_requests_per_lane(self):
         result = bench.run_scenario(
             self.base, {"name": "paced", "path": "/ok", "interval_seconds": 0.03},
@@ -178,7 +191,11 @@ class BenchmarkTests(unittest.TestCase):
         stop = threading.Event()
         with mock.patch.dict(sys.modules, {"psutil": None}):
             process = bench.process_monitor(123, stop)
+            hardware = bench.hardware_metadata()
         self.assertEqual(process["status"], "unavailable")
+        self.assertIsNone(hardware["cpu_model"])
+        self.assertIsNone(hardware["total_memory_bytes"])
+        self.assertIn("psutil unavailable", hardware["resource_instrumentation"])
         with mock.patch.object(bench.subprocess, "run", side_effect=FileNotFoundError("psql")):
             database = bench.database_size("postgresql://redacted")
         self.assertEqual(database["status"], "unavailable")
@@ -205,6 +222,9 @@ class BenchmarkTests(unittest.TestCase):
         metadata = bench.scenario_metadata(scenario)
         self.assertEqual(metadata["path"], "/v1/events")
         self.assertGreater(metadata["request_body_bytes"], 0)
+        self.assertEqual(metadata["latency_measurement"], "time_to_response_headers")
+        stream_metadata = bench.scenario_metadata({**scenario, "read_first_byte": True})
+        self.assertEqual(stream_metadata["latency_measurement"], "time_to_first_byte")
         self.assertTrue(metadata["authenticated"])
         self.assertNotIn("must-not-be-reported", json.dumps(metadata))
         self.assertNotIn("SECRET_TOKEN", json.dumps(metadata))
