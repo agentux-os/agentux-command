@@ -2967,6 +2967,7 @@ async fn export_audit(
             since,
             until,
             limit: 1000,
+            ..office::Replay::default()
         };
         let batch = match s.office.events(&org, &replay).await {
             Ok(batch) => batch,
