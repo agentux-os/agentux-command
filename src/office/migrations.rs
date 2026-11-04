@@ -46,6 +46,10 @@ const FILES: &[(&str, &str)] = &[
         "010_event_retention.sql",
         include_str!("../../migrations/010_event_retention.sql"),
     ),
+    (
+        "011_mission_schedules.sql",
+        include_str!("../../migrations/011_mission_schedules.sql"),
+    ),
 ];
 
 pub(crate) struct Migration {

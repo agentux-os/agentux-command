@@ -50,12 +50,13 @@ That contract is defined in [AgentUX Protocol](https://github.com/agentux-os/age
 - Node enrollment, approval/revocation, health and harness telemetry, plus authenticated remote commands
 - Organization-scoped event history, replay, live streams, audit export and Office projections for runs, approvals, artifacts and node status
 - OIDC operator sessions and capability-checked Console and Office access
+- Durable one-time and recurring mission schedules with timezone-aware cron, missed-run and overlap policies, firing history, and run links
 
 ## Planned capabilities
 
 - **Capability-aware placement:** runs may name a node; otherwise Command currently picks the lexicographically first online, connected node in the organization. It does not yet match mission requirements to advertised node capabilities. See [#67](https://github.com/agentux-os/agentux-command/issues/67).
 - **Aggregated incident and cost analytics:** node events can carry run-level cost and incident data, but Command does not yet provide cross-run or organization-level analytics and reporting. See [#68](https://github.com/agentux-os/agentux-command/issues/68).
-- **Scheduled and recurring missions** ([#58](https://github.com/agentux-os/agentux-command/issues/58)), **approval decisions through messaging channels** ([#59](https://github.com/agentux-os/agentux-command/issues/59)), and **organization-shared tool catalogs and policies** ([#57](https://github.com/agentux-os/agentux-command/issues/57)).
+- **Approval decisions through messaging channels** ([#59](https://github.com/agentux-os/agentux-command/issues/59)) and **organization-shared tool catalogs and policies** ([#57](https://github.com/agentux-os/agentux-command/issues/57)).
 
 ## Non-goals
 
@@ -263,6 +264,13 @@ GET  /v1/organizations/<org>/runs/<run>              organization.read
 POST /v1/organizations/<org>/runs/<run>/pause        node.command
 POST /v1/organizations/<org>/runs/<run>/resume       node.command        (a failed run retries its step)
 POST /v1/organizations/<org>/runs/<run>/cancel       node.command
+GET  /v1/organizations/<org>/schedules              organization.read
+POST /v1/organizations/<org>/schedules              node.command
+GET  /v1/organizations/<org>/schedules/<schedule>   organization.read
+PATCH /v1/organizations/<org>/schedules/<schedule>   node.command        {"expectedRevision", "schedule": {...}}
+POST /v1/organizations/<org>/schedules/<schedule>/pause   node.command
+POST /v1/organizations/<org>/schedules/<schedule>/resume  node.command
+DELETE /v1/organizations/<org>/schedules/<schedule>  node.command        (soft delete)
 ```
 
 - **agent** steps go to a node of the organization (the run's `nodeId`, or
@@ -287,6 +295,14 @@ POST /v1/organizations/<org>/runs/<run>/cancel       node.command
   with its actor and `definitionVersion`; the log is the run's audit trail.
   The Office projection shows each run with `kind: "mission"`. Due runs move
   on their own every 2 s, including after a restart.
+- Schedules accept either a one-time UTC `runAt`, or a five-field cron
+  expression plus an IANA `timezone`. `missedPolicy` is `skip`, `run_once`, or
+  `run_all`; `concurrencyPolicy` is `skip`, `queue`, or `allow`. PostgreSQL
+  records each intended firing with a stable run ID, and the worker claims due
+  schedules using row locks so restarts and replicas do not create a second
+  run for one occurrence. Scheduled runs still pass through node policy and
+  human approval gates. The Office and Command Console schedule screens are
+  tracked separately in [agentux-apps #23](https://github.com/agentux-os/agentux-apps/issues/23).
 
 ## Events
 

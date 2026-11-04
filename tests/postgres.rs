@@ -706,6 +706,8 @@ async fn mission_runs_live_in_the_database_and_refuse_stale_writes() {
         status: missions::RUNNING.into(),
         step: "implement".into(),
         input: Input::default(),
+        schedule_id: None,
+        scheduled_for: None,
         steps: Default::default(),
         error: String::new(),
         run_at: None,

@@ -32,6 +32,7 @@ use crate::nodes::{self, Registry};
 use crate::office::{self, OfficeRepository, ResolutionRequest};
 use crate::protocol;
 use crate::random_hex;
+use crate::schedules;
 
 /// How long an operator's command waits for the node's answer.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(150);
@@ -76,6 +77,7 @@ struct Inner {
     changed: tokio::sync::Notify,
     /// Missions' runs.
     runs: Arc<dyn missions::Store>,
+    schedules: Arc<dyn schedules::Store>,
     /// Process-local low-cardinality HTTP metrics.
     metrics: Arc<Metrics>,
     /// Dedicated scrape bearer token; absent means the endpoint is disabled.
@@ -138,6 +140,7 @@ impl Handler {
                 database: None,
                 changed: tokio::sync::Notify::new(),
                 runs: Arc::new(missions::Memory::default()),
+                schedules: Arc::new(schedules::Memory::default()),
                 metrics: Arc::new(Metrics::default()),
                 metrics_token: None,
                 event_sink_configured: false,
@@ -160,6 +163,7 @@ impl Handler {
             .with_sessions(Arc::new(auth::PostgresSessions::new(pool.clone())))
             .with_definitions(Arc::new(definitions::Postgres::new(pool.clone())))
             .with_runs(Arc::new(missions::Postgres::new(pool.clone())))
+            .with_schedules(Arc::new(schedules::Postgres::new(pool.clone())))
             .with_stored_nodes(pool.clone())
             .await?
             .with_enroll_store(Arc::new(enroll::Postgres::new(pool)))
@@ -196,6 +200,11 @@ impl Handler {
     /// Keeps missions' runs in `store`.
     pub fn with_runs(mut self, store: Arc<dyn missions::Store>) -> Self {
         self.inner.runs = store;
+        self
+    }
+
+    pub fn with_schedules(mut self, store: Arc<dyn schedules::Store>) -> Self {
+        self.inner.schedules = store;
         self
     }
 
@@ -307,6 +316,7 @@ impl Handler {
                     tokio::time::sleep(Duration::from_secs(2)).await;
                     let Some(s) = weak.upgrade() else { break };
                     s.engine().tick(&NodesVia(&s)).await;
+                    tick_schedules(&s).await;
                 }
             });
         }
@@ -365,6 +375,20 @@ impl Handler {
                 get(list_runs).post(start_run),
             )
             .route("/v1/organizations/{org}/runs/{run}", get(get_run))
+            .route(
+                "/v1/organizations/{org}/schedules",
+                get(list_schedules).post(create_schedule),
+            )
+            .route(
+                "/v1/organizations/{org}/schedules/{schedule}",
+                get(get_schedule)
+                    .patch(update_schedule)
+                    .delete(delete_schedule),
+            )
+            .route(
+                "/v1/organizations/{org}/schedules/{schedule}/{action}",
+                post(control_schedule),
+            )
             .route(
                 "/v1/organizations/{org}/runs/{run}/{action}",
                 post(control_run),
@@ -795,6 +819,28 @@ async fn metrics_endpoint(State(s): AppState, headers: HeaderMap) -> Response {
     };
     output.push_str("# HELP command_database_ready Whether PostgreSQL answered the metrics scrape query.\n# TYPE command_database_ready gauge\n");
     output.push_str(&format!("command_database_ready {db_ready}\n"));
+    output.push_str("# HELP command_mission_schedule_occurrences Current scheduled mission occurrences by fixed lifecycle state.\n# TYPE command_mission_schedule_occurrences gauge\n");
+    output.push_str("# HELP command_mission_schedule_lag_seconds Age of the oldest pending due schedule occurrence.\n# TYPE command_mission_schedule_lag_seconds gauge\n");
+    if let Some(pool) = &s.database {
+        if let Ok(client) = pool.get().await {
+            if let Ok(row) = client.query_one(
+                "SELECT count(*) FILTER (WHERE status='pending')::bigint, count(*) FILTER (WHERE status='failed')::bigint, count(*) FILTER (WHERE status='dispatched')::bigint, count(*) FILTER (WHERE status='skipped')::bigint, COALESCE(EXTRACT(EPOCH FROM (now()-min(scheduled_for) FILTER (WHERE status='pending'))),0)::double precision FROM mission_schedule_occurrences",
+                &[],
+            ).await {
+                for (index, state) in ["pending", "failed", "dispatched", "skipped"].iter().enumerate() {
+                    output.push_str(&format!("command_mission_schedule_occurrences{{state=\"{state}\"}} {}\n", row.get::<_, i64>(index)));
+                }
+                output.push_str(&format!("command_mission_schedule_lag_seconds {}\n", row.get::<_, f64>(4)));
+            }
+        }
+    } else {
+        for state in ["pending", "failed", "dispatched", "skipped"] {
+            output.push_str(&format!(
+                "command_mission_schedule_occurrences{{state=\"{state}\"}} 0\n"
+            ));
+        }
+        output.push_str("command_mission_schedule_lag_seconds 0\n");
+    }
 
     let mut running = 0usize;
     let mut waiting = 0usize;
@@ -2324,6 +2370,361 @@ async fn control_run(
         ),
         Err(missions::Error::Invalid(m)) => error(StatusCode::CONFLICT, &m),
         Err(e) => mission_error(e),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSchedule {
+    expected_revision: i64,
+    schedule: schedules::Create,
+}
+
+async fn list_schedules(
+    State(s): AppState,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = operator_in(&s, &headers, &org, auth::ORGANIZATION_READ).await {
+        return *denied;
+    }
+    match s.schedules.list(&org).await {
+        Ok(schedules) => reply(
+            StatusCode::OK,
+            json!({"organizationId":org,"schedules":schedules}),
+        ),
+        Err(error) => schedule_error(error),
+    }
+}
+
+async fn get_schedule(
+    State(s): AppState,
+    Path((org, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(denied) = operator_in(&s, &headers, &org, auth::ORGANIZATION_READ).await {
+        return *denied;
+    }
+    match s.schedules.get(&org, &id).await {
+        Ok(schedule) => {
+            let occurrences = match s.schedules.occurrences(&org, &id).await {
+                Ok(occurrences) => occurrences,
+                Err(error) => return schedule_error(error),
+            };
+            reply(
+                StatusCode::OK,
+                json!({"schedule":schedule,"occurrences":occurrences}),
+            )
+        }
+        Err(error) => schedule_error(error),
+    }
+}
+
+async fn create_schedule(
+    State(s): AppState,
+    Path(org): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let operator = match operator_in(&s, &headers, &org, auth::NODE_COMMAND).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let Some(input) = parse::<schedules::Create>(&body, 1 << 20) else {
+        return error(StatusCode::BAD_REQUEST, "invalid JSON");
+    };
+    let next = match schedules::validate(&input) {
+        Ok(next) => next,
+        Err(e) => return schedule_error(e),
+    };
+    let now = Utc::now();
+    let schedule = schedules::Schedule {
+        schedule_id: format!("schedule-{}", random_hex(12)),
+        organization_id: org.clone(),
+        name: input.name.trim().to_string(),
+        input: input.input,
+        cron: input.cron,
+        timezone: input.timezone,
+        run_at: input.run_at,
+        missed_policy: input.missed_policy,
+        concurrency_policy: input.concurrency_policy,
+        status: schedules::ACTIVE.into(),
+        next_run_at: next,
+        last_run_at: None,
+        last_run_id: None,
+        created_by: operator.subject.clone(),
+        created_at: now,
+        updated_at: now,
+        revision: 1,
+    };
+    match s.schedules.create(&schedule).await {
+        Ok(()) => {
+            s.audit(
+                &org,
+                "mission.schedule.created",
+                &operator,
+                json!({"scheduleId":schedule.schedule_id,"name":schedule.name}),
+            )
+            .await;
+            reply(StatusCode::CREATED, json!(schedule))
+        }
+        Err(e) => schedule_error(e),
+    }
+}
+
+async fn update_schedule(
+    State(s): AppState,
+    Path((org, id)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let operator = match operator_in(&s, &headers, &org, auth::NODE_COMMAND).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let Some(update) = parse::<UpdateSchedule>(&body, 1 << 20) else {
+        return error(StatusCode::BAD_REQUEST, "invalid JSON");
+    };
+    let next = match schedules::validate(&update.schedule) {
+        Ok(next) => next,
+        Err(e) => return schedule_error(e),
+    };
+    let mut schedule = match s.schedules.get(&org, &id).await {
+        Ok(s) => s,
+        Err(e) => return schedule_error(e),
+    };
+    if schedule.revision != update.expected_revision {
+        return schedule_error(schedules::Error::Conflict);
+    }
+    schedule.name = update.schedule.name.trim().to_string();
+    schedule.input = update.schedule.input;
+    schedule.cron = update.schedule.cron;
+    schedule.timezone = update.schedule.timezone;
+    schedule.run_at = update.schedule.run_at;
+    schedule.missed_policy = update.schedule.missed_policy;
+    schedule.concurrency_policy = update.schedule.concurrency_policy;
+    if schedule.status != schedules::PAUSED {
+        schedule.status = schedules::ACTIVE.into();
+    }
+    schedule.next_run_at = next;
+    schedule.updated_at = Utc::now();
+    schedule.revision += 1;
+    match s.schedules.save(&schedule).await {
+        Ok(()) => {
+            s.audit(
+                &org,
+                "mission.schedule.updated",
+                &operator,
+                json!({"scheduleId":id,"revision":schedule.revision}),
+            )
+            .await;
+            reply(StatusCode::OK, json!(schedule))
+        }
+        Err(e) => schedule_error(e),
+    }
+}
+
+async fn control_schedule(
+    State(s): AppState,
+    Path((org, id, action)): Path<(String, String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let operator = match operator_in(&s, &headers, &org, auth::NODE_COMMAND).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let mut schedule = match s.schedules.get(&org, &id).await {
+        Ok(s) => s,
+        Err(e) => return schedule_error(e),
+    };
+    match action.as_str() {
+        "pause" if schedule.status == schedules::ACTIVE => {
+            schedule.status = schedules::PAUSED.into()
+        }
+        "resume" if schedule.status == schedules::PAUSED => {
+            schedule.status = schedules::ACTIVE.into();
+            schedule.next_run_at = match schedules::validate(&schedules::Create {
+                name: schedule.name.clone(),
+                input: schedule.input.clone(),
+                cron: schedule.cron.clone(),
+                timezone: schedule.timezone.clone(),
+                run_at: schedule.run_at,
+                missed_policy: schedule.missed_policy,
+                concurrency_policy: schedule.concurrency_policy,
+            }) {
+                Ok(next) => next,
+                Err(e) => return schedule_error(e),
+            };
+        }
+        _ => return error(StatusCode::CONFLICT, "schedule cannot perform that action"),
+    }
+    schedule.updated_at = Utc::now();
+    schedule.revision += 1;
+    match s.schedules.save(&schedule).await {
+        Ok(()) => {
+            s.audit(
+                &org,
+                &format!("mission.schedule.{action}d"),
+                &operator,
+                json!({"scheduleId":id}),
+            )
+            .await;
+            reply(StatusCode::OK, json!(schedule))
+        }
+        Err(e) => schedule_error(e),
+    }
+}
+
+async fn delete_schedule(
+    State(s): AppState,
+    Path((org, id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    let operator = match operator_in(&s, &headers, &org, auth::NODE_COMMAND).await {
+        Ok(p) => p,
+        Err(denied) => return *denied,
+    };
+    let mut schedule = match s.schedules.get(&org, &id).await {
+        Ok(s) => s,
+        Err(e) => return schedule_error(e),
+    };
+    schedule.status = schedules::DELETED.into();
+    schedule.next_run_at = None;
+    schedule.updated_at = Utc::now();
+    schedule.revision += 1;
+    match s.schedules.save(&schedule).await {
+        Ok(()) => {
+            s.audit(
+                &org,
+                "mission.schedule.deleted",
+                &operator,
+                json!({"scheduleId":id}),
+            )
+            .await;
+            reply(StatusCode::OK, json!({"deleted":true,"scheduleId":id}))
+        }
+        Err(e) => schedule_error(e),
+    }
+}
+
+fn schedule_error(e: schedules::Error) -> Response {
+    match e {
+        schedules::Error::NotFound => error(StatusCode::NOT_FOUND, "schedule not found"),
+        schedules::Error::Invalid(message) => error(StatusCode::UNPROCESSABLE_ENTITY, &message),
+        schedules::Error::Conflict => {
+            error(StatusCode::CONFLICT, "schedule changed meanwhile; retry")
+        }
+        schedules::Error::Storage(_) => error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "schedule store unavailable",
+        ),
+    }
+}
+
+async fn tick_schedules(s: &Inner) {
+    let now = Utc::now();
+    let claimed = match s.schedules.claim_due(now, 50).await {
+        Ok(items) => items,
+        Err(error) => {
+            eprintln!("agentux-command: schedule claim failed: {error}");
+            return;
+        }
+    };
+    for occurrence in claimed
+        .iter()
+        .filter(|item| item.status == schedules::SKIPPED)
+    {
+        audit_schedule_event(s, occurrence, "skipped").await;
+    }
+    let pending = match s.schedules.claim_pending(now, 50).await {
+        Ok(items) => items,
+        Err(error) => {
+            eprintln!("agentux-command: schedule queue read failed: {error}");
+            return;
+        }
+    };
+    for mut occurrence in pending {
+        let schedule = match s
+            .schedules
+            .get(&occurrence.organization_id, &occurrence.schedule_id)
+            .await
+        {
+            Ok(schedule) => schedule,
+            Err(_) => continue,
+        };
+        let active = s
+            .runs
+            .active(Some(&occurrence.organization_id))
+            .await
+            .unwrap_or_default();
+        let overlaps = active
+            .iter()
+            .any(|run| run.schedule_id.as_deref() == Some(&schedule.schedule_id));
+        if overlaps && schedule.concurrency_policy == schedules::ConcurrencyPolicy::Queue {
+            occurrence.status = schedules::PENDING.into();
+            let _ = s.schedules.set_occurrence(&occurrence).await;
+            continue;
+        }
+        if overlaps && schedule.concurrency_policy == schedules::ConcurrencyPolicy::Skip {
+            occurrence.status = schedules::SKIPPED.into();
+            if s.schedules.set_occurrence(&occurrence).await.is_ok() {
+                audit_schedule_event(s, &occurrence, "skipped").await;
+            }
+            continue;
+        }
+        match s
+            .engine()
+            .start_with_id(
+                &occurrence.organization_id,
+                schedule.input.clone(),
+                &Actor {
+                    kind: "service".into(),
+                    id: "command.schedule".into(),
+                },
+                &NodesVia(s),
+                occurrence.run_id.clone(),
+                Some(schedule.schedule_id.clone()),
+                Some(occurrence.scheduled_for),
+            )
+            .await
+        {
+            Ok(run) => {
+                occurrence.status = schedules::DISPATCHED.into();
+                occurrence.run = serde_json::to_value(run).ok();
+            }
+            Err(missions::Error::Storage(_)) => continue,
+            Err(e) => {
+                occurrence.status = schedules::FAILED.into();
+                occurrence.error = e.to_string();
+            }
+        }
+        if let Err(error) = s.schedules.set_occurrence(&occurrence).await {
+            eprintln!("agentux-command: schedule occurrence update failed: {error}");
+        } else {
+            audit_schedule_event(s, &occurrence, &occurrence.status).await;
+        }
+    }
+}
+
+async fn audit_schedule_event(s: &Inner, occurrence: &schedules::Occurrence, outcome: &str) {
+    let event_id = format!("audit-{}", random_hex(12));
+    let event = office::Event {
+        event_id: event_id.clone(),
+        event_type: format!("mission.schedule.occurrence.{outcome}"),
+        organization_id: occurrence.organization_id.clone(),
+        node_id: "command.audit".into(),
+        occurred_at: crate::now_rfc3339(),
+        correlation_id: event_id,
+        actor: Some(json!({"kind":"service","id":"command.schedule"})),
+        data: Some(
+            json!({"scheduleId":occurrence.schedule_id,"runId":occurrence.run_id,"scheduledFor":occurrence.scheduled_for}),
+        ),
+        ..office::Event::default()
+    };
+    if let Err(error) = s.office.apply_event(event).await {
+        eprintln!("agentux-command: schedule audit event failed: {error}");
+    } else {
+        s.changed.notify_waiters();
     }
 }
 
