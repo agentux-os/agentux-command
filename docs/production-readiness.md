@@ -99,9 +99,11 @@ For a 30-day month, 99.5% corresponds to a maximum error budget of 3 hours,
 ## Capacity and retention envelope
 
 There is currently **no qualified numeric production range** for the following
-dimensions. The lower and upper bounds are intentionally left unclaimed; the
-development machine baseline in older runbook text is not a production
-capacity result.
+dimensions. The lower and upper bounds are intentionally left unclaimed. The
+repeatable harness and test procedure are in [`benchmarks/`](../benchmarks/README.md);
+no dedicated target-hardware evidence has been captured, so this change does
+not qualify a numeric limit. Development-machine and harness-test results are
+not production capacity results.
 
 | Dimension | Initial supported range | Qualification owner and method |
 |---|---|---|
@@ -113,10 +115,14 @@ capacity result.
 | Event retention | Indefinite by default; no qualified duration or maximum retained volume. Optional pruning requires operator-selected age and archive destination. | Operator sets and backs up policy/archive; Command team verifies correctness and growth characteristics. Use the event-growth report; capacity tests in [#52](https://github.com/agentux-os/agentux-command/issues/52). |
 
 Issue [#52](https://github.com/agentux-os/agentux-command/issues/52) owns
-repeatable load benchmarks and publishes measured limits. Results must record
-hardware, workload, throughput, p50/p95/p99 latency, CPU/memory, database
-growth, error rate, and overload behavior. A release can claim only the ranges
-covered by retained benchmark evidence. Issue
+repeatable load benchmarks and publishes measured limits. The repository now
+contains a bounded HTTP workload runner and procedures for event ingestion and
+replay, heartbeats, mission transitions, Office projections/live streams, and
+database growth/retention. Results must record hardware, workload, throughput,
+p50/p95/p99 latency, CPU/memory, database growth, error rate, and overload
+behavior. **All dimensions in the table above remain UNQUALIFIED until a
+repeatable run on the target hardware is retained and linked here.** A release
+can claim only the ranges covered by retained benchmark evidence. Issue
 [#54](https://github.com/agentux-os/agentux-command/issues/54) qualifies the
 release with a deployed image, a real node gateway, and controlled failures.
 Issue [#55](https://github.com/agentux-os/agentux-command/issues/55) uses those
