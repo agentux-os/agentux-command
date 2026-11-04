@@ -964,7 +964,7 @@ async fn validate_activity_scope(
     organization_id: &str,
     node_id: &str,
     activity: &Value,
-) -> Result<(), Response> {
+) -> Result<(), StatusCode> {
     let run_id = activity
         .get("runId")
         .and_then(Value::as_str)
@@ -975,30 +975,12 @@ async fn validate_activity_scope(
         .unwrap_or_default();
     let run = match s.runs.get(organization_id, run_id).await {
         Ok(run) => run,
-        Err(missions::Error::NotFound) => {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "execution activity does not belong to this run and node",
-            ));
-        }
-        Err(missions::Error::Storage(_)) => {
-            return Err(error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "could not verify execution activity scope",
-            ));
-        }
-        Err(_) => {
-            return Err(error(
-                StatusCode::BAD_REQUEST,
-                "execution activity does not belong to this run and node",
-            ));
-        }
+        Err(missions::Error::NotFound) => return Err(StatusCode::BAD_REQUEST),
+        Err(missions::Error::Storage(_)) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+        Err(_) => return Err(StatusCode::BAD_REQUEST),
     };
     if run.mission_id != mission_id || !run.steps.values().any(|step| step.node_id == node_id) {
-        return Err(error(
-            StatusCode::BAD_REQUEST,
-            "execution activity does not belong to this run and node",
-        ));
+        return Err(StatusCode::BAD_REQUEST);
     }
     Ok(())
 }
@@ -1059,10 +1041,17 @@ async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Respons
                     Some(activity) => activity,
                     None => return error(StatusCode::BAD_REQUEST, "invalid execution activity"),
                 };
-                if let Err(response) =
+                if let Err(status) =
                     validate_activity_scope(&s, &p.organization_id, &p.node_id, &activity).await
                 {
-                    return response;
+                    return if status == StatusCode::SERVICE_UNAVAILABLE {
+                        error(status, "could not verify execution activity scope")
+                    } else {
+                        error(
+                            status,
+                            "execution activity does not belong to this run and node",
+                        )
+                    };
                 }
             }
             s.apply(&body, accepted_capabilities.clone());
