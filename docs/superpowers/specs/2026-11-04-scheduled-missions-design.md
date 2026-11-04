@@ -28,7 +28,8 @@ the existing mission engine's node policy and approval gates.
   second logical run.
 - Schedule advancement and occurrence creation commit together. `skip` drops
   missed slots and advances to the next future slot; `run_once` creates one
-  occurrence for the latest missed slot; `run_all` creates each missed slot,
+  occurrence for the first missed slot and advances past the backlog;
+  `run_all` creates each missed slot,
   subject to a bounded catch-up batch per scheduler tick.
 - Concurrency policies are evaluated against active runs linked to the
   schedule. `skip` records a skipped occurrence; `queue` leaves it pending

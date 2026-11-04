@@ -193,30 +193,22 @@ fn due_slots(schedule: &Schedule, now: DateTime<Utc>) -> Result<DueSlots, Error>
     if all.is_empty() {
         return Ok((Vec::new(), Some(due)));
     }
-    let selected: Vec<DateTime<Utc>> = match schedule.missed_policy {
-        MissedPolicy::Skip
-            if all
-                .last()
-                .is_some_and(|last| now.signed_duration_since(*last).num_seconds() > 60) =>
-        {
-            vec![*all.last().unwrap()]
-        }
-        MissedPolicy::Skip => vec![all[0]],
-        MissedPolicy::RunOnce => vec![*all.last().unwrap()],
-        MissedPolicy::RunAll => all.clone(),
+    let old_backlog = all
+        .first()
+        .is_some_and(|first| now.signed_duration_since(*first).num_seconds() > 60);
+    let (selected, next) = match schedule.missed_policy {
+        MissedPolicy::Skip if old_backlog => (
+            vec![(all[0], SKIPPED)],
+            next_after(schedule, now + chrono::Duration::seconds(1))?,
+        ),
+        MissedPolicy::Skip => (vec![(all[0], PENDING)], Some(due)),
+        MissedPolicy::RunOnce => (
+            vec![(all[0], PENDING)],
+            next_after(schedule, now + chrono::Duration::seconds(1))?,
+        ),
+        MissedPolicy::RunAll => (all.iter().map(|time| (*time, PENDING)).collect(), Some(due)),
     };
-    let next = Some(due);
-    Ok((
-        selected
-            .into_iter()
-            .map(|time| {
-                let skipped = schedule.missed_policy == MissedPolicy::Skip
-                    && now.signed_duration_since(time).num_seconds() > 60;
-                (time, if skipped { SKIPPED } else { PENDING })
-            })
-            .collect(),
-        next,
-    ))
+    Ok((selected, next))
 }
 
 #[async_trait]
@@ -569,7 +561,7 @@ mod tests {
     }
 
     #[test]
-    fn missed_run_once_collapses_backlog_to_latest_slot() {
+    fn missed_run_once_collapses_backlog_to_one_slot() {
         let schedule = schedule(
             MissedPolicy::RunOnce,
             Utc.with_ymd_and_hms(2026, 10, 1, 13, 0, 0).unwrap(),
@@ -579,7 +571,7 @@ mod tests {
         assert_eq!(slots.len(), 1);
         assert_eq!(
             slots[0].0,
-            Utc.with_ymd_and_hms(2026, 10, 3, 13, 0, 0).unwrap()
+            Utc.with_ymd_and_hms(2026, 10, 1, 13, 0, 0).unwrap()
         );
         assert!(next.is_some_and(|time| time > now));
     }
@@ -595,7 +587,7 @@ mod tests {
         assert_eq!(
             slots,
             vec![(
-                Utc.with_ymd_and_hms(2026, 10, 3, 13, 0, 0).unwrap(),
+                Utc.with_ymd_and_hms(2026, 10, 1, 13, 0, 0).unwrap(),
                 SKIPPED
             )]
         );
