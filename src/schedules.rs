@@ -109,7 +109,11 @@ impl std::error::Error for Error {}
 
 impl From<tokio_postgres::Error> for Error {
     fn from(error: tokio_postgres::Error) -> Self {
-        Self::Storage(error.to_string())
+        let detail = error
+            .as_db_error()
+            .map(|db| format!("{} (SQLSTATE {})", db.message(), db.code()))
+            .unwrap_or_else(|| error.to_string());
+        Self::Storage(detail)
     }
 }
 
