@@ -352,7 +352,7 @@ fn repository(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::write(repo.join("README.md"), "# app\n").unwrap();
     std::fs::write(
         repo.join("agentux.yaml"),
-        "version: 1\nroles:\n  planner:\n    harness: fake-planner\n  dev:\n    harness: fake-acp\npipeline:\n  - step: plan\n    role: planner\n  - step: implement\n    role: dev\n  - step: pull_request\n",
+        "version: 1\nroles:\n  planner:\n    harness: fake-planner\n  dev:\n    harness: fake-acp\nisolation:\n  agents:\n    mode: none\npipeline:\n  - step: plan\n    role: planner\n  - step: implement\n    role: dev\n  - step: pull_request\n",
     )
     .unwrap();
     let git = |args: &[&str]| {
