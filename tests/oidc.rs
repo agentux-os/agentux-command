@@ -335,3 +335,22 @@ async fn sign_in_is_off_until_configured() {
     let (status, _, _) = send(&app, "GET", "/v1/auth/login", &[]).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn forwarded_host_headers_cannot_make_a_cross_origin_session_request_same_origin() {
+    let app = Handler::new().router();
+    let (status, _, _) = send(
+        &app,
+        "POST",
+        "/v1/auth/logout",
+        &[
+            ("host", "command.internal"),
+            ("cookie", "agentux_session=invalid"),
+            ("origin", "https://attacker.example"),
+            ("x-forwarded-host", "attacker.example"),
+            ("x-forwarded-proto", "https"),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

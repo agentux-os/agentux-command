@@ -709,22 +709,16 @@ impl Inner {
         if !self.public_url.is_empty() {
             return self.public_url.clone();
         }
-        let header = |name: &str| {
-            headers
-                .get(name)
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("")
-        };
-        let scheme = if header("x-forwarded-proto") == "https" {
-            "https"
-        } else {
-            "http"
-        };
-        let host = match header("x-forwarded-host") {
-            "" => header("host"),
-            host => host,
-        };
-        format!("{scheme}://{host}")
+        // Forwarded headers are only safe when a trusted proxy is known to
+        // overwrite them. Command has no proxy-trust configuration, so never
+        // use client-supplied X-Forwarded-* values for the CSRF origin check.
+        // TLS deployments set AGENTUX_COMMAND_PUBLIC_URL to their canonical
+        // HTTPS origin.
+        let host = headers
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("");
+        format!("http://{host}")
     }
 }
 

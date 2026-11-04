@@ -44,6 +44,17 @@ async fn run() -> Result<(), String> {
         a if a.starts_with(':') => format!("0.0.0.0{a}"),
         a => a,
     };
+    let public_url = env("AGENTUX_COMMAND_PUBLIC_URL");
+    let insecure_demo_tokens = env("AGENTUX_COMMAND_INSECURE_DEMO_TOKENS") == "1";
+    let insecure_open_nodes = env("AGENTUX_COMMAND_INSECURE_OPEN_NODES") == "1";
+    validate_insecure_modes(
+        insecure_demo_tokens,
+        insecure_open_nodes,
+        env("AGENTUX_COMMAND_DEVELOPMENT_MODE") == "1",
+        &address,
+        &public_url,
+        !env("AGENTUX_COMMAND_OIDC_ISSUER").is_empty(),
+    )?;
     let database_url = env("AGENTUX_COMMAND_DATABASE_URL");
     let startup = tokio::time::timeout(
         std::time::Duration::from_secs(30),
@@ -64,13 +75,13 @@ async fn run() -> Result<(), String> {
     if !tokens.is_empty() {
         handler = handler.with_node_tokens(tokens);
     }
-    if env("AGENTUX_COMMAND_INSECURE_DEMO_TOKENS") == "1" {
+    if insecure_demo_tokens {
         eprintln!(
             "AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1: demo-leader and demo-observer are accepted"
         );
         handler = handler.with_demo_tokens(true);
     }
-    if env("AGENTUX_COMMAND_INSECURE_OPEN_NODES") == "1" {
+    if insecure_open_nodes {
         eprintln!("AGENTUX_COMMAND_INSECURE_OPEN_NODES=1: nodes that never enrolled may report");
         handler = handler.with_open_nodes(true);
     }
@@ -99,7 +110,6 @@ async fn run() -> Result<(), String> {
         eprintln!("AgentUX Command console is served at /console/ from {console_dir}");
         handler = handler.with_console_dir(dir);
     }
-    let public_url = env("AGENTUX_COMMAND_PUBLIC_URL");
     if !public_url.is_empty() {
         handler = handler.with_public_url(&public_url);
     }
@@ -178,6 +188,31 @@ async fn run() -> Result<(), String> {
         .with_graceful_shutdown(shutdown())
         .await
         .map_err(|e| e.to_string())
+}
+
+fn validate_insecure_modes(
+    demo_tokens: bool,
+    open_nodes: bool,
+    development_mode: bool,
+    address: &str,
+    public_url: &str,
+    oidc_configured: bool,
+) -> Result<(), String> {
+    if !demo_tokens && !open_nodes {
+        return Ok(());
+    }
+    if !development_mode {
+        return Err(
+            "AGENTUX_COMMAND_INSECURE_* requires AGENTUX_COMMAND_DEVELOPMENT_MODE=1".into(),
+        );
+    }
+    let loopback = address
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|address| address.ip().is_loopback());
+    if !loopback || !public_url.is_empty() || oidc_configured {
+        return Err("insecure development modes require a loopback bind and must not be combined with AGENTUX_COMMAND_PUBLIC_URL or OIDC".into());
+    }
+    Ok(())
 }
 
 /// Ctrl-C, or SIGTERM from systemd or Podman.
@@ -389,4 +424,33 @@ fn oidc_from_env(public_url: &str) -> Result<Option<agentux_command::oidc::Oidc>
         roles,
     };
     Oidc::new(config).map(Some).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+
+    #[test]
+    fn production_rejects_insecure_development_modes() {
+        assert!(validate_insecure_modes(true, false, false, "0.0.0.0:8080", "", false).is_err());
+        assert!(validate_insecure_modes(false, true, false, "0.0.0.0:8080", "", false).is_err());
+    }
+
+    #[test]
+    fn insecure_modes_require_an_explicit_loopback_development_server() {
+        assert!(validate_insecure_modes(true, true, true, "127.0.0.1:8080", "", false).is_ok());
+        assert!(validate_insecure_modes(true, false, true, "0.0.0.0:8080", "", false).is_err());
+        assert!(
+            validate_insecure_modes(
+                true,
+                false,
+                true,
+                "127.0.0.1:8080",
+                "https://command.example",
+                false
+            )
+            .is_err()
+        );
+        assert!(validate_insecure_modes(true, false, true, "127.0.0.1:8080", "", true).is_err());
+    }
 }

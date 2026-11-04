@@ -38,6 +38,7 @@ url_b=postgres://agentux:drill@127.0.0.1:55433/agentux?sslmode=disable
 
 # Some state: a published definition, a node and its events.
 AGENTUX_COMMAND_DATABASE_URL=$url_a AGENTUX_COMMAND_ADDR=127.0.0.1:18080 \
+    AGENTUX_COMMAND_DEVELOPMENT_MODE=1 \
     AGENTUX_COMMAND_INSECURE_DEMO_TOKENS=1 AGENTUX_COMMAND_INSECURE_OPEN_NODES=1 \
     "$bin" >"$work/server.log" 2>&1 &
 server=$!
