@@ -111,7 +111,11 @@ async fn office_is_served_at_office_with_a_config_for_the_operator() {
 #[tokio::test]
 async fn console_is_served_on_command_origin_with_public_auth_config_only() {
     let dir = tempfile::tempdir().unwrap();
-    std::fs::write(dir.path().join("index.html"), "<title>Command console</title>").unwrap();
+    std::fs::write(
+        dir.path().join("index.html"),
+        "<title>Command console</title>",
+    )
+    .unwrap();
     std::fs::write(dir.path().join("app.js"), "console.log('console')").unwrap();
     std::fs::write(dir.path().join(".env"), "SECRET=1").unwrap();
 
@@ -125,10 +129,12 @@ async fn console_is_served_on_command_origin_with_public_auth_config_only() {
     let (status, headers, body) = get(&app, "/console/", "").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("Command console"));
-    assert!(headers["content-security-policy"]
-        .to_str()
-        .unwrap()
-        .contains("default-src 'self'"));
+    assert!(
+        headers["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .contains("default-src 'self'")
+    );
 
     let (status, headers, config) = get(&app, "/console/config.js", "").await;
     assert_eq!(status, StatusCode::OK);
@@ -138,7 +144,11 @@ async fn console_is_served_on_command_origin_with_public_auth_config_only() {
     assert!(!config.contains("token"), "{config}");
 
     assert_eq!(get(&app, "/console/app.js", "").await.0, StatusCode::OK);
-    for path in ["/console/.env", "/console/missing.js", "/console/..%2Foutside.html"] {
+    for path in [
+        "/console/.env",
+        "/console/missing.js",
+        "/console/..%2Foutside.html",
+    ] {
         assert_eq!(get(&app, path, "").await.0, StatusCode::NOT_FOUND, "{path}");
     }
 
