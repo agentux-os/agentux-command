@@ -137,7 +137,10 @@ mod tests {
 
     #[test]
     fn versions_are_ordered_and_start_at_one() {
-        assert_eq!(migration_versions(), vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        assert_eq!(
+            migration_versions(),
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+        );
     }
 
     #[test]
