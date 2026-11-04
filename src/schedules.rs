@@ -1,6 +1,6 @@
 //! Organization-scoped mission schedules and durable firing occurrences.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -162,10 +162,9 @@ fn occurrence_id(schedule_id: &str, scheduled_for: DateTime<Utc>) -> String {
     format!("scheduled-{}", hex::encode(digest.finalize()))
 }
 
-fn due_slots(
-    schedule: &Schedule,
-    now: DateTime<Utc>,
-) -> Result<(Vec<(DateTime<Utc>, &'static str)>, Option<DateTime<Utc>>), Error> {
+type DueSlots = (Vec<(DateTime<Utc>, &'static str)>, Option<DateTime<Utc>>);
+
+fn due_slots(schedule: &Schedule, now: DateTime<Utc>) -> Result<DueSlots, Error> {
     let Some(mut due) = schedule.next_run_at else {
         return Ok((Vec::new(), None));
     };

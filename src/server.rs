@@ -822,8 +822,8 @@ async fn metrics_endpoint(State(s): AppState, headers: HeaderMap) -> Response {
     output.push_str("# HELP command_mission_schedule_occurrences Current scheduled mission occurrences by fixed lifecycle state.\n# TYPE command_mission_schedule_occurrences gauge\n");
     output.push_str("# HELP command_mission_schedule_lag_seconds Age of the oldest pending due schedule occurrence.\n# TYPE command_mission_schedule_lag_seconds gauge\n");
     if let Some(pool) = &s.database {
-        if let Ok(client) = pool.get().await {
-            if let Ok(row) = client.query_one(
+        if let Ok(client) = pool.get().await
+            && let Ok(row) = client.query_one(
                 "SELECT count(*) FILTER (WHERE status='pending')::bigint, count(*) FILTER (WHERE status='failed')::bigint, count(*) FILTER (WHERE status='dispatched')::bigint, count(*) FILTER (WHERE status='skipped')::bigint, COALESCE(EXTRACT(EPOCH FROM (now()-min(scheduled_for) FILTER (WHERE status='pending'))),0)::double precision FROM mission_schedule_occurrences",
                 &[],
             ).await {
@@ -831,7 +831,6 @@ async fn metrics_endpoint(State(s): AppState, headers: HeaderMap) -> Response {
                     output.push_str(&format!("command_mission_schedule_occurrences{{state=\"{state}\"}} {}\n", row.get::<_, i64>(index)));
                 }
                 output.push_str(&format!("command_mission_schedule_lag_seconds {}\n", row.get::<_, f64>(4)));
-            }
         }
     } else {
         for state in ["pending", "failed", "dispatched", "skipped"] {
@@ -2682,9 +2681,11 @@ async fn tick_schedules(s: &Inner) {
                     id: "command.schedule".into(),
                 },
                 &NodesVia(s),
-                occurrence.run_id.clone(),
-                Some(schedule.schedule_id.clone()),
-                Some(occurrence.scheduled_for),
+                missions::RunIdentity {
+                    run_id: occurrence.run_id.clone(),
+                    schedule_id: Some(schedule.schedule_id.clone()),
+                    scheduled_for: Some(occurrence.scheduled_for),
+                },
             )
             .await
         {

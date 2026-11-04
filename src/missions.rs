@@ -114,6 +114,14 @@ pub struct Run {
     pub revision: i64,
 }
 
+/// Stable identity and schedule metadata for idempotent run starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunIdentity {
+    pub run_id: String,
+    pub schedule_id: Option<String>,
+    pub scheduled_for: Option<DateTime<Utc>>,
+}
+
 impl Run {
     pub fn finished(&self) -> bool {
         matches!(self.status.as_str(), COMPLETED | CANCELLED)
@@ -418,9 +426,11 @@ impl Engine {
             input,
             actor,
             nodes,
-            format!("run-{}", crate::random_hex(8)),
-            None,
-            None,
+            RunIdentity {
+                run_id: format!("run-{}", crate::random_hex(8)),
+                schedule_id: None,
+                scheduled_for: None,
+            },
         )
         .await
     }
@@ -433,9 +443,7 @@ impl Engine {
         input: Input,
         actor: &Actor,
         nodes: &dyn Nodes,
-        run_id: String,
-        schedule_id: Option<String>,
-        scheduled_for: Option<DateTime<Utc>>,
+        identity: RunIdentity,
     ) -> Result<Run, Error> {
         if input.repository.trim().is_empty() || input.prompt.trim().is_empty() {
             return Err(Error::Invalid("repository and prompt are required".into()));
@@ -471,7 +479,7 @@ impl Engine {
             .ok_or_else(|| Error::Invalid("the mission's workflow has no steps".into()))?;
         let now = Utc::now();
         let run = Run {
-            run_id,
+            run_id: identity.run_id,
             organization_id: org.into(),
             definition_version: published.definition_version,
             mission_id: input.mission_id.clone(),
@@ -479,8 +487,8 @@ impl Engine {
             status: RUNNING.into(),
             step: first.into(),
             input,
-            schedule_id,
-            scheduled_for,
+            schedule_id: identity.schedule_id,
+            scheduled_for: identity.scheduled_for,
             steps: BTreeMap::new(),
             error: String::new(),
             run_at: None,
