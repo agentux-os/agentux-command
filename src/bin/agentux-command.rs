@@ -52,6 +52,13 @@ async fn run() -> Result<(), String> {
     let mut handler = startup
         .await
         .map_err(|_| "the database did not answer within 30 s".to_string())??;
+    let metrics_token = env("AGENTUX_COMMAND_METRICS_TOKEN");
+    if !metrics_token.is_empty() {
+        eprintln!("the protected /metrics endpoint is enabled");
+        handler = handler.with_metrics_token(&metrics_token)?;
+    }
+    handler = handler
+        .with_event_retention_enabled(!env("AGENTUX_COMMAND_EVENT_RETENTION_DAYS").is_empty());
     // Each node authenticates with its own token: node-1=token,node-2=token.
     let tokens = parse_node_tokens(&env("AGENTUX_COMMAND_NODE_TOKENS"));
     if !tokens.is_empty() {
