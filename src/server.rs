@@ -2651,11 +2651,15 @@ async fn tick_schedules(s: &Inner) {
             Ok(schedule) => schedule,
             Err(_) => continue,
         };
-        let active = s
-            .runs
-            .active(Some(&occurrence.organization_id))
-            .await
-            .unwrap_or_default();
+        let active = match s.runs.active(Some(&occurrence.organization_id)).await {
+            Ok(active) => active,
+            Err(error) => {
+                eprintln!("agentux-command: could not check schedule concurrency: {error}");
+                occurrence.status = schedules::PENDING.into();
+                let _ = s.schedules.set_occurrence(&occurrence).await;
+                continue;
+            }
+        };
         let overlaps = active
             .iter()
             .any(|run| run.schedule_id.as_deref() == Some(&schedule.schedule_id));

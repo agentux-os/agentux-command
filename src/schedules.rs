@@ -169,7 +169,14 @@ fn due_slots(schedule: &Schedule, now: DateTime<Utc>) -> Result<DueSlots, Error>
         return Ok((Vec::new(), None));
     };
     if schedule.cron.is_none() {
-        return Ok((vec![(due, PENDING)], None));
+        let status = if schedule.missed_policy == MissedPolicy::Skip
+            && now.signed_duration_since(due).num_seconds() > 60
+        {
+            SKIPPED
+        } else {
+            PENDING
+        };
+        return Ok((vec![(due, status)], None));
     }
     let mut all = Vec::new();
     while due <= now && all.len() < 100 {
