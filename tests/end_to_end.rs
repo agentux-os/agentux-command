@@ -765,9 +765,7 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
     assert!(
         activities.iter().all(|item| {
             item["activity"]["schemaVersion"] == "v1"
-                && item["activity"]["toolName"]
-                    .as_str()
-                    .is_some_and(|name| !name.is_empty())
+                && item["activity"]["toolName"] == "execute"
                 && item["activity"]["toolCallId"] == "tool-activity-e2e"
         }),
         "typed ACP fields must be projected: {activity_page:#}"

@@ -34,11 +34,11 @@ url = "2"
 [dev-dependencies]
 # The real node side for tests/end_to_end.rs: agentux-core's gateway in
 # front of an agentuxd with scripted agents.
-agentux-gateway = { git = "https://github.com/agentux-os/agentux-core", rev = "9835460b18f8580d14db6ce2d336049179446e86" }
-agentux-fake-agent = { git = "https://github.com/agentux-os/agentux-core", rev = "9835460b18f8580d14db6ce2d336049179446e86" }
-agentux-harness = { git = "https://github.com/agentux-os/agentux-core", rev = "9835460b18f8580d14db6ce2d336049179446e86" }
-agentux-store = { git = "https://github.com/agentux-os/agentux-core", rev = "9835460b18f8580d14db6ce2d336049179446e86" }
-agentuxd = { git = "https://github.com/agentux-os/agentux-core", rev = "9835460b18f8580d14db6ce2d336049179446e86" }
+agentux-gateway = { git = "https://github.com/agentux-os/agentux-core", rev = "2548db8598aba757da183ff3ceaebcdc55427b99" }
+agentux-fake-agent = { git = "https://github.com/agentux-os/agentux-core", rev = "2548db8598aba757da183ff3ceaebcdc55427b99" }
+agentux-harness = { git = "https://github.com/agentux-os/agentux-core", rev = "2548db8598aba757da183ff3ceaebcdc55427b99" }
+agentux-store = { git = "https://github.com/agentux-os/agentux-core", rev = "2548db8598aba757da183ff3ceaebcdc55427b99" }
+agentuxd = { git = "https://github.com/agentux-os/agentux-core", rev = "2548db8598aba757da183ff3ceaebcdc55427b99" }
 tempfile = "3"
 # Contract tests against agentux-protocol's schemas (auxp::schemas).
 jsonschema = { version = "0.30", default-features = false }
