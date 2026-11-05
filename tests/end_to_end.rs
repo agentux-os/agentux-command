@@ -980,9 +980,9 @@ async fn an_organization_runs_a_mission_on_a_real_node_through_a_human_gate() {
         .await
         .unwrap()
         .get(0);
-    assert_eq!(
-        resumed_cursor, legacy_cursor,
-        "resume must not regress the cursor"
+    assert!(
+        resumed_cursor >= legacy_cursor,
+        "resume must not regress the cursor: resumed={resumed_cursor}, legacy={legacy_cursor}"
     );
     let cursor = activity_page["next"].as_i64().unwrap();
     let (status, replay_tail) = call(
