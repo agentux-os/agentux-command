@@ -30,7 +30,7 @@ async fn the_gateway_accepts_hello_and_lists_the_node() {
 }
 
 #[tokio::test]
-async fn replay_capability_negotiation_and_event_ledger_reject_gaps_and_conflicts() {
+async fn in_memory_command_omits_replay_capability_and_rejects_event_identity_conflicts() {
     let store = Arc::new(office::Store::new());
     let app = Handler::with_office(store.clone()).router();
     let mut hello = hello("org-a", "node-a");
@@ -40,7 +40,7 @@ async fn replay_capability_negotiation_and_event_ledger_reject_gaps_and_conflict
     assert_eq!(status, StatusCode::ACCEPTED, "{response}");
     assert_eq!(
         response["result"]["acceptedCapabilities"],
-        json!(["execution.activity.v1", "node.event_replay.v1"])
+        json!(["execution.activity.v1"])
     );
 
     let event = |event_id: &str, sequence: i64| {
@@ -52,11 +52,7 @@ async fn replay_capability_negotiation_and_event_ledger_reject_gaps_and_conflict
         let (status, body) = call(&app, "POST", "/v1/protocol/messages", "", Some(message)).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     }
-    for message in [
-        event("other-id", 1),
-        event("event-3", 3),
-        event("event-1", 2),
-    ] {
+    for message in [event("other-id", 1), event("event-1", 2)] {
         let (status, _) = call(&app, "POST", "/v1/protocol/messages", "", Some(message)).await;
         assert_eq!(status, StatusCode::CONFLICT);
     }
@@ -382,7 +378,7 @@ async fn operators_send_commands_to_connected_nodes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn reconnect_resumes_at_the_durable_cursor_and_acks_only_committed_events() {
+async fn in_memory_command_does_not_resume_or_ack_node_event_replay() {
     let store = Arc::new(office::Store::new());
     let handler = Handler::with_office(store.clone())
         .with_node_tokens(parse_node_tokens("node-replay=s3cret"));
@@ -394,6 +390,7 @@ async fn reconnect_resumes_at_the_durable_cursor_and_acks_only_committed_events(
     hello["params"]["capabilities"] = json!(["node.event_replay.v1"]);
     let (status, body) = call(&app, "POST", "/v1/protocol/messages", "s3cret", Some(hello)).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["result"]["acceptedCapabilities"], json!([]));
     let forged = json!({"jsonrpc":"2.0", "method":"run.updated", "params":params("other-org", "node-replay", json!({
         "eventId":"cross-org-event", "sequence":1, "runId":"run-1", "state":"running"
     }))});
@@ -408,24 +405,12 @@ async fn reconnect_resumes_at_the_durable_cursor_and_acks_only_committed_events(
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     let (mut socket, _) = dial(&address, "node-replay", "s3cret").await.unwrap();
-    let resume: Value = match socket.next().await.unwrap().unwrap() {
-        tungstenite::Message::Text(text) => serde_json::from_str(&text).unwrap(),
-        other => panic!("expected node.resume, got {other:?}"),
-    };
-    assert_eq!(resume["method"], "node.resume");
-    assert_eq!(resume["params"]["lastAcknowledgedSequence"], 0);
-    socket
-        .send(tungstenite::Message::Text(
-            json!({"jsonrpc":"2.0", "id":resume["id"], "result":{
-                "status":"replay", "nodeId":"node-replay", "requestedAfterSequence":0,
-                "oldestAvailableSequence":0, "highWaterSequence":0,
-                "eventsReplayed":0, "snapshotRequired":false
-            }})
-            .to_string()
-            .into(),
-        ))
-        .await
-        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), socket.next())
+            .await
+            .is_err(),
+        "an in-memory Command must not request durable replay"
+    );
 
     let event = json!({"jsonrpc":"2.0", "method":"run.updated", "params":params("org-replay", "node-replay", json!({
         "eventId":"replay-event-1", "sequence":1, "runId":"run-1", "state":"running"
@@ -434,25 +419,12 @@ async fn reconnect_resumes_at_the_durable_cursor_and_acks_only_committed_events(
         .send(tungstenite::Message::Text(event.to_string().into()))
         .await
         .unwrap();
-    let ack: Value = match tokio::time::timeout(Duration::from_secs(3), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-    {
-        tungstenite::Message::Text(text) => serde_json::from_str(&text).unwrap(),
-        other => panic!("expected node.events.ack, got {other:?}"),
-    };
-    assert_eq!(ack["method"], "node.events.ack");
-    assert_eq!(ack["params"]["throughSequence"], 1);
-    socket
-        .send(tungstenite::Message::Text(
-            json!({"jsonrpc":"2.0", "id":ack["id"], "result":{"accepted":true}})
-                .to_string()
-                .into(),
-        ))
-        .await
-        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), socket.next())
+            .await
+            .is_err(),
+        "an in-memory Command must not ACK events as durably stored"
+    );
     assert_eq!(
         store
             .node_event_cursor("org-replay", "node-replay")
@@ -461,24 +433,10 @@ async fn reconnect_resumes_at_the_durable_cursor_and_acks_only_committed_events(
         1
     );
     socket.close(None).await.unwrap();
-
-    let (mut reconnected, _) = dial(&address, "node-replay", "s3cret").await.unwrap();
-    let resume: Value = match tokio::time::timeout(Duration::from_secs(3), reconnected.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-    {
-        tungstenite::Message::Text(text) => serde_json::from_str(&text).unwrap(),
-        other => panic!("expected node.resume after reconnect, got {other:?}"),
-    };
-    assert_eq!(resume["method"], "node.resume");
-    assert_eq!(resume["params"]["lastAcknowledgedSequence"], 1);
-    reconnected.close(None).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn expired_replay_requests_run_snapshots_without_fabricating_timeline_history() {
+async fn in_memory_command_does_not_request_expired_cursor_snapshots() {
     let store = Arc::new(office::Store::new());
     let handler = Handler::with_office(store.clone())
         .with_node_tokens(parse_node_tokens("node-expired=s3cret"));
@@ -490,6 +448,7 @@ async fn expired_replay_requests_run_snapshots_without_fabricating_timeline_hist
     hello["params"]["capabilities"] = json!(["node.event_replay.v1"]);
     let (status, body) = call(&app, "POST", "/v1/protocol/messages", "s3cret", Some(hello)).await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    assert_eq!(body["result"]["acceptedCapabilities"], json!([]));
     let event = json!({"jsonrpc":"2.0", "method":"run.updated", "params":params("org-expired", "node-expired", json!({
         "eventId":"expired-event-1", "sequence":1, "runId":"run-1", "state":"running"
     }))});
@@ -497,54 +456,14 @@ async fn expired_replay_requests_run_snapshots_without_fabricating_timeline_hist
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 
     let (mut socket, _) = dial(&address, "node-expired", "s3cret").await.unwrap();
-    let resume: Value = match socket.next().await.unwrap().unwrap() {
-        tungstenite::Message::Text(text) => serde_json::from_str(&text).unwrap(),
-        other => panic!("expected node.resume, got {other:?}"),
-    };
-    assert_eq!(resume["params"]["lastAcknowledgedSequence"], 1);
-    socket
-        .send(tungstenite::Message::Text(
-            json!({"jsonrpc":"2.0", "id":resume["id"], "result":{
-                "status":"cursor_expired", "nodeId":"node-expired",
-                "requestedAfterSequence":1, "oldestAvailableSequence":3,
-                "highWaterSequence":3, "eventsReplayed":0, "snapshotRequired":true
-            }})
-            .to_string()
-            .into(),
-        ))
-        .await
-        .unwrap();
-    let snapshot_request: Value = match tokio::time::timeout(Duration::from_secs(3), socket.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap()
-    {
-        tungstenite::Message::Text(text) => serde_json::from_str(&text).unwrap(),
-        other => panic!("expected run.snapshot, got {other:?}"),
-    };
-    assert_eq!(snapshot_request["method"], "run.snapshot");
-    assert_eq!(snapshot_request["params"]["runId"], "run-1");
-    socket
-        .send(tungstenite::Message::Text(
-            json!({"jsonrpc":"2.0", "id":snapshot_request["id"], "result":{
-                "runId":"run-1", "state":"completed", "sequence":3
-            }})
-            .to_string()
-            .into(),
-        ))
-        .await
-        .unwrap();
-
-    for _ in 0..100 {
-        let (_, nodes) = call(&app, "GET", "/v1/nodes", "demo-observer", None).await;
-        if nodes[0]["runs"]["run-1"]["state"] == "completed" {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), socket.next())
+            .await
+            .is_err(),
+        "an in-memory Command must not request replay or run snapshots"
+    );
     let (_, nodes) = call(&app, "GET", "/v1/nodes", "demo-observer", None).await;
-    assert_eq!(nodes[0]["runs"]["run-1"]["state"], "completed");
+    assert_eq!(nodes[0]["runs"]["run-1"]["state"], "running");
     assert_eq!(
         store
             .node_event_cursor("org-expired", "node-expired")

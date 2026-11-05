@@ -43,10 +43,13 @@ const MESSAGE_LIMIT: usize = 4 << 20;
 /// Optional node capabilities this Command implements.
 const SUPPORTED_NODE_CAPABILITIES: &[&str] = &["execution.activity.v1", "node.event_replay.v1"];
 
-fn negotiate_node_capabilities(offered: &[String]) -> Vec<String> {
+fn negotiate_node_capabilities(offered: &[String], durable_node_store: bool) -> Vec<String> {
     SUPPORTED_NODE_CAPABILITIES
         .iter()
-        .filter(|supported| offered.iter().any(|capability| capability == **supported))
+        .filter(|supported| {
+            (durable_node_store || **supported != "node.event_replay.v1")
+                && offered.iter().any(|capability| capability == **supported)
+        })
         .map(|capability| (*capability).to_string())
         .collect()
 }
@@ -638,8 +641,9 @@ impl Inner {
             "node.hello" => self.registry.hello(nodes::Node {
                 id: p.node_id,
                 organization_id: p.organization_id,
-                accepted_capabilities: accepted_capabilities
-                    .unwrap_or_else(|| negotiate_node_capabilities(&p.capabilities)),
+                accepted_capabilities: accepted_capabilities.unwrap_or_else(|| {
+                    negotiate_node_capabilities(&p.capabilities, self.database.is_some())
+                }),
                 capabilities: Some(p.capabilities),
                 agentux_version: p.agentux_version,
                 last_seen_at: p.occurred_at,
@@ -1352,7 +1356,10 @@ async fn message(State(s): AppState, headers: HeaderMap, body: Bytes) -> Respons
             let organization_id =
                 authenticated_organization.unwrap_or_else(|| p.organization_id.clone());
             if message.method == "node.hello" {
-                accepted_capabilities = Some(negotiate_node_capabilities(&p.capabilities));
+                accepted_capabilities = Some(negotiate_node_capabilities(
+                    &p.capabilities,
+                    s.database.is_some(),
+                ));
             }
             if message.method == "node.hello" {
                 // A static per-node token authenticates the first hello; its

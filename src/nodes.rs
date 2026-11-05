@@ -225,7 +225,7 @@ impl Registry {
             let applied = apply_to_node(node, event);
             let store = self.store.lock().unwrap_or_else(|e| e.into_inner()).clone();
             let Some(store) = store else {
-                return Ok(applied);
+                return Err("node registry persistence writer is not configured".into());
             };
             let (completion_tx, completion_rx) = oneshot::channel();
             store
@@ -524,6 +524,25 @@ mod tests {
             .send(Err("database unavailable".into()))
             .unwrap();
         assert_eq!(applying.await.unwrap().unwrap_err(), "database unavailable");
+    }
+
+    #[tokio::test]
+    async fn replay_event_barrier_fails_when_no_durable_writer_is_configured() {
+        let registry = Registry::new();
+        let result = registry
+            .apply_and_persist(Event {
+                node_id: "node-1".into(),
+                organization_id: "org-1".into(),
+                method: "harness.status".into(),
+                sequence: 1,
+                ..Event::default()
+            })
+            .await;
+
+        assert_eq!(
+            result.unwrap_err(),
+            "node registry persistence writer is not configured"
+        );
     }
 
     #[test]
