@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 /// A node heard from within this many seconds is online...
 const ONLINE_FOR: i64 = 90;
@@ -93,7 +93,13 @@ const MAX_RUNS: usize = 200;
 pub struct Registry {
     nodes: Mutex<HashMap<String, Node>>,
     /// Where changed nodes go to be stored, when they are.
-    store: Mutex<Option<mpsc::UnboundedSender<Node>>>,
+    store: Mutex<Option<mpsc::UnboundedSender<PersistRequest>>>,
+}
+
+/// A registry snapshot for the asynchronous PostgreSQL writer.
+pub struct PersistRequest {
+    node: Node,
+    completion: Option<oneshot::Sender<Result<(), String>>>,
 }
 
 impl Registry {
@@ -106,7 +112,7 @@ impl Registry {
     }
 
     /// Sends every change from now on to `store` ([`persist::writer`]).
-    pub fn store_to(&self, store: mpsc::UnboundedSender<Node>) {
+    pub fn store_to(&self, store: mpsc::UnboundedSender<PersistRequest>) {
         *self.store.lock().unwrap_or_else(|e| e.into_inner()) = Some(store);
     }
 
@@ -126,7 +132,10 @@ impl Registry {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            let _ = store.send(node.clone());
+            let _ = store.send(PersistRequest {
+                node: node.clone(),
+                completion: None,
+            });
         }
     }
 
@@ -195,40 +204,42 @@ impl Registry {
             status: "online".into(),
             ..Node::default()
         });
-        if event.sequence <= node.last_sequence {
-            return false;
+        let applied = apply_to_node(node, event);
+        if applied {
+            self.stored(node);
         }
-        node.last_sequence = event.sequence;
-        if !event.occurred_at.is_empty() {
-            node.last_seen_at = event.occurred_at.clone();
-        }
-        let params = event.params.unwrap_or(Value::Null);
-        match event.method.as_str() {
-            "harness.status" => node.harnesses = event.harnesses,
-            "harness.limits_changed" => node.limits = event.limits,
-            "approval.requested" => {
-                if !event.request_id.is_empty() {
-                    node.pending_approvals.insert(event.request_id, params);
-                }
-            }
-            "run.accepted" | "run.started" | "run.updated" | "run.completed" | "run.failed"
-                if !event.run_id.is_empty() =>
-            {
-                node.runs.insert(event.run_id.clone(), params);
-                if node.runs.len() > MAX_RUNS {
-                    trim_runs(&mut node.runs);
-                }
-                // A run that is not waiting has no approval pending any more.
-                if event.state != "waiting" {
-                    node.pending_approvals.retain(|_, approval| {
-                        approval.get("runId").and_then(Value::as_str) != Some(&event.run_id)
-                    });
-                }
-            }
-            _ => {}
-        }
-        self.stored(node);
-        true
+        applied
+    }
+
+    /// Applies a replayable event and waits for the resulting registry state
+    /// to be durably written before allowing the caller to acknowledge it.
+    pub async fn apply_and_persist(&self, event: Event) -> Result<bool, String> {
+        let (applied, completion) = {
+            let mut nodes = self.lock();
+            let node = nodes.entry(event.node_id.clone()).or_insert_with(|| Node {
+                id: event.node_id.clone(),
+                organization_id: event.organization_id.clone(),
+                status: "online".into(),
+                ..Node::default()
+            });
+            let applied = apply_to_node(node, event);
+            let store = self.store.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let Some(store) = store else {
+                return Ok(applied);
+            };
+            let (completion_tx, completion_rx) = oneshot::channel();
+            store
+                .send(PersistRequest {
+                    node: node.clone(),
+                    completion: Some(completion_tx),
+                })
+                .map_err(|_| "node registry persistence writer stopped".to_string())?;
+            (applied, completion_rx)
+        };
+        completion
+            .await
+            .map_err(|_| "node registry persistence writer stopped".to_string())??;
+        Ok(applied)
     }
 
     pub fn get(&self, id: &str) -> Option<Node> {
@@ -305,16 +316,31 @@ pub mod persist {
 
     /// Starts the task that stores changed nodes; send it each change. A
     /// burst of changes is written once per node, the latest.
-    pub fn writer(pool: deadpool_postgres::Pool) -> mpsc::UnboundedSender<Node> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<Node>();
+    pub fn writer(pool: deadpool_postgres::Pool) -> mpsc::UnboundedSender<PersistRequest> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<PersistRequest>();
         tokio::spawn(async move {
             while let Some(first) = rx.recv().await {
-                let mut latest = HashMap::from([(first.id.clone(), first)]);
+                let mut latest = HashMap::from([(
+                    first.node.id.clone(),
+                    (first.node, first.completion.into_iter().collect::<Vec<_>>()),
+                )]);
                 while let Ok(more) = rx.try_recv() {
-                    latest.insert(more.id.clone(), more);
+                    let entry = latest
+                        .entry(more.node.id.clone())
+                        .or_insert_with(|| (more.node.clone(), Vec::new()));
+                    entry.0 = more.node;
+                    if let Some(completion) = more.completion {
+                        entry.1.push(completion);
+                    }
                 }
-                if let Err(e) = write(&pool, latest.into_values()).await {
+                let result = write(&pool, latest.values().map(|(node, _)| node.clone())).await;
+                if let Err(e) = &result {
                     eprintln!("agentux-command: cannot store node state: {e}");
+                }
+                for (_, completions) in latest.into_values() {
+                    for completion in completions {
+                        let _ = completion.send(result.clone());
+                    }
                 }
             }
         });
@@ -340,6 +366,41 @@ pub mod persist {
         }
         Ok(())
     }
+}
+
+fn apply_to_node(node: &mut Node, event: Event) -> bool {
+    if event.sequence <= node.last_sequence {
+        return false;
+    }
+    node.last_sequence = event.sequence;
+    if !event.occurred_at.is_empty() {
+        node.last_seen_at = event.occurred_at.clone();
+    }
+    let params = event.params.unwrap_or(Value::Null);
+    match event.method.as_str() {
+        "harness.status" => node.harnesses = event.harnesses,
+        "harness.limits_changed" => node.limits = event.limits,
+        "approval.requested" => {
+            if !event.request_id.is_empty() {
+                node.pending_approvals.insert(event.request_id, params);
+            }
+        }
+        "run.accepted" | "run.started" | "run.updated" | "run.completed" | "run.failed"
+            if !event.run_id.is_empty() =>
+        {
+            node.runs.insert(event.run_id.clone(), params);
+            if node.runs.len() > MAX_RUNS {
+                trim_runs(&mut node.runs);
+            }
+            if event.state != "waiting" {
+                node.pending_approvals.retain(|_, approval| {
+                    approval.get("runId").and_then(Value::as_str) != Some(&event.run_id)
+                });
+            }
+        }
+        _ => {}
+    }
+    true
 }
 
 /// Drops finished runs, oldest started first, down to MAX_RUNS.
@@ -399,8 +460,8 @@ mod tests {
             ..Node::default()
         });
         registry.heartbeat("node-1", "ready");
-        assert_eq!(rx.recv().await.unwrap().status, "online");
-        let latest = rx.recv().await.unwrap();
+        assert_eq!(rx.recv().await.unwrap().node.status, "online");
+        let latest = rx.recv().await.unwrap().node;
         assert_eq!(latest.status, "ready");
 
         let restarted = Registry::new();
@@ -411,6 +472,58 @@ mod tests {
         let node = restarted.get("node-1").unwrap();
         assert_eq!(node.status, "ready");
         assert!(!node.connected, "no connection survives a restart");
+    }
+
+    #[tokio::test]
+    async fn replay_event_barrier_waits_for_registry_storage_confirmation() {
+        let registry = Registry::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        registry.store_to(tx);
+
+        let applying = tokio::spawn(async move {
+            registry
+                .apply_and_persist(Event {
+                    node_id: "node-1".into(),
+                    organization_id: "org-1".into(),
+                    method: "harness.status".into(),
+                    sequence: 1,
+                    harnesses: Some(json!([{"id": "codex"}])),
+                    ..Event::default()
+                })
+                .await
+        });
+
+        let request = rx.recv().await.unwrap();
+        assert_eq!(request.node.harnesses, Some(json!([{"id": "codex"}])));
+        assert!(!applying.is_finished(), "the barrier is still pending");
+        request.completion.unwrap().send(Ok(())).unwrap();
+        assert!(applying.await.unwrap().unwrap());
+    }
+
+    #[tokio::test]
+    async fn replay_event_barrier_reports_registry_storage_failure() {
+        let registry = Registry::new();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        registry.store_to(tx);
+        let applying = tokio::spawn(async move {
+            registry
+                .apply_and_persist(Event {
+                    node_id: "node-1".into(),
+                    organization_id: "org-1".into(),
+                    method: "harness.status".into(),
+                    sequence: 1,
+                    ..Event::default()
+                })
+                .await
+        });
+
+        let request = rx.recv().await.unwrap();
+        request
+            .completion
+            .unwrap()
+            .send(Err("database unavailable".into()))
+            .unwrap();
+        assert_eq!(applying.await.unwrap().unwrap_err(), "database unavailable");
     }
 
     #[test]
