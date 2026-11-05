@@ -7,6 +7,7 @@ use std::sync::{Mutex, MutexGuard};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use sha2::Digest;
 
 use crate::now_rfc3339;
 
@@ -58,6 +59,16 @@ pub trait OfficeRepository: Send + Sync {
     ) -> Result<Option<i64>, Error> {
         Ok(None)
     }
+    /// Atomically replaces a node's current-state checkpoint and advances its
+    /// verified cursor. Implementations must reject an unexpected starting cursor.
+    async fn apply_node_checkpoint(
+        &self,
+        _checkpoint: NodeCheckpoint,
+    ) -> Result<CheckpointReceipt, Error> {
+        Err(Error::Storage(
+            "node checkpoints are not implemented by this store".into(),
+        ))
+    }
     /// Part of an organization's event log, oldest first.
     async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error>;
     async fn resolve_approval(
@@ -65,6 +76,213 @@ pub trait OfficeRepository: Send + Sync {
         approval_id: &str,
         request: ResolutionRequest,
     ) -> Result<ResolutionResponse, Error>;
+}
+
+/// The projection inventories carried by the accepted checkpoint contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointProjection {
+    Approval,
+    Artifact,
+    Command,
+    Gate,
+    Harness,
+    Limit,
+    Node,
+    NodeAlert,
+    Run,
+    Session,
+    Task,
+}
+
+impl CheckpointProjection {
+    pub const ALL: [Self; 11] = [
+        Self::Approval,
+        Self::Artifact,
+        Self::Command,
+        Self::Gate,
+        Self::Harness,
+        Self::Limit,
+        Self::Node,
+        Self::NodeAlert,
+        Self::Run,
+        Self::Session,
+        Self::Task,
+    ];
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Approval => "approval",
+            Self::Artifact => "artifact",
+            Self::Command => "command",
+            Self::Gate => "gate",
+            Self::Harness => "harness",
+            Self::Limit => "limit",
+            Self::Node => "node",
+            Self::NodeAlert => "node_alert",
+            Self::Run => "run",
+            Self::Session => "session",
+            Self::Task => "task",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckpointEntry {
+    pub projection: CheckpointProjection,
+    pub entry_id: String,
+    /// `Some` is a complete projection state; `None` is a validated tombstone.
+    pub state: Option<Value>,
+    pub removed_at_sequence: Option<i64>,
+    pub run_id: Option<String>,
+}
+
+/// A complete, already wire-validated checkpoint. Construction is restricted
+/// to this module so partial page chains cannot reach the storage primitive.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct NodeCheckpoint {
+    organization_id: String,
+    node_id: String,
+    checkpoint_id: String,
+    snapshot_id: String,
+    requested_after_sequence: i64,
+    high_water_sequence: i64,
+    entries: Vec<CheckpointEntry>,
+}
+
+impl NodeCheckpoint {
+    pub(crate) fn from_validated_pages(
+        organization_id: String,
+        node_id: String,
+        checkpoint_id: String,
+        snapshot_id: String,
+        requested_after_sequence: i64,
+        high_water_sequence: i64,
+        entries: Vec<CheckpointEntry>,
+    ) -> Result<Self, Error> {
+        if organization_id.is_empty()
+            || node_id.is_empty()
+            || checkpoint_id.is_empty()
+            || snapshot_id.is_empty()
+            || requested_after_sequence < 0
+            || high_water_sequence < requested_after_sequence
+        {
+            return Err(Error::Invalid(
+                "invalid checkpoint identity or sequence range".into(),
+            ));
+        }
+        let mut ids = HashSet::new();
+        for entry in &entries {
+            if entry.entry_id.is_empty()
+                || !entry
+                    .entry_id
+                    .starts_with(&format!("{}:", entry.projection.as_str()))
+                || !ids.insert(entry.entry_id.clone())
+            {
+                return Err(Error::Invalid(
+                    "checkpoint entry IDs must be unique and projection-prefixed".into(),
+                ));
+            }
+            match (&entry.state, entry.removed_at_sequence) {
+                (Some(state), None) if state.is_object() => {}
+                (None, Some(sequence))
+                    if sequence > requested_after_sequence && sequence <= high_water_sequence => {}
+                _ => {
+                    return Err(Error::Invalid(
+                        "checkpoint entry state or tombstone is invalid".into(),
+                    ));
+                }
+            }
+            if let Some(state) = &entry.state {
+                let object = state.as_object().unwrap();
+                let identity = entry
+                    .entry_id
+                    .split_once(':')
+                    .map(|(_, id)| id)
+                    .unwrap_or_default();
+                let identity_field = match entry.projection {
+                    CheckpointProjection::Approval => "approvalId",
+                    CheckpointProjection::Artifact => "artifactId",
+                    CheckpointProjection::Command => "commandId",
+                    CheckpointProjection::Gate => "gateId",
+                    CheckpointProjection::Harness => "harnessId",
+                    CheckpointProjection::Limit => "limitId",
+                    CheckpointProjection::Node => "nodeId",
+                    CheckpointProjection::NodeAlert => "alertId",
+                    CheckpointProjection::Run => "runId",
+                    CheckpointProjection::Session => "sessionId",
+                    CheckpointProjection::Task => "taskId",
+                };
+                if object.get(identity_field).and_then(Value::as_str) != Some(identity)
+                    || !object.get("currentState").is_some_and(Value::is_object)
+                    || object
+                        .get("currentState")
+                        .and_then(Value::as_object)
+                        .is_some_and(|v| v.is_empty())
+                {
+                    return Err(Error::Invalid(
+                        "checkpoint state identity or currentState mismatch".into(),
+                    ));
+                }
+                if matches!(
+                    entry.projection,
+                    CheckpointProjection::Approval
+                        | CheckpointProjection::Artifact
+                        | CheckpointProjection::Command
+                        | CheckpointProjection::Gate
+                        | CheckpointProjection::Run
+                        | CheckpointProjection::Session
+                        | CheckpointProjection::Task
+                ) && object.get("organizationId").and_then(Value::as_str)
+                    != Some(organization_id)
+                {
+                    return Err(Error::Invalid(
+                        "checkpoint projection organization scope mismatch".into(),
+                    ));
+                }
+                if entry.projection == CheckpointProjection::Node && identity != node_id {
+                    return Err(Error::Invalid(
+                        "checkpoint node projection scope mismatch".into(),
+                    ));
+                }
+                if entry.projection == CheckpointProjection::Run
+                    && (object.get("owner").and_then(Value::as_str) != Some("command")
+                        || !object
+                            .get("commandId")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                        || !object
+                            .get("missionId")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty())
+                        || !object
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .is_some_and(|s| !s.is_empty()))
+                {
+                    return Err(Error::Invalid("run checkpoint is not command-owned".into()));
+                }
+            } else if entry.projection == CheckpointProjection::Run
+                && entry.run_id.as_deref() != entry.entry_id.strip_prefix("run:")
+            {
+                return Err(Error::Invalid("run tombstone identity mismatch".into()));
+            }
+        }
+        Ok(Self {
+            organization_id,
+            node_id,
+            checkpoint_id,
+            snapshot_id,
+            requested_after_sequence,
+            high_water_sequence,
+            entries,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointReceipt {
+    pub contiguous_sequence: i64,
+    pub duplicate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -428,6 +646,9 @@ struct MemoryState {
     node_events: HashMap<(String, String, i64), NodeEvent>,
     node_event_ids: HashMap<(String, String, String), i64>,
     node_event_cursors: HashMap<(String, String), i64>,
+    checkpoints: HashMap<(String, String), (String, i64, String)>,
+    checkpoint_entries: HashMap<(String, String, String), CheckpointEntry>,
+    checkpoint_gaps: Vec<(String, String, i64, i64)>,
 }
 
 fn objects(value: Value) -> Vec<Object> {
@@ -504,6 +725,9 @@ impl Store {
                 node_events: HashMap::new(),
                 node_event_ids: HashMap::new(),
                 node_event_cursors: HashMap::new(),
+                checkpoints: HashMap::new(),
+                checkpoint_entries: HashMap::new(),
+                checkpoint_gaps: Vec::new(),
             }),
         }
     }
@@ -708,6 +932,94 @@ impl OfficeRepository for Store {
             .get(&(organization_id.to_string(), node_id.to_string()))
             .copied()
             .unwrap_or(0))
+    }
+
+    async fn node_event_history_gap(
+        &self,
+        organization_id: &str,
+        node_id: &str,
+    ) -> Result<Option<i64>, Error> {
+        Ok(self
+            .lock()
+            .checkpoint_gaps
+            .iter()
+            .filter(|(org, node, _, _)| org == organization_id && node == node_id)
+            .map(|(_, _, _, through)| *through)
+            .max())
+    }
+
+    async fn apply_node_checkpoint(
+        &self,
+        checkpoint: NodeCheckpoint,
+    ) -> Result<CheckpointReceipt, Error> {
+        let mut state = self.lock();
+        let key = (
+            checkpoint.organization_id.clone(),
+            checkpoint.node_id.clone(),
+        );
+        let cursor = state.node_event_cursors.get(&key).copied().unwrap_or(0);
+        let serialized =
+            serde_json::to_vec(&checkpoint).map_err(|e| Error::Invalid(e.to_string()))?;
+        let digest = format!("{:x}", sha2::Sha256::digest(serialized));
+        if let Some((id, high, previous_digest)) = state.checkpoints.get(&key) {
+            if id == &checkpoint.checkpoint_id
+                && *high == checkpoint.high_water_sequence
+                && previous_digest == &digest
+            {
+                return Ok(CheckpointReceipt {
+                    contiguous_sequence: *high,
+                    duplicate: true,
+                });
+            }
+            if id == &checkpoint.checkpoint_id {
+                return Err(Error::conflict(
+                    "checkpoint_identity_conflict",
+                    "checkpoint ID was reused with different content",
+                ));
+            }
+        }
+        if cursor != checkpoint.requested_after_sequence {
+            return Err(Error::conflict(
+                "checkpoint_cursor_conflict",
+                "checkpoint starting cursor is stale",
+            ));
+        }
+        let prefix = (
+            checkpoint.organization_id.clone(),
+            checkpoint.node_id.clone(),
+        );
+        state
+            .checkpoint_entries
+            .retain(|(org, node, _), _| org != &prefix.0 || node != &prefix.1);
+        for entry in checkpoint.entries.iter().cloned() {
+            state.checkpoint_entries.insert(
+                (prefix.0.clone(), prefix.1.clone(), entry.entry_id.clone()),
+                entry,
+            );
+        }
+        if checkpoint.high_water_sequence > checkpoint.requested_after_sequence {
+            state.checkpoint_gaps.push((
+                prefix.0.clone(),
+                prefix.1.clone(),
+                checkpoint.requested_after_sequence + 1,
+                checkpoint.high_water_sequence,
+            ));
+        }
+        state.checkpoints.insert(
+            key.clone(),
+            (
+                checkpoint.checkpoint_id,
+                checkpoint.high_water_sequence,
+                digest,
+            ),
+        );
+        state
+            .node_event_cursors
+            .insert(key, checkpoint.high_water_sequence);
+        Ok(CheckpointReceipt {
+            contiguous_sequence: checkpoint.high_water_sequence,
+            duplicate: false,
+        })
     }
 
     async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error> {
@@ -1465,6 +1777,72 @@ mod tests {
         assert_eq!(
             serde_json::to_value(conflict).unwrap(),
             json!({"code": "already_decided", "message": "approval already decided"})
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_commit_advances_cursor_records_gap_and_retries_idempotently() {
+        let store = Store::new();
+        let checkpoint = NodeCheckpoint::from_validated_pages(
+            "acme".into(),
+            "node-1".into(),
+            "cp-1".into(),
+            "snap-1".into(),
+            0,
+            4,
+            vec![],
+        )
+        .unwrap();
+        let first = store
+            .apply_node_checkpoint(checkpoint.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            first,
+            CheckpointReceipt {
+                contiguous_sequence: 4,
+                duplicate: false
+            }
+        );
+        assert_eq!(store.node_event_cursor("acme", "node-1").await.unwrap(), 4);
+        assert_eq!(
+            store
+                .node_event_history_gap("acme", "node-1")
+                .await
+                .unwrap(),
+            Some(4)
+        );
+        let retry = store.apply_node_checkpoint(checkpoint).await.unwrap();
+        assert_eq!(
+            retry,
+            CheckpointReceipt {
+                contiguous_sequence: 4,
+                duplicate: true
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_rejects_stale_cursor_without_advancing_it() {
+        let store = Store::new();
+        let checkpoint = NodeCheckpoint::from_validated_pages(
+            "acme".into(),
+            "node-1".into(),
+            "cp-1".into(),
+            "snap-1".into(),
+            2,
+            4,
+            vec![],
+        )
+        .unwrap();
+        assert!(store.apply_node_checkpoint(checkpoint).await.is_err());
+        assert_eq!(store.node_event_cursor("acme", "node-1").await.unwrap(), 0);
+        assert_eq!(
+            store
+                .node_event_history_gap("acme", "node-1")
+                .await
+                .unwrap(),
+            None
         );
     }
 }
