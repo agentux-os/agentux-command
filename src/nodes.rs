@@ -265,7 +265,7 @@ pub mod persist {
     use tokio::sync::mpsc;
     use tokio_postgres::types::Json;
 
-    use super::Node;
+    use super::{Node, PersistRequest};
 
     /// Every stored node.
     pub async fn load(pool: &deadpool_postgres::Pool) -> Result<Vec<Node>, String> {
