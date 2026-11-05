@@ -234,7 +234,7 @@ impl NodeCheckpoint {
                         | CheckpointProjection::Session
                         | CheckpointProjection::Task
                 ) && object.get("organizationId").and_then(Value::as_str)
-                    != Some(organization_id)
+                    != Some(organization_id.as_str())
                 {
                     return Err(Error::Invalid(
                         "checkpoint projection organization scope mismatch".into(),
