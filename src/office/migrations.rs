@@ -62,6 +62,10 @@ const FILES: &[(&str, &str)] = &[
         "014_safe_legacy_node_event_cursor.sql",
         include_str!("../../migrations/014_safe_legacy_node_event_cursor.sql"),
     ),
+    (
+        "015_node_snapshot_checkpoints.sql",
+        include_str!("../../migrations/015_node_snapshot_checkpoints.sql"),
+    ),
 ];
 
 pub(crate) struct Migration {
@@ -153,7 +157,7 @@ mod tests {
     fn versions_are_ordered_and_start_at_one() {
         assert_eq!(
             migration_versions(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
         );
     }
 
@@ -171,6 +175,28 @@ mod tests {
         );
         assert!(!cursor_safety.sql.contains("SET contiguous_sequence"));
         assert!(cursor_safety.sql.contains("history_gap_through_sequence"));
+    }
+
+    #[test]
+    fn checkpoint_migration_stores_scoped_projections_identity_and_explicit_gaps() {
+        let migrations = load().unwrap();
+        let checkpoint = migrations
+            .iter()
+            .find(|migration| migration.version == 15)
+            .unwrap();
+        assert!(
+            checkpoint
+                .sql
+                .contains("command_node_checkpoint_projections")
+        );
+        assert!(checkpoint.sql.contains("command_node_checkpoints"));
+        assert!(checkpoint.sql.contains("command_node_history_gaps"));
+        assert!(
+            checkpoint
+                .sql
+                .contains("PRIMARY KEY (organization_id, node_id, projection_type, entry_id)")
+        );
+        assert!(checkpoint.sql.contains("content_sha256"));
     }
 
     #[test]

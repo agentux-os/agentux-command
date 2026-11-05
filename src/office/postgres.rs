@@ -12,9 +12,10 @@ use tokio_postgres::NoTls;
 use tokio_postgres::types::Json;
 
 use super::{
-    Error, Event, Logged, NodeEvent, NodeEventReceipt, OfficeRepository, Projection, Replay,
-    ResolutionRequest, ResolutionResponse, apply_projection_event, empty_projection, migrate,
-    prepare, stamp_definition, validate_event, validate_resolution,
+    CheckpointReceipt, Error, Event, Logged, NodeCheckpoint, NodeEvent, NodeEventReceipt,
+    OfficeRepository, Projection, Replay, ResolutionRequest, ResolutionResponse,
+    apply_projection_event, empty_projection, migrate, prepare, stamp_definition, validate_event,
+    validate_resolution,
 };
 use crate::now_rfc3339;
 
@@ -494,6 +495,73 @@ impl OfficeRepository for PostgresStore {
         })
     }
 
+    async fn apply_node_checkpoint(
+        &self,
+        checkpoint: NodeCheckpoint,
+    ) -> Result<CheckpointReceipt, Error> {
+        let bytes = serde_json::to_vec(&checkpoint).map_err(|e| Error::Invalid(e.to_string()))?;
+        let digest = hex::encode(Sha256::digest(bytes));
+        let mut client = self.pool.get().await?;
+        let tx = client
+            .transaction()
+            .await
+            .map_err(storage("begin node checkpoint transaction"))?;
+        tx.execute("INSERT INTO command_node_event_cursors (organization_id,node_id) VALUES ($1,$2) ON CONFLICT DO NOTHING",
+            &[&checkpoint.organization_id,&checkpoint.node_id]).await.map_err(storage("initialize checkpoint cursor"))?;
+        let cursor: i64 = tx.query_one("SELECT contiguous_sequence FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2 FOR UPDATE",
+            &[&checkpoint.organization_id,&checkpoint.node_id]).await.map_err(storage("lock checkpoint cursor"))?.get(0);
+        let prior = tx.query_opt("SELECT checkpoint_id,high_water_sequence,content_sha256 FROM command_node_checkpoints WHERE organization_id=$1 AND node_id=$2 FOR UPDATE",
+            &[&checkpoint.organization_id,&checkpoint.node_id]).await.map_err(storage("read checkpoint identity"))?;
+        if let Some(row) = prior {
+            let id: String = row.get(0);
+            let high: i64 = row.get(1);
+            let previous_digest: String = row.get(2);
+            if id == checkpoint.checkpoint_id {
+                if high == checkpoint.high_water_sequence && previous_digest == digest {
+                    tx.commit()
+                        .await
+                        .map_err(storage("commit checkpoint retry"))?;
+                    return Ok(CheckpointReceipt {
+                        contiguous_sequence: high,
+                        duplicate: true,
+                    });
+                }
+                return Err(Error::conflict(
+                    "checkpoint_identity_conflict",
+                    "checkpoint ID was reused with different content",
+                ));
+            }
+        }
+        if cursor != checkpoint.requested_after_sequence {
+            return Err(Error::conflict(
+                "checkpoint_cursor_conflict",
+                "checkpoint starting cursor is stale",
+            ));
+        }
+        tx.execute("DELETE FROM command_node_checkpoint_projections WHERE organization_id=$1 AND node_id=$2",
+            &[&checkpoint.organization_id,&checkpoint.node_id]).await.map_err(storage("replace checkpoint projections"))?;
+        for entry in &checkpoint.entries {
+            tx.execute("INSERT INTO command_node_checkpoint_projections (organization_id,node_id,projection_type,entry_id,state,removed_at_sequence,run_id,checkpoint_id) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                &[&checkpoint.organization_id,&checkpoint.node_id,&entry.projection.as_str(),&entry.entry_id,&entry.state.as_ref().map(Json),&entry.removed_at_sequence,&entry.run_id,&checkpoint.checkpoint_id])
+                .await.map_err(storage("persist checkpoint projection"))?;
+        }
+        tx.execute("INSERT INTO command_node_checkpoints (organization_id,node_id,checkpoint_id,snapshot_id,requested_after_sequence,high_water_sequence,content_sha256) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (organization_id,node_id) DO UPDATE SET checkpoint_id=EXCLUDED.checkpoint_id,snapshot_id=EXCLUDED.snapshot_id,requested_after_sequence=EXCLUDED.requested_after_sequence,high_water_sequence=EXCLUDED.high_water_sequence,content_sha256=EXCLUDED.content_sha256,applied_at=now()",
+            &[&checkpoint.organization_id,&checkpoint.node_id,&checkpoint.checkpoint_id,&checkpoint.snapshot_id,&checkpoint.requested_after_sequence,&checkpoint.high_water_sequence,&digest]).await.map_err(storage("persist checkpoint identity"))?;
+        if checkpoint.high_water_sequence > checkpoint.requested_after_sequence {
+            tx.execute("INSERT INTO command_node_history_gaps (organization_id,node_id,checkpoint_id,from_sequence,through_sequence) VALUES ($1,$2,$3,$4,$5)",
+                &[&checkpoint.organization_id,&checkpoint.node_id,&checkpoint.checkpoint_id,&(checkpoint.requested_after_sequence+1),&checkpoint.high_water_sequence]).await.map_err(storage("record checkpoint history gap"))?;
+        }
+        tx.execute("UPDATE command_node_event_cursors SET contiguous_sequence=$3,verified_sequence=$3,history_gap_through_sequence=NULL,updated_at=now() WHERE organization_id=$1 AND node_id=$2",
+            &[&checkpoint.organization_id,&checkpoint.node_id,&checkpoint.high_water_sequence]).await.map_err(storage("advance checkpoint cursor"))?;
+        tx.commit()
+            .await
+            .map_err(storage("commit node checkpoint"))?;
+        Ok(CheckpointReceipt {
+            contiguous_sequence: checkpoint.high_water_sequence,
+            duplicate: false,
+        })
+    }
+
     async fn node_event_cursor(&self, organization_id: &str, node_id: &str) -> Result<i64, Error> {
         let client = self.pool.get().await?;
         Ok(client
@@ -514,13 +582,19 @@ impl OfficeRepository for PostgresStore {
     ) -> Result<Option<i64>, Error> {
         let client = self.pool.get().await?;
         Ok(client
-            .query_opt(
-                "SELECT history_gap_through_sequence FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2",
+            .query_one(
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM command_node_history_gaps WHERE organization_id=$1 AND node_id=$2)
+                                  OR EXISTS (SELECT 1 FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2 AND history_gap_through_sequence IS NOT NULL)
+                            THEN GREATEST(
+                                COALESCE((SELECT MAX(through_sequence) FROM command_node_history_gaps WHERE organization_id=$1 AND node_id=$2), 0),
+                                COALESCE((SELECT history_gap_through_sequence FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2), 0)
+                            )
+                            ELSE NULL END",
                 &[&organization_id, &node_id],
             )
             .await
             .map_err(storage("read node event history gap"))?
-            .and_then(|row| row.get(0)))
+            .get(0))
     }
 
     async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error> {

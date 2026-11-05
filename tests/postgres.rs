@@ -5,7 +5,8 @@ mod common;
 
 use agentux_command::nodes::{self, Node};
 use agentux_command::office::{
-    self, Event, NodeEvent, OfficeRepository, PostgresStore, ResolutionRequest,
+    self, CheckpointEntry, CheckpointProjection, Event, NodeCheckpoint, NodeEvent,
+    OfficeRepository, PostgresStore, ResolutionRequest,
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -33,6 +34,28 @@ fn event(id: &str, org: &str, sequence: i64) -> Event {
         sequence,
         ..Event::default()
     }
+}
+
+fn checkpoint(org: &str, id: &str, after: i64, high: i64, status: &str) -> NodeCheckpoint {
+    NodeCheckpoint::from_validated_pages(
+        org.into(),
+        "node-01".into(),
+        id.into(),
+        format!("snapshot-{id}"),
+        after,
+        high,
+        vec![CheckpointEntry {
+            projection: CheckpointProjection::Node,
+            entry_id: "node:node-01".into(),
+            state: Some(json!({
+                "nodeId": "node-01",
+                "currentState": {"status": status}
+            })),
+            removed_at_sequence: None,
+            run_id: None,
+        }],
+    )
+    .unwrap()
 }
 
 #[tokio::test]
@@ -1138,4 +1161,242 @@ async fn old_events_are_archived_then_pruned_and_the_projection_still_verifies()
         .await
         .unwrap();
     assert_eq!(again.iter().map(|p| p.events).sum::<u64>(), 0);
+}
+
+#[tokio::test]
+async fn node_event_history_gap_includes_durable_checkpoint_intervals_and_legacy_cursor() {
+    let Some((store, pool, _, _)) = store().await else {
+        return;
+    };
+    let client = pool.get().await.unwrap();
+    client
+        .execute(
+            "INSERT INTO command_node_event_cursors (organization_id,node_id,history_gap_through_sequence) VALUES ('gap-org','node',14),('legacy-org','node',30),('other-org','node',90)",
+            &[],
+        )
+        .await
+        .unwrap();
+    client
+        .execute(
+            "INSERT INTO command_node_history_gaps (organization_id,node_id,checkpoint_id,from_sequence,through_sequence) VALUES ('gap-org','node','cp-1',3,7),('gap-org','node','cp-2',11,19),('legacy-org','node','legacy-cp',2,20),('other-org','node','other-cp',1,90)",
+            &[],
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        store
+            .node_event_history_gap("gap-org", "node")
+            .await
+            .unwrap(),
+        Some(19),
+        "the highest durable checkpoint gap must be combined with a legacy cursor gap"
+    );
+    assert_eq!(
+        store
+            .node_event_history_gap("unrelated-org", "node")
+            .await
+            .unwrap(),
+        None,
+        "gaps must remain organization scoped"
+    );
+    assert_eq!(
+        store
+            .node_event_history_gap("legacy-org", "node")
+            .await
+            .unwrap(),
+        Some(30),
+        "a higher legacy cursor gap must be retained alongside checkpoint intervals"
+    );
+}
+
+#[tokio::test]
+async fn postgres_checkpoint_applies_projection_gap_and_cursor_atomically() {
+    let Some((store, pool, _, _)) = store().await else {
+        return;
+    };
+    let receipt = store
+        .apply_node_checkpoint(checkpoint("checkpoint-org", "cp-1", 0, 5, "ready"))
+        .await
+        .unwrap();
+    assert!(!receipt.duplicate);
+    assert_eq!(receipt.contiguous_sequence, 5);
+    assert_eq!(
+        store
+            .node_event_cursor("checkpoint-org", "node-01")
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        store
+            .node_event_history_gap("checkpoint-org", "node-01")
+            .await
+            .unwrap(),
+        Some(5)
+    );
+    let row = pool
+        .get()
+        .await
+        .unwrap()
+        .query_one(
+            "SELECT state->'currentState'->>'status' FROM command_node_checkpoint_projections WHERE organization_id='checkpoint-org' AND node_id='node-01' AND entry_id='node:node-01'",
+            &[],
+        )
+        .await
+        .unwrap();
+    assert_eq!(row.get::<_, String>(0), "ready");
+}
+
+#[tokio::test]
+async fn postgres_checkpoint_duplicate_retry_is_idempotent() {
+    let Some((store, pool, _, _)) = store().await else {
+        return;
+    };
+    let cp = checkpoint("retry-org", "cp-retry", 0, 5, "ready");
+    store.apply_node_checkpoint(cp.clone()).await.unwrap();
+    let retry = store.apply_node_checkpoint(cp).await.unwrap();
+    assert!(retry.duplicate);
+    assert_eq!(retry.contiguous_sequence, 5);
+    let client = pool.get().await.unwrap();
+    assert_eq!(
+        client
+            .query_one("SELECT count(*)::bigint FROM command_node_checkpoints", &[])
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*)::bigint FROM command_node_history_gaps",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        1
+    );
+}
+
+#[tokio::test]
+async fn postgres_checkpoint_rejects_stale_cursor_and_conflicting_identity() {
+    let Some((store, _, _, _)) = store().await else {
+        return;
+    };
+    let original = checkpoint("conflict-org", "cp-original", 0, 5, "ready");
+    store.apply_node_checkpoint(original.clone()).await.unwrap();
+    assert!(matches!(
+        store
+            .apply_node_checkpoint(checkpoint("conflict-org", "cp-stale", 0, 8, "new"))
+            .await,
+        Err(office::Error::Conflict(_))
+    ));
+    assert!(matches!(
+        store
+            .apply_node_checkpoint(checkpoint("conflict-org", "cp-original", 0, 5, "changed"))
+            .await,
+        Err(office::Error::Conflict(_))
+    ));
+    assert_eq!(
+        store
+            .node_event_cursor("conflict-org", "node-01")
+            .await
+            .unwrap(),
+        5
+    );
+    assert_eq!(
+        store
+            .node_event_history_gap("conflict-org", "node-01")
+            .await
+            .unwrap(),
+        Some(5)
+    );
+}
+
+#[tokio::test]
+async fn postgres_checkpoints_are_isolated_by_organization() {
+    let Some((store, pool, _, _)) = store().await else {
+        return;
+    };
+    store
+        .apply_node_checkpoint(checkpoint("tenant-a", "same-id", 0, 3, "a"))
+        .await
+        .unwrap();
+    store
+        .apply_node_checkpoint(checkpoint("tenant-b", "same-id", 0, 7, "b"))
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .node_event_cursor("tenant-a", "node-01")
+            .await
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        store
+            .node_event_cursor("tenant-b", "node-01")
+            .await
+            .unwrap(),
+        7
+    );
+    assert_eq!(
+        store
+            .node_event_history_gap("tenant-a", "node-01")
+            .await
+            .unwrap(),
+        Some(3)
+    );
+    assert_eq!(
+        store
+            .node_event_history_gap("tenant-b", "node-01")
+            .await
+            .unwrap(),
+        Some(7)
+    );
+    let client = pool.get().await.unwrap();
+    assert_eq!(
+        client
+            .query_one(
+                "SELECT count(*)::bigint FROM command_node_checkpoint_projections",
+                &[]
+            )
+            .await
+            .unwrap()
+            .get::<_, i64>(0),
+        2
+    );
+}
+
+#[tokio::test]
+async fn postgres_checkpoint_failure_rolls_back_projection_checkpoint_gap_and_cursor() {
+    let Some((store, pool, _, _)) = store().await else {
+        return;
+    };
+    store
+        .apply_node_checkpoint(checkpoint("rollback-org", "cp-before", 0, 2, "before"))
+        .await
+        .unwrap();
+    let client = pool.get().await.unwrap();
+    client.batch_execute(
+        "CREATE FUNCTION reject_checkpoint_projection() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected projection failure'; END $$;
+         CREATE TRIGGER reject_checkpoint_projection BEFORE INSERT ON command_node_checkpoint_projections FOR EACH ROW EXECUTE FUNCTION reject_checkpoint_projection();"
+    ).await.unwrap();
+    assert!(
+        store
+            .apply_node_checkpoint(checkpoint("rollback-org", "cp-failed", 2, 4, "after"))
+            .await
+            .is_err()
+    );
+    let row = client.query_one(
+        "SELECT c.checkpoint_id,c.high_water_sequence,p.state->'currentState'->>'status',cur.contiguous_sequence,(SELECT count(*) FROM command_node_history_gaps g WHERE g.organization_id='rollback-org' AND g.node_id='node-01') FROM command_node_checkpoints c JOIN command_node_checkpoint_projections p USING (organization_id,node_id) JOIN command_node_event_cursors cur USING (organization_id,node_id) WHERE c.organization_id='rollback-org' AND c.node_id='node-01'",
+        &[],
+    ).await.unwrap();
+    assert_eq!(row.get::<_, String>(0), "cp-before");
+    assert_eq!(row.get::<_, i64>(1), 2);
+    assert_eq!(row.get::<_, String>(2), "before");
+    assert_eq!(row.get::<_, i64>(3), 2);
+    assert_eq!(row.get::<_, i64>(4), 1);
 }
