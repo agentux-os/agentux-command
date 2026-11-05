@@ -8,8 +8,12 @@ use agentux_command::office::{
     self, CheckpointEntry, CheckpointProjection, Event, NodeCheckpoint, NodeEvent,
     OfficeRepository, PostgresStore, ResolutionRequest,
 };
+use agentux_command::server::{Handler, parse_node_tokens};
+use axum::http::StatusCode;
+use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use tokio_tungstenite::tungstenite::{self, client::IntoClientRequest};
 
 async fn store() -> Option<(
     PostgresStore,
@@ -298,6 +302,198 @@ async fn accepted_node_capabilities_survive_a_command_restart() {
     .unwrap();
     let loaded = nodes::persist::load(&office::pool(config)).await.unwrap();
     assert_eq!(loaded[0].accepted_capabilities, ["node.event_replay.v1"]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_registry_barrier_waits_until_postgres_commits_node_state() {
+    let Some((_, pool, _, _)) = store().await else {
+        return;
+    };
+    let mut locker = pool.get().await.unwrap();
+    let transaction = locker.transaction().await.unwrap();
+    transaction
+        .batch_execute("LOCK TABLE node_state IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+
+    let registry = std::sync::Arc::new(nodes::Registry::new());
+    registry.store_to(nodes::persist::writer(pool.clone()));
+    let mut applying = {
+        let registry = registry.clone();
+        tokio::spawn(async move {
+            registry
+                .apply_and_persist(nodes::Event {
+                    node_id: "barrier-node".into(),
+                    organization_id: "barrier-org".into(),
+                    method: "harness.status".into(),
+                    sequence: 1,
+                    harnesses: Some(json!([{"id": "codex", "signedIn": true}])),
+                    ..nodes::Event::default()
+                })
+                .await
+        })
+    };
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut applying)
+            .await
+            .is_err(),
+        "writer must not release the barrier while its node_state write is blocked"
+    );
+    transaction.commit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), applying)
+        .await
+        .expect("registry writer should finish after the lock is released")
+        .unwrap()
+        .unwrap();
+
+    let persisted = nodes::persist::load(&pool).await.unwrap();
+    assert_eq!(persisted[0].id, "barrier-node");
+    assert_eq!(
+        persisted[0].harnesses.as_ref().unwrap()[0]["signedIn"],
+        true
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn replay_ack_waits_until_registry_projection_is_durable() {
+    let Some((_, pool, _, schema)) = store().await else {
+        return;
+    };
+    let database_url = format!(
+        "{}&application_name=command-ack-barrier-test",
+        url_with_schema(&schema)
+    );
+    let handler = Handler::postgres(&database_url)
+        .await
+        .unwrap()
+        .with_node_tokens(parse_node_tokens("ack-barrier-node=s3cret"));
+    let app = handler.router();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    tokio::spawn(axum::serve(listener, app.clone()).into_future());
+
+    let hello = json!({
+        "jsonrpc": "2.0", "id": "hello", "method": "node.hello",
+        "params": common::params("ack-barrier-org", "ack-barrier-node", json!({
+            "capabilities": ["node.event_replay.v1"],
+            "agentuxVersion": "test", "supportedProtocolVersions": ["v1"]
+        }))
+    });
+    let (status, response) =
+        common::call(&app, "POST", "/v1/protocol/messages", "s3cret", Some(hello)).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+    assert_eq!(
+        response["result"]["acceptedCapabilities"],
+        json!(["node.event_replay.v1"])
+    );
+
+    let mut request = format!("ws://{address}/v1/protocol/connect?nodeId=ack-barrier-node")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert("authorization", "Bearer s3cret".parse().unwrap());
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let resume: serde_json::Value =
+        match tokio::time::timeout(std::time::Duration::from_secs(3), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        {
+            tungstenite::Message::Text(text) => serde_json::from_str(&text).unwrap(),
+            other => panic!("expected node.resume, got {other:?}"),
+        };
+    socket
+        .send(tungstenite::Message::Text(
+            json!({"jsonrpc":"2.0", "id":resume["id"], "result":{
+                "status":"replay", "nodeId":"ack-barrier-node", "requestedAfterSequence":0,
+                "oldestAvailableSequence":0, "highWaterSequence":0,
+                "eventsReplayed":0, "snapshotRequired":false
+            }})
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap();
+
+    let mut locker = pool.get().await.unwrap();
+    let transaction = locker.transaction().await.unwrap();
+    transaction
+        .batch_execute("LOCK TABLE node_state IN ACCESS EXCLUSIVE MODE")
+        .await
+        .unwrap();
+    let event = json!({
+        "jsonrpc":"2.0", "method":"harness.status",
+        "params":common::params("ack-barrier-org", "ack-barrier-node", json!({
+            "eventId":"ack-barrier-event", "sequence":1,
+            "harnesses":[{"id":"codex", "signedIn":true}]
+        }))
+    });
+    socket
+        .send(tungstenite::Message::Text(event.to_string().into()))
+        .await
+        .unwrap();
+
+    let writer_blocked = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let blocked = pool
+                .get()
+                .await
+                .unwrap()
+                .query_one(
+                    "SELECT EXISTS (
+                        SELECT 1 FROM pg_stat_activity
+                        WHERE datname = current_database()
+                          AND application_name = 'command-ack-barrier-test'
+                          AND wait_event_type = 'Lock'
+                          AND query LIKE 'INSERT INTO node_state%'
+                    )",
+                    &[],
+                )
+                .await
+                .unwrap()
+                .get::<_, bool>(0);
+            if blocked {
+                break true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or(false);
+    assert!(
+        writer_blocked,
+        "the test event must reach the blocked registry writer"
+    );
+
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), socket.next())
+            .await
+            .is_err(),
+        "Command must not ACK while the registry projection write is blocked"
+    );
+    transaction.commit().await.unwrap();
+
+    let ack: serde_json::Value =
+        match tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+        {
+            tungstenite::Message::Text(text) => serde_json::from_str(&text).unwrap(),
+            other => panic!("expected node.events.ack, got {other:?}"),
+        };
+    assert_eq!(ack["method"], "node.events.ack");
+    assert_eq!(ack["params"]["throughSequence"], 1);
+    let persisted = nodes::persist::load(&pool).await.unwrap();
+    assert_eq!(
+        persisted[0].harnesses.as_ref().unwrap()[0]["signedIn"],
+        true
+    );
+    socket.close(None).await.unwrap();
 }
 
 #[tokio::test]
