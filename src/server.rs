@@ -1026,6 +1026,13 @@ async fn accept_node_event(
         let activity = params_value
             .get("activity")
             .ok_or(StatusCode::BAD_REQUEST)?;
+        let typed: auxp::activity::Activity =
+            serde_json::from_value(activity.clone()).map_err(|_| StatusCode::BAD_REQUEST)?;
+        typed.validate().map_err(|_| StatusCode::BAD_REQUEST)?;
+        let normalized = serde_json::to_value(typed).map_err(|_| StatusCode::BAD_REQUEST)?;
+        if normalized != *activity {
+            return Err(StatusCode::BAD_REQUEST);
+        }
         validate_activity_scope(&state, organization_id, node_id, activity).await?;
     }
     let event_id = params_value
@@ -2588,6 +2595,14 @@ async fn run_activity(
         .and_then(Value::as_str);
     let node_id =
         projected_node.or_else(|| events.first().map(|logged| logged.event.node_id.as_str()));
+    let history_gap = if let Some(node_id) = node_id {
+        match s.office.node_event_history_gap(&org, node_id).await {
+            Ok(gap) => gap,
+            Err(_) => return error(StatusCode::SERVICE_UNAVAILABLE, "activity_log_unavailable"),
+        }
+    } else {
+        None
+    };
     let node = node_id
         .and_then(|id| s.registry.get(id))
         .filter(|node| node.organization_id == org);
@@ -2611,6 +2626,12 @@ async fn run_activity(
     });
     if let Some(node) = node {
         body["nodeId"] = json!(node.id);
+    }
+    if let Some(through_sequence) = history_gap {
+        body["historyGap"] = json!({
+            "kind": "unverified_legacy_prefix",
+            "throughSequence": through_sequence,
+        });
     }
     reply(StatusCode::OK, body)
 }

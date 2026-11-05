@@ -70,7 +70,7 @@ pub async fn open_postgres(database_url: &str) -> Result<Pool, Error> {
     let mut client = pool
         .get()
         .await
-        .map_err(|e| Error::Storage(format!("connect to PostgreSQL: {e}")))?;
+        .map_err(|e| Error::Storage(format!("connect to PostgreSQL: {e:?}")))?;
     migrate(&mut client)
         .await
         .map_err(|e| Error::Storage(format!("migrate PostgreSQL database: {e}")))?;
@@ -451,9 +451,37 @@ impl OfficeRepository for PostgresStore {
             }
             contiguous = next;
         }
+        let verified: i64 = tx
+            .query_one(
+                "SELECT COALESCE(
+                    (SELECT first_gap.ordinal - 1
+                     FROM (
+                         SELECT sequence, row_number() OVER (ORDER BY sequence) AS ordinal
+                         FROM command_node_events
+                         WHERE organization_id=$1 AND node_id=$2
+                     ) first_gap
+                     WHERE first_gap.sequence <> first_gap.ordinal
+                     ORDER BY first_gap.ordinal
+                     LIMIT 1),
+                    (SELECT COALESCE(MAX(sequence), 0)
+                     FROM command_node_events
+                     WHERE organization_id=$1 AND node_id=$2))",
+                &[&event.organization_id, &event.node_id],
+            )
+            .await
+            .map_err(storage("derive verified node event prefix"))?
+            .get(0);
         tx.execute(
-            "UPDATE command_node_event_cursors SET contiguous_sequence=$3,updated_at=now() WHERE organization_id=$1 AND node_id=$2",
-            &[&event.organization_id, &event.node_id, &contiguous],
+            "UPDATE command_node_event_cursors
+             SET contiguous_sequence=$3,
+                 verified_sequence=$4,
+                 history_gap_through_sequence=CASE
+                     WHEN history_gap_through_sequence IS NOT NULL AND $4 >= history_gap_through_sequence THEN NULL
+                     ELSE history_gap_through_sequence
+                 END,
+                 updated_at=now()
+             WHERE organization_id=$1 AND node_id=$2",
+            &[&event.organization_id, &event.node_id, &contiguous, &verified],
         )
         .await
         .map_err(storage("save contiguous node event cursor"))?;
@@ -477,6 +505,22 @@ impl OfficeRepository for PostgresStore {
             .map_err(storage("read contiguous node event cursor"))?
             .map(|row| row.get(0))
             .unwrap_or(0))
+    }
+
+    async fn node_event_history_gap(
+        &self,
+        organization_id: &str,
+        node_id: &str,
+    ) -> Result<Option<i64>, Error> {
+        let client = self.pool.get().await?;
+        Ok(client
+            .query_opt(
+                "SELECT history_gap_through_sequence FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2",
+                &[&organization_id, &node_id],
+            )
+            .await
+            .map_err(storage("read node event history gap"))?
+            .and_then(|row| row.get(0)))
     }
 
     async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error> {

@@ -49,6 +49,15 @@ pub trait OfficeRepository: Send + Sync {
     ) -> Result<i64, Error> {
         Ok(0)
     }
+    /// Legacy event history below this sequence may have been acknowledged
+    /// before Command had a verifiable receiver ledger.
+    async fn node_event_history_gap(
+        &self,
+        _organization_id: &str,
+        _node_id: &str,
+    ) -> Result<Option<i64>, Error> {
+        Ok(None)
+    }
     /// Part of an organization's event log, oldest first.
     async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error>;
     async fn resolve_approval(

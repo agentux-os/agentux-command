@@ -58,6 +58,10 @@ const FILES: &[(&str, &str)] = &[
         "013_node_event_replay.sql",
         include_str!("../../migrations/013_node_event_replay.sql"),
     ),
+    (
+        "014_safe_legacy_node_event_cursor.sql",
+        include_str!("../../migrations/014_safe_legacy_node_event_cursor.sql"),
+    ),
 ];
 
 pub(crate) struct Migration {
@@ -104,8 +108,12 @@ pub async fn migrate(client: &mut Client) -> Result<(), Error> {
         .map_err(|e| Error::Storage(format!("create migration table: {e}")))?;
     for item in migrations {
         let fail = |what: &str, e: tokio_postgres::Error| {
+            let diagnostic = e
+                .as_db_error()
+                .map(|db| format!("{}: {}", db.code().code(), db.message()))
+                .unwrap_or_else(|| e.to_string());
             Error::Storage(format!(
-                "{what} migration {} ({}): {e}",
+                "{what} migration {} ({}): {diagnostic}",
                 item.version, item.name
             ))
         };
@@ -122,11 +130,9 @@ pub async fn migrate(client: &mut Client) -> Result<(), Error> {
             .map_err(|e| fail("read", e))?
             .get(0);
         if !applied {
-            for statement in item.sql.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                tx.execute(statement, &[])
-                    .await
-                    .map_err(|e| fail("execute", e))?;
-            }
+            tx.batch_execute(item.sql)
+                .await
+                .map_err(|e| fail("execute", e))?;
             tx.execute(
                 "INSERT INTO command_schema_migrations (version, name) VALUES ($1, $2)",
                 &[&item.version, &item.name],
@@ -147,8 +153,24 @@ mod tests {
     fn versions_are_ordered_and_start_at_one() {
         assert_eq!(
             migration_versions(),
-            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]
         );
+    }
+
+    #[test]
+    fn legacy_replay_cursors_preserve_prior_ack_and_record_unverified_history() {
+        let migrations = load().unwrap();
+        let cursor_safety = migrations
+            .iter()
+            .find(|migration| migration.version == 14)
+            .unwrap();
+        assert!(
+            cursor_safety
+                .sql
+                .contains("verified_sequence = prefix.verified_prefix")
+        );
+        assert!(!cursor_safety.sql.contains("SET contiguous_sequence"));
+        assert!(cursor_safety.sql.contains("history_gap_through_sequence"));
     }
 
     #[test]

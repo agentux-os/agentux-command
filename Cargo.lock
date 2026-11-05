@@ -45,8 +45,8 @@ dependencies = [
 
 [[package]]
 name = "agentux-api"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "base64 0.23.1",
  "serde",
@@ -56,8 +56,8 @@ dependencies = [
 
 [[package]]
 name = "agentux-bus"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "agentux-config",
  "rmcp",
@@ -71,11 +71,13 @@ dependencies = [
 name = "agentux-command"
 version = "0.2.1"
 dependencies = [
+ "agentux-fake-agent",
  "agentux-gateway",
+ "agentux-harness",
  "agentux-store",
  "agentuxd",
  "async-trait",
- "auxp 0.1.0 (git+https://github.com/agentux-os/agentux-protocol?rev=a44991dfeb5eba0d25e97d87c22c8d21495f521d)",
+ "auxp",
  "axum",
  "base64 0.22.1",
  "chrono",
@@ -105,8 +107,8 @@ dependencies = [
 
 [[package]]
 name = "agentux-config"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "serde",
  "serde-saphyr",
@@ -114,12 +116,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "agentux-fake-agent"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
+dependencies = [
+ "agent-client-protocol",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
 name = "agentux-gateway"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "agentux-api",
- "auxp 0.1.0 (git+https://github.com/agentux-os/agentux-protocol?rev=aeced51393523ee7cd20c0b163cdb2664c2a038e)",
+ "agentux-config",
+ "auxp",
  "futures-util",
  "jiff",
  "reqwest",
@@ -132,8 +145,8 @@ dependencies = [
 
 [[package]]
 name = "agentux-harness"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "agent-client-protocol",
  "rustix",
@@ -143,8 +156,8 @@ dependencies = [
 
 [[package]]
 name = "agentux-store"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "agentux-api",
  "rusqlite",
@@ -155,13 +168,13 @@ dependencies = [
 
 [[package]]
 name = "agentux-worktree"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 
 [[package]]
 name = "agentuxd"
-version = "0.4.9"
-source = "git+https://github.com/agentux-os/agentux-core?rev=8876e26547af079dc957c8039260001df68838a5#8876e26547af079dc957c8039260001df68838a5"
+version = "0.5.4"
+source = "git+https://github.com/agentux-os/agentux-core?rev=9835460b18f8580d14db6ce2d336049179446e86#9835460b18f8580d14db6ce2d336049179446e86"
 dependencies = [
  "agentux-api",
  "agentux-bus",
@@ -173,6 +186,7 @@ dependencies = [
  "jiff",
  "portable-pty",
  "regex",
+ "reqwest",
  "rustix",
  "serde",
  "serde-saphyr",
@@ -312,16 +326,6 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 name = "auxp"
 version = "0.1.0"
 source = "git+https://github.com/agentux-os/agentux-protocol?rev=a44991dfeb5eba0d25e97d87c22c8d21495f521d#a44991dfeb5eba0d25e97d87c22c8d21495f521d"
-dependencies = [
- "jiff",
- "serde",
- "serde_json",
-]
-
-[[package]]
-name = "auxp"
-version = "0.1.0"
-source = "git+https://github.com/agentux-os/agentux-protocol?rev=aeced51393523ee7cd20c0b163cdb2664c2a038e#aeced51393523ee7cd20c0b163cdb2664c2a038e"
 dependencies = [
  "jiff",
  "serde",
@@ -493,9 +497,9 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "cc"
-version = "1.9.0"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "877bf67ac8e52449eb2f9e98a344ea163beb70dd1f9eebe3cc5357dcfeaee4df"
+checksum = "f74872d07caf508b30a21f6836e7d7016a2eaf7d9ff4f48deaa58cd8a0407630"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -1097,9 +1101,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.15"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c66915cc5391097de7a2b0b972e8505aa33c0df401fd3a6811dbdb32881ba48"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "fixedbitset"
@@ -1836,9 +1840,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.2"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
+checksum = "14a5f01b87b92705d07b433c06f96cbc764637d81a0bffb5734ce17cf0f9a2b3"
 dependencies = [
  "cc",
  "pkg-config",
@@ -2720,9 +2724,9 @@ dependencies = [
 
 [[package]]
 name = "rusqlite"
-version = "0.40.2"
+version = "0.41.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
+checksum = "da9bba6f3506135e120a6586df05be18b48d18896600646a4bec8f993d91a594"
 dependencies = [
  "bitflags 2.13.2",
  "fallible-iterator 0.3.0",
@@ -3127,9 +3131,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.3"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5b3dc8af474f516a851ff4bd12db780f948b9250ad37211e4eec0bccea54e01b"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 
 [[package]]
 name = "socket2"
@@ -3627,9 +3631,9 @@ checksum = "5c1cb5db39152898a79168971543b1cb5020dff7fe43c8dc468b0885f5e29df5"
 
 [[package]]
 name = "unicode-ident"
-version = "1.0.27"
+version = "1.0.26"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
+checksum = "d245f478577f809a851594d02313b640fb437e0bb33866753cff937863096954"
 
 [[package]]
 name = "unicode-normalization"

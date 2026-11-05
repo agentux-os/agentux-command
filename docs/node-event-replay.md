@@ -26,11 +26,31 @@ the highest contiguous sequence. If a message arrives over HTTP without an open 
 connection, its successful HTTP response follows the durable commit; the next
 `node.resume` carries that stored cursor.
 
+The node registry is a separate read model written through an asynchronous
+writer. Its projection may not yet be durable when the ledger ACK is sent;
+non-Office summaries such as `harness.status` can therefore be lost on a
+Command crash in that interval. See Command #79. The durable ACK guarantee
+covers the event ledger and transactional Office projection, not that registry
+summary.
+
 Command currently retains the receiver ledger indefinitely; there is no Command
-retention or pruning setting for these rows. Migration 013 seeds the cursor
-from previously durable node and Office cursors. Payloads predating the ledger
-cannot be verified against an old event ID, so such sequences are treated as
-already acknowledged. New rows receive full duplicate and conflict checks.
+retention or pruning setting for these rows. Migration 013 seeded legacy
+cursors from node and Office high-water marks, which cannot prove that every
+earlier sequence was received. Migration 014 derives the verified contiguous
+prefix from ledger rows and preserves the old resume cursor. The currently
+stored accepted-capability list is replaced on each hello, so its absence
+cannot prove the node never received a replay ACK in an earlier session. A
+lower cursor could therefore ask Core to replay events it has already pruned.
+If the old cursor exceeds the verified prefix, Command persists
+`history_gap_through_sequence` and includes a `historyGap` marker in the run
+activity response. That marker reports that historical activity may be
+incomplete; it does not invent missing events or advance the resume cursor.
+This conservative migration can leave a stale high cursor on a node that
+never negotiated replay, so automatic recovery of its still-retained older
+events is deferred until Command can establish durable historical ACK
+provenance. Payloads predating the ledger cannot be verified against an old
+event ID; old Office entries remain protected by their own event identity.
+New rows receive full duplicate and conflict checks.
 
 On a WebSocket reconnect, Command sends `node.resume` with its durable cursor and
 validates the returned replay metadata. If the node reports `cursor_expired`,
@@ -39,7 +59,7 @@ registry and replaces those cached run summaries. It does not pretend that a
 run snapshot recreates missing activity, audit, or Office timeline events.
 Those historical entries remain unavailable. Command does not advance the
 node-wide cursor or ACK across the gap: `run.snapshot` is per-run and the
-current protocol has no atomic node-wide snapshot cursor that can prove every
-run and event stream is covered. Core #80 must supply that checkpoint contract
-before Command can safely resume after an expired cursor without operator
-intervention.
+current Protocol contract has no atomic node-wide snapshot cursor that can
+prove every run and event stream is covered. Cursor expiry therefore still
+requires operator intervention; Command does not invent or depend on an
+unmerged checkpoint wire contract.
