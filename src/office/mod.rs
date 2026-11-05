@@ -150,7 +150,8 @@ pub struct NodeCheckpoint {
 }
 
 impl NodeCheckpoint {
-    pub(crate) fn from_validated_pages(
+    /// Creates a checkpoint after validating its identity, sequence range, and entries.
+    pub fn from_validated_pages(
         organization_id: String,
         node_id: String,
         checkpoint_id: String,

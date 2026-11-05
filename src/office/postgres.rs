@@ -582,13 +582,19 @@ impl OfficeRepository for PostgresStore {
     ) -> Result<Option<i64>, Error> {
         let client = self.pool.get().await?;
         Ok(client
-            .query_opt(
-                "SELECT history_gap_through_sequence FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2",
+            .query_one(
+                "SELECT CASE WHEN EXISTS (SELECT 1 FROM command_node_history_gaps WHERE organization_id=$1 AND node_id=$2)
+                                  OR EXISTS (SELECT 1 FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2 AND history_gap_through_sequence IS NOT NULL)
+                            THEN GREATEST(
+                                COALESCE((SELECT MAX(through_sequence) FROM command_node_history_gaps WHERE organization_id=$1 AND node_id=$2), 0),
+                                COALESCE((SELECT history_gap_through_sequence FROM command_node_event_cursors WHERE organization_id=$1 AND node_id=$2), 0)
+                            )
+                            ELSE NULL END",
                 &[&organization_id, &node_id],
             )
             .await
             .map_err(storage("read node event history gap"))?
-            .and_then(|row| row.get(0)))
+            .get(0))
     }
 
     async fn events(&self, organization_id: &str, replay: &Replay) -> Result<Vec<Logged>, Error> {
